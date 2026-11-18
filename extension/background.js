@@ -1,5 +1,4 @@
-// Centrality Local V10.1 + motor de zona (gnat-adapter).
-// Inyecta en el mundo MAIN para compartir webMap_ / Acs / Ext con la página.
+// Launcher de Centrality V10: requiere clic del usuario en la pestaña activa.
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab?.id) return;
   try {
@@ -16,7 +15,9 @@ chrome.action.onClicked.addListener(async (tab) => {
           if (!w?.webMap_?.map || !w?.ol) {
             return { status: "not_ready", message: "El mapa todavía no está listo. Espera a que cargue GNAT." };
           }
-          if (typeof w.__centralityV10?.toggle === "function") return { status: "running" };
+          if (typeof w.__centralityV10?.toggle === "function") {
+            return { status: "running" };
+          }
           return { status: "ready" };
         } catch (_) {
           return { status: "not_ready", message: "No se puede acceder al mapa dentro del iframe. Revisa la sesión de GNAT." };
@@ -40,11 +41,7 @@ chrome.action.onClicked.addListener(async (tab) => {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         world: "MAIN",
-        files: [
-          "tools/gnat-adapter/gnat-adapter.js",
-          "tools/gnat-adapter/gnat-adapter.browser.js",
-          "centrality_v10.js"
-        ]
+        files: ["centrality_v10.js"]
       });
       return;
     }

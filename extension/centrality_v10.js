@@ -1,11 +1,11 @@
 /*
- * CENTRALITY LOCAL V10
- * Interfaz espacial limpia sobre OpenLayers (GNAT):
- * - Barra superior compacta + Dock de cursor inferior + Cajón lateral de tabla
- * - Autoguardado y Proyectos recientes en IndexedDB + Carpeta de respaldo opcional
- * - Paleta de alto contraste para mapa, Envolventes de zona y Ruta secuencial (1->2->3)
- * - Modo Supervisor "fantasma" por defecto (CC, TL, RD, JB disponibles bajo demanda)
- * - Selección directa en mapa (clic / Shift+arrastrar / caja) y menú clic derecho
+ * CENTRALITY LOCAL V10.2 (INTEGRATED GNAT DMS & D/T/F POLYGON ENGINE)
+ * - 3 zonas espaciales: Barra superior + Dock inferior + Cajón lateral de tabla
+ * - Motor GNAT integrado (svc_wmc.php): búsqueda con pin [F], caché de catálogo en IndexedDB,
+ *   auto-descubrimiento de tramos MT (A->B), aperturas cercanas y remates aguas abajo
+ * - Generación y edición independiente de polígonos para D (Zona desconectada), T (Zona de trabajo) y F (Punto de faenas)
+ * - Editor de vértices nativo (arrastrar vértices, insertar punto medio, borrar con clic derecho, dibujar nuevo)
+ *   con toggle para ocultar pines de postes y autoguardado real en IndexedDB y JSON
  */
 (() => {
   "use strict";
@@ -34,8 +34,38 @@
     return;
   }
 
+  // Migración en caliente si viene de una sesión previa en memoria
+  const prevPoints = [];
+  const prevZones = [];
+  try {
+    if (typeof w.__superponerKMZ?.getPuntos === "function") {
+      for (const f of w.__superponerKMZ.getPuntos() || []) {
+        const g = f.getGeometry?.();
+        if (g?.getType?.() === "Point") {
+          prevPoints.push({
+            xy: g.getCoordinates().slice(0, 2),
+            id: f.get("id"),
+            numero: f.get("numero"),
+            tipo: f.get("tipo") || "PUNTO",
+            codigo: f.get("codigo"),
+            bloqueId: f.get("bloqueId") || "",
+            bloques: f.get("bloques") || [],
+            aperturasIds: f.get("aperturasIds") || [],
+            bloque: f.get("bloque") || "Sin asignar",
+            tipoEquipo: f.get("tipoEquipo") || "",
+            colorPersonalizado: f.get("colorPersonalizado") || ""
+          });
+        }
+      }
+    }
+    if (typeof w.__superponerKMZ?.getBloques === "function") {
+      prevZones.push(...(w.__superponerKMZ.getBloques() || []));
+    }
+  } catch (_) {}
+
   // Cerrar instancias previas limpiamente
   try { w.__centralityV10?.destroy?.(); } catch (_) {}
+  try { w.__centralityToolsV1?.destroy?.(); } catch (_) {}
   try { w.__superponerKMZ?.cerrar?.(); } catch (_) {}
   try { w.__pruebaDetalleCentrality?.cerrar?.(); } catch (_) {}
   try { w.__centralityAtlasPDF?.destruir?.(); } catch (_) {}
@@ -44,16 +74,18 @@
   // 1. CONSTANTES, PALETA DE ALTO CONTRASTE Y DIRECTORIO DE SUPERVISORES
   // =========================================================================
   const HIGH_CONTRAST_PALETTE = [
-    "#00C853", // Verde neón
-    "#FF6D00", // Naranjo intenso
-    "#2979FF", // Azul eléctrico
+    "#00C853", // Verde neón (T - Zona de trabajo)
+    "#FF6D00", // Naranjo intenso (F - Punto de faenas / CC)
+    "#DC2626", // Rojo intenso (D - Zona desconectada)
+    "#2979FF", // Azul eléctrico (TL)
     "#00BFA5", // Verde turquesa claro (JB)
     "#D500F9", // Magenta vivo
     "#FFD600", // Amarillo alto contraste
     "#00E5FF", // Cian eléctrico
-    "#E11D48", // Carmesí
-    "#65A30D", // Lima
-    "#4F46E5"  // Índigo
+    "#15803D", // Verde oscuro (RD)
+    "#4F46E5", // Índigo
+    "#F97316", // Ámbar vivo
+    "#06B6D4"  // Turquesa medio
   ];
 
   const DEFAULT_SUPERVISORS = [
@@ -68,9 +100,11 @@
     "Naranjo": "CC",
     "Azul": "TL",
     "Verde": "RD",
+    "Turquesa": "JB",
     "Sin asignar": "default"
   };
 
+  const EQUIPMENT_TYPES = ["", "DF", "DBC", "DC", "Pole Top", "Reconectador", "Seccionador", "EPT BT y MT", "EPT MT", "EPT BT"];
   const OPENING_COLOR = "#DC2626";
   const UNASSIGNED_ZONE_COLOR = "#475569";
   const UMBRAL_ETIQUETA = 25;
@@ -82,51 +116,60 @@
     projectId: "proj-" + Date.now(),
     projectName: "Proyecto sin título",
     dirty: false,
-    savingText: "Listo",
-    points: [],            // Array<ol.Feature>
-    zones: new Map(),      // id -> { id, name, color }
+    points: [],             // Array<ol.Feature> (postes y aperturas)
+    spans: [],              // Array<{ id, from, to, coords: [[lon,lat],[lon,lat]], display, voltage }> (vectores MT A->B)
+    zones: new Map([
+      ["D", { id: "D", name: "Zona desconectada (D)", color: "#DC2626", customRing: null }],
+      ["T", { id: "T", name: "Zona de trabajo (T)", color: "#00C853", customRing: null }],
+      ["F", { id: "F", name: "Punto de faenas (F)", color: "#FF6D00", customRing: null }]
+    ]),
     supervisors: new Map(DEFAULT_SUPERVISORS.map(s => [s.id, { ...s }])),
     multiSupervisorEnabled: false,
-    selected: new Set(),   // Set<number> (indices in state.points)
-    focused: -1,           // index in state.points
-    cursorMode: "nav",     // "nav" | "box" | "add" | "link-opening"
-    pendingLinkIndices: [],// indices waiting to be linked to clicked/created opening
+    autoPrefixF: true,      // Pin [F] activo por defecto para Frontel
+    selected: new Set(),    // Set<number> (indices in state.points)
+    focused: -1,            // index in state.points
+    cursorMode: "nav",      // "nav" | "box" | "add" | "link-opening" | "place-missing" | "edit-poly" | "draw-poly"
+    editingZoneId: null,    // ID de la zona cuyo polígono se está editando o dibujando
+    drawingCoords: [],      // vértices temporales al dibujar polígono nuevo
+    pendingLinkIndices: [], // indices waiting to be linked to clicked/created opening
+    pendingMissingCodes: [],// queue of missing codes to place on map click by click
     drawerOpen: true,
     collapsed: false,
-    // Filtros dinámicos
+    // Filtros dinámicos combinables
     search: "",
-    filterType: "all",     // "all" | "PUNTO" | "APERTURA"
-    filterZones: new Set(),// empty = all; can include "__NONE__" for unzoned
-    filterSups: new Set(), // empty = all
+    filterType: "all",      // "all" | "PUNTO" | "APERTURA"
+    filterZones: new Set(), // empty = all; "__NONE__" = sin zona
+    filterSups: new Set(),  // empty = all
     // Opciones de visualización en mapa
-    colorBy: "zone",       // "zone" | "supervisor"
-    showHulls: true,       // envolventes suaves por zona
-    showRoute: false,      // línea secuencial 1->2->3
-    labelMode: "cerca",    // "cerca" | "siempre" | "ninguna"
-    labelContent: "numero",// "numero" | "completo"
-    mtbtDetail: 0,         // 0 | 1 | 2
-    backupDirHandle: null
+    colorBy: "zone",        // "zone" | "supervisor"
+    hidePoles: false,       // Ocultar pines de postes para editar polígonos cómodamente
+    showHulls: true,        // Polígonos D / T / F
+    showSpans: true,        // Vectores de tramos MT (A->B)
+    showRoute: false,       // Línea secuencial 1->2->3
+    showLinks: true,        // Rayos punteados entre poste enfocado y sus aperturas
+    labelMode: "cerca",     // "cerca" | "siempre" | "ninguna"
+    labelContent: "numero", // "numero" | "completo"
+    mtbtDetail: 0,          // 0 | 1 | 2
+    backupDirHandle: null,
+    backupDirPerm: "prompt"
   };
 
   let styleCache = new WeakMap();
   let vectorLayer = null;
   let hullLayer = null;
+  let spanLayer = null;
   let routeLayer = null;
+  let linkLayer = null;
   let dragBoxInteraction = null;
   let addPointDropCoord = null;
   let activePopover = null;
   let autosaveTimer = null;
-  let atlasRunning = false;
-  let atlasCancel = false;
-  let atlasCaptures = null;
-  let rendererExport = null;
+  let draggingVertex = null; // { zoneId, vertexIdx, isMidpoint }
 
   // =========================================================================
   // 3. UTILIDADES Y HELPERS
   // =========================================================================
   const isHex = (v) => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
-  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, ch =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
 
   const contrastText = (hex) => {
     if (!isHex(hex)) return "#FFFFFF";
@@ -153,22 +196,53 @@
   };
 
   const getPointZoneIds = (f) => {
+    const explicit = Array.isArray(f.get("bloques")) ? f.get("bloques") : [];
+    const primary = String(f.get("bloqueId") || "").trim();
+    const all = [...new Set([primary, ...explicit].filter(Boolean))];
     if (f.get("tipo") === "APERTURA") {
-      const explicit = Array.isArray(f.get("bloques")) ? f.get("bloques") : [];
       const apId = String(f.get("id"));
       const derived = state.points
         .filter(p => p.get("tipo") !== "APERTURA" && p.get("bloqueId") && (p.get("aperturasIds") || []).includes(apId))
         .map(p => String(p.get("bloqueId")));
-      return [...new Set([...explicit, ...derived].filter(Boolean))];
+      return [...new Set([...all, ...derived].filter(Boolean))];
     }
-    const z = String(f.get("bloqueId") || "").trim();
-    return z ? [z] : [];
+    return all;
+  };
+
+  const getLinkedOpeningsForPoste = (f) => {
+    if (!f || f.get("tipo") === "APERTURA") return [];
+    const directIds = new Set(Array.isArray(f.get("aperturasIds")) ? f.get("aperturasIds").map(String) : []);
+    const zIds = getPointZoneIds(f);
+    return state.points.filter(p => {
+      if (p.get("tipo") !== "APERTURA") return false;
+      if (directIds.has(String(p.get("id"))) || directIds.has(getPointCode(p))) return true;
+      const apZones = Array.isArray(p.get("bloques")) ? p.get("bloques") : [];
+      return zIds.some(z => apZones.includes(z));
+    });
+  };
+
+  const getLinkedPostesForOpening = (apFeat) => {
+    if (!apFeat || apFeat.get("tipo") !== "APERTURA") return [];
+    const apId = String(apFeat.get("id"));
+    const apCode = getPointCode(apFeat);
+    const apZones = new Set(Array.isArray(apFeat.get("bloques")) ? apFeat.get("bloques") : []);
+    return state.points.filter(p => {
+      if (p.get("tipo") === "APERTURA") return false;
+      const refs = Array.isArray(p.get("aperturasIds")) ? p.get("aperturasIds") : [];
+      if (refs.includes(apId) || refs.includes(apCode)) return true;
+      return getPointZoneIds(p).some(z => apZones.has(z));
+    });
   };
 
   const getSupId = (f) => {
     const raw = String(f.get("supervisorId") || f.get("bloque") || "default").trim();
     if (state.supervisors.has(raw)) return raw;
     if (LEGACY_COLOR_TO_SUP[raw]) return LEGACY_COLOR_TO_SUP[raw];
+    for (const s of state.supervisors.values()) {
+      if (s.initials.toUpperCase() === raw.toUpperCase() || s.name.toLowerCase() === raw.toLowerCase()) {
+        return s.id;
+      }
+    }
     return "default";
   };
 
@@ -184,17 +258,22 @@
   };
 
   const getPointColor = (f) => {
+    const custom = f.get("colorPersonalizado");
+    if (isHex(custom)) return custom;
     if (f.get("tipo") === "APERTURA") return OPENING_COLOR;
     if (state.colorBy === "supervisor" && isMultiSupActive()) {
       const sup = state.supervisors.get(getSupId(f));
       return sup ? sup.color : UNASSIGNED_ZONE_COLOR;
     }
-    const zid = String(f.get("bloqueId") || "").trim();
-    if (zid && state.zones.has(zid)) {
-      return state.zones.get(zid).color || HIGH_CONTRAST_PALETTE[0];
+    const zids = getPointZoneIds(f);
+    // Prioridad visual: F (Faena) > T (Trabajo) > D (Desconectada) > otras zonas
+    const priority = ["F", "T", "D"];
+    for (const pid of priority) {
+      if (zids.includes(pid) && state.zones.has(pid)) return state.zones.get(pid).color;
     }
-    const custom = f.get("colorPersonalizado");
-    if (isHex(custom)) return custom;
+    if (zids.length && state.zones.has(zids[0])) {
+      return state.zones.get(zids[0]).color || HIGH_CONTRAST_PALETTE[0];
+    }
     return UNASSIGNED_ZONE_COLOR;
   };
 
@@ -208,20 +287,23 @@
   const autoAssignHighContrastZones = () => {
     let i = 0;
     for (const z of state.zones.values()) {
+      if (z.id === "D") { z.color = "#DC2626"; continue; }
+      if (z.id === "T") { z.color = "#00C853"; continue; }
+      if (z.id === "F") { z.color = "#FF6D00"; continue; }
       z.color = HIGH_CONTRAST_PALETTE[i % HIGH_CONTRAST_PALETTE.length];
       i++;
     }
     styleCache = new WeakMap();
     refreshAll();
     markDirty();
-    showToast("Colores de alto contraste aplicados a todas las zonas.");
+    showToast("Paleta automática de alto contraste aplicada a las zonas.");
   };
 
   // =========================================================================
-  // 4. ALMACENAMIENTO LOCAL (IndexedDB + Carpeta Opcional)
+  // 4. ALMACENAMIENTO LOCAL (IndexedDB: Proyectos + Catálogo GNAT Persistente)
   // =========================================================================
   const DB_NAME = "CentralityLocalV10";
-  const DB_VERSION = 1;
+  const DB_VERSION = 2;
 
   function openDB() {
     return new Promise((resolve, reject) => {
@@ -234,10 +316,38 @@
         if (!db.objectStoreNames.contains("settings")) {
           db.createObjectStore("settings", { keyPath: "key" });
         }
+        if (!db.objectStoreNames.contains("gnat_catalog")) {
+          db.createObjectStore("gnat_catalog", { keyPath: "code" });
+        }
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
     });
+  }
+
+  async function dbGetGnatCache(code) {
+    try {
+      const db = await openDB();
+      return await new Promise((resolve) => {
+        const tx = db.transaction("gnat_catalog", "readonly");
+        const req = tx.objectStore("gnat_catalog").get(String(code).toUpperCase());
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      });
+    } catch (_) { return null; }
+  }
+
+  async function dbPutGnatCache(entry) {
+    if (!entry?.code) return;
+    try {
+      const db = await openDB();
+      await new Promise((resolve) => {
+        const tx = db.transaction("gnat_catalog", "readwrite");
+        tx.objectStore("gnat_catalog").put({ ...entry, code: String(entry.code).toUpperCase(), fetchedAt: Date.now() });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      });
+    } catch (_) {}
   }
 
   async function dbPutProject(proj) {
@@ -293,6 +403,16 @@
     });
   }
 
+  async function restoreBackupFolderHandle() {
+    try {
+      const handle = await dbGetSetting("backupDirHandle");
+      if (handle && typeof handle.queryPermission === "function") {
+        state.backupDirHandle = handle;
+        state.backupDirPerm = await handle.queryPermission({ mode: "readwrite" });
+      }
+    } catch (_) {}
+  }
+
   function serializeProjectPayload() {
     const registros = state.points.map(f => {
       const [longitud, latitud] = ol.proj.toLonLat(f.getGeometry().getCoordinates(), map.getView().getProjection());
@@ -311,20 +431,28 @@
         bloques: Array.isArray(f.get("bloques")) ? f.get("bloques") : [],
         aperturasIds: Array.isArray(f.get("aperturasIds")) ? f.get("aperturasIds") : [],
         tipoEquipo: String(f.get("tipoEquipo") || ""),
+        rolPT: String(f.get("rolPT") || ""),
+        accionPT: String(f.get("accionPT") || ""),
+        esRemate: Boolean(f.get("esRemate")),
         colorPersonalizado: String(f.get("colorPersonalizado") || "")
       };
     });
     return {
-      version: 5,
+      version: 6,
       formato: "CentralityLocal",
       id: state.projectId,
       nombre: state.projectName,
       updatedAt: Date.now(),
       multiSupervisorEnabled: state.multiSupervisorEnabled,
       supervisors: [...state.supervisors.values()],
-      bloques: [...state.zones.values()].map(z => ({ id: z.id, nombre: z.name, color: z.color })),
-      registros,
-      zona: zoneOutlineForSave()
+      bloques: [...state.zones.values()].map(z => ({
+        id: z.id,
+        nombre: z.name,
+        color: z.color,
+        customRing: Array.isArray(z.customRing) ? z.customRing : null
+      })),
+      spans: state.spans,
+      registros
     };
   }
 
@@ -334,11 +462,29 @@
     w.clearTimeout(autosaveTimer);
     autosaveTimer = w.setTimeout(() => {
       autosaveNow().catch(err => console.warn("Autosave error:", err));
-    }, 650);
+    }, 450);
+  }
+
+  async function writeToBackupFolder(payload) {
+    if (!state.backupDirHandle) return false;
+    try {
+      const perm = await state.backupDirHandle.queryPermission({ mode: "readwrite" });
+      state.backupDirPerm = perm;
+      if (perm !== "granted") return false;
+      const safeName = state.projectName.replace(/[^a-zA-Z0-9._-]+/g, "_") || "proyecto";
+      const fh = await state.backupDirHandle.getFileHandle(safeName + ".json", { create: true });
+      const writable = await fh.createWritable();
+      await writable.write(JSON.stringify(payload, null, 2));
+      await writable.close();
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   async function autosaveNow() {
-    if (!state.points.length) {
+    const hasAnyData = state.points.length > 0 || [...state.zones.values()].some(z => Array.isArray(z.customRing) && z.customRing.length >= 3);
+    if (!hasAnyData) {
       state.dirty = false;
       updateSaveIndicator("Sin datos");
       return;
@@ -352,27 +498,206 @@
       zoneCount: payload.bloques.length,
       payload
     });
+    const backedUp = await writeToBackupFolder(payload);
     state.dirty = false;
-    updateSaveIndicator("✓ Guardado");
-
-    if (state.backupDirHandle) {
-      try {
-        const perm = await state.backupDirHandle.queryPermission({ mode: "readwrite" });
-        if (perm === "granted") {
-          const safeName = state.projectName.replace(/[^a-zA-Z0-9._-]+/g, "_") || "proyecto";
-          const fh = await state.backupDirHandle.getFileHandle(safeName + ".json", { create: true });
-          const writable = await fh.createWritable();
-          await writable.write(JSON.stringify(payload, null, 2));
-          await writable.close();
-        }
-      } catch (e) {
-        console.warn("Respaldo en carpeta omitido:", e);
-      }
-    }
+    updateSaveIndicator(backedUp ? "✓ Guardado (PC + Local)" : "✓ Guardado");
   }
 
   // =========================================================================
-  // 5. SHELL DOM AISLADO (SHADOW DOM) + ESTILOS DESIGN SYSTEM
+  // 5. MOTOR GNAT DMS (svc_wmc.php + Caché + Grafo MT A->B + Aperturas/Remates)
+  // =========================================================================
+  const CODE_AT_START = /^([A-Z]{0,3}\d{3,8})\b/i;
+  // Permite sufijos en textual_search como "FAG1674 - FAG1665 (Alambre Cu...)"
+  const SPAN_PAIR_REGEX = /^([A-Z]{0,3}\d{3,8})\s*[-–]\s*([A-Z]{0,3}\d{3,8})\b/i;
+  const OPENING_DEVICE_REGEX = /\b(desconectador|fusible|seccionador|seccional|reconectador|cuchilla|interruptor|pole\s*top|\bddff\b|\bddcc\b|\bdf\b|\bdbc\b|\bdc\b|\brc\d*\b)/i;
+  const POLE_CLASS_REGEX = /\b(poste|ensamblado|estructura|torre|c\.a\.)\b/i;
+  const EXCLUDE_NON_POLE_REGEX = /\b(medidor|punto de consumo|cliente|acometida|luminaria)\b/i;
+  const BT_AP_SPAN_REGEX = /\b(tramo a[eé]reo ap|alumbrado|\bbt\b|baja tensi[oó]n|preensamblado\s+1x)\b/i;
+
+  function gnatRequest(url, params, timeoutMs = 8000) {
+    return new Promise((resolve, reject) => {
+      if (!w.Acs?.request || !w.webMap_?.getViewportParams) {
+        return reject(new Error("Sesión GNAT no disponible."));
+      }
+      let settled = false;
+      const timer = w.setTimeout(() => {
+        if (!settled) { settled = true; reject(new Error("Timeout GNAT")); }
+      }, timeoutMs);
+      try {
+        w.Acs.request({
+          url,
+          params,
+          success: (res) => {
+            if (!settled) { settled = true; w.clearTimeout(timer); resolve(res?.data ?? res); }
+          },
+          failure: () => {
+            if (!settled) { settled = true; w.clearTimeout(timer); reject(new Error("Fallo en consulta GNAT")); }
+          }
+        });
+      } catch (e) {
+        if (!settled) { settled = true; w.clearTimeout(timer); reject(e); }
+      }
+    });
+  }
+
+  function buildCandidateSearchQueries(rawCode) {
+    const clean = String(rawCode || "").trim().toUpperCase().replace(/^Poste\s*N?[°º]?\s*/i, "");
+    if (!clean) return [];
+    if (!state.autoPrefixF) return [clean];
+    if (/^\d+$/.test(clean)) return ["F" + clean, clean];
+    if (/^F\d+$/.test(clean)) return [clean, "F" + clean, clean.slice(1)];
+    return [clean, "F" + clean];
+  }
+
+  function parseSpanPair(display, typeStr = "", descStr = "") {
+    const text = String(display || "").trim();
+    const m = SPAN_PAIR_REGEX.exec(text);
+    if (!m) return null;
+    const a = m[1].toUpperCase();
+    const b = m[2].toUpperCase();
+    if (a === b) return null;
+    const meta = `${text} ${typeStr} ${descStr}`;
+    const isBtOrAp = BT_AP_SPAN_REGEX.test(meta) && !/\bMT\b|media tensi[oó]n/i.test(meta);
+    return { from: a, to: b, voltage: isBtOrAp ? "bt" : "mt", display: `${a} - ${b}`, rawDisplay: text };
+  }
+
+  async function resolveCodeInGnat(rawCode, useCache = true) {
+    const queries = buildCandidateSearchQueries(rawCode);
+    for (const q of queries) {
+      if (useCache) {
+        const cached = await dbGetGnatCache(q);
+        if (cached && Array.isArray(cached.lonlat) && cached.lonlat.length === 2) {
+          return cached;
+        }
+      }
+    }
+
+    const wm = w.webMap_;
+    for (const q of queries) {
+      let rows = [];
+      try {
+        const res = await gnatRequest("svc_wmc.php", w.Ext.apply({
+          action: "textual_search",
+          query: q,
+          page: 1,
+          start: 0,
+          limit: 50
+        }, wm.getViewportParams()));
+        rows = Array.isArray(res) ? res : [];
+      } catch (_) { rows = []; }
+      if (!rows.length) continue;
+
+      const spansFromSearch = [];
+      const exactMatches = [];
+      const devicesOnCode = [];
+
+      for (const r of rows) {
+        const disp = String(r?.display || "").trim();
+        const span = parseSpanPair(disp);
+        if (span && (span.from === q || span.to === q)) {
+          spansFromSearch.push({ ...span, id: Number(r.surrogate_in_map_id || r.object_id) });
+          continue;
+        }
+        const m = CODE_AT_START.exec(disp);
+        const token = m ? m[1].toUpperCase() : "";
+        if (token !== q) continue;
+        if (EXCLUDE_NON_POLE_REGEX.test(disp)) continue;
+        if (OPENING_DEVICE_REGEX.test(disp)) {
+          devicesOnCode.push({
+            objectId: Number(r.object_id),
+            surrogateId: Number(r.surrogate_in_map_id || r.object_id),
+            display: disp
+          });
+        }
+        exactMatches.push(r);
+      }
+
+      if (!exactMatches.length) continue;
+      // Priorizar el candidato que sea Poste/Estructura; si solo es un equipo (ej. FBE9179 Reconectador), usarlo
+      exactMatches.sort((a, b) => Number(POLE_CLASS_REGEX.test(b.display)) - Number(POLE_CLASS_REGEX.test(a.display)));
+
+      for (const cand of exactMatches) {
+        const idsToTry = [Number(cand.surrogate_in_map_id), Number(cand.object_id)].filter(n => Number.isFinite(n) && n > 0);
+        for (const id of idsToTry) {
+          try {
+            const geo = await gnatRequest("svc_wmc.php", w.Ext.apply({
+              action: "get_objects_geojson",
+              object_ids: w.Ext.encode([id])
+            }, wm.getViewportParams()));
+            const feat = Array.isArray(geo?.features) ? geo.features[0] : (geo?.geometry ? geo : null);
+            const coords = feat?.geometry?.coordinates;
+            if (feat?.geometry?.type === "Point" && Array.isArray(coords) && coords.length >= 2) {
+              const entry = {
+                code: q,
+                lonlat: [Number(coords[0]), Number(coords[1])],
+                display: String(cand.display || q),
+                objectId: Number(cand.object_id),
+                surrogateId: Number(cand.surrogate_in_map_id || id),
+                isOpeningDevice: OPENING_DEVICE_REGEX.test(cand.display) && !POLE_CLASS_REGEX.test(cand.display),
+                devices: devicesOnCode,
+                spans: spansFromSearch
+              };
+              await dbPutGnatCache(entry);
+              return entry;
+            }
+          } catch (_) {}
+        }
+      }
+    }
+    return null;
+  }
+
+  // Descubre tramos MT y aparatos en la coordenada de un poste (1 request calibrado)
+  async function inspectPoleNeighborhoodInGnat(code, lonlat) {
+    const wm = w.webMap_;
+    const spans = [];
+    const devices = [];
+    const tunings = [
+      { scale: 250, units_per_pixel: 0.9 },
+      { scale: 250, units_per_pixel: 2.2 }
+    ];
+    for (const t of tunings) {
+      let items = [];
+      try {
+        const params = w.Ext.apply({
+          action: "get_objects_info_for_point",
+          lonlat: w.Ext.encode({ lon: Number(lonlat[0]), lat: Number(lonlat[1]) })
+        }, wm.getViewportParams());
+        params.scale = t.scale;
+        params.units_per_pixel = t.units_per_pixel;
+        const res = await gnatRequest("svc_wmc.php", params);
+        items = Array.isArray(res) ? res : [];
+      } catch (_) { items = []; }
+
+      for (const it of items) {
+        const sp = parseSpanPair(it.display, it.type, it.description);
+        if (sp && sp.voltage === "mt" && (sp.from === code || sp.to === code)) {
+          if (!spans.some(x => x.display === sp.display)) {
+            spans.push({ ...sp, id: Number(it.id) });
+          }
+          continue;
+        }
+        const fullText = `${it.display || ""} ${it.type || ""} ${it.description || ""}`;
+        if (OPENING_DEVICE_REGEX.test(fullText)) {
+          const m = CODE_AT_START.exec(String(it.display || "").trim());
+          const devCode = m ? m[1].toUpperCase() : code;
+          if (!devices.some(d => d.id === Number(it.id))) {
+            devices.push({
+              id: Number(it.id),
+              code: devCode,
+              type: String(it.type || "Equipo de apertura"),
+              display: String(it.display || devCode)
+            });
+          }
+        }
+      }
+      if (spans.length > 0) break;
+    }
+    return { spans, devices };
+  }
+
+  // =========================================================================
+  // 6. SHELL DOM AISLADO (SHADOW DOM) + ESTILOS DESIGN SYSTEM
   // =========================================================================
   const host = doc.createElement("div");
   host.id = "centrality-v10-host";
@@ -403,7 +728,7 @@
       color: var(--text-primary);
     }
     * { box-sizing: border-box; }
-    button, input, select { font: inherit; color: inherit; }
+    button, input, select, textarea { font: inherit; color: inherit; }
     button {
       cursor: pointer;
       border: 1px solid transparent;
@@ -411,7 +736,7 @@
       border-radius: 6px;
       display: inline-flex;
       align-items: center;
-      gap: 6px;
+      gap: 5px;
       padding: 5px 9px;
       transition: background 120ms ease, border-color 120ms ease;
     }
@@ -433,15 +758,15 @@
       color: var(--danger);
       font-weight: 600;
     }
-    button.btn-danger:hover:not(:disabled) { background: #FECACA; }
     button.active-pill {
       background: var(--accent-soft);
       color: var(--accent);
       border-color: #93C5FD;
       font-weight: 600;
     }
+    .icon-btn { padding: 5px 7px; justify-content: center; }
 
-    /* TOP CONTEXT BAR */
+    /* TOPBAR */
     .topbar {
       pointer-events: auto;
       position: fixed;
@@ -460,26 +785,15 @@
       box-shadow: var(--shadow);
       backdrop-filter: blur(8px);
     }
-    .topbar-left, .topbar-right {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      min-width: 0;
-    }
-    .divider {
-      width: 1px;
-      height: 22px;
-      background: var(--border);
-      margin: 0 2px;
-      flex-shrink: 0;
-    }
+    .topbar-left, .topbar-right { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .divider { width: 1px; height: 22px; background: var(--border); margin: 0 2px; flex-shrink: 0; }
     .proj-name {
       font-weight: 600;
       font-size: 13px;
       border: 1px solid transparent;
       border-radius: 5px;
       padding: 3px 6px;
-      max-width: 190px;
+      max-width: 185px;
       background: transparent;
       text-overflow: ellipsis;
     }
@@ -496,7 +810,7 @@
     }
     .save-badge.dirty { background: #FEF3C7; color: #92400E; }
 
-    /* BOTTOM-CENTER CURSOR DOCK */
+    /* DOCK */
     .dock {
       pointer-events: auto;
       position: fixed;
@@ -513,25 +827,17 @@
       box-shadow: var(--shadow);
       backdrop-filter: blur(8px);
     }
-    .dock button {
-      border-radius: 999px;
-      padding: 6px 12px;
-      font-size: 12px;
-      font-weight: 600;
-    }
-    .dock button.active {
-      background: var(--text-primary);
-      color: #fff;
-    }
+    .dock button { border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 600; }
+    .dock button.active { background: var(--text-primary); color: #fff; }
 
-    /* RIGHT TABLE DRAWER */
+    /* DRAWER */
     .drawer {
       pointer-events: auto;
       position: fixed;
       top: 64px;
       right: 10px;
       bottom: 14px;
-      width: 356px;
+      width: 376px;
       max-width: calc(100vw - 20px);
       background: var(--bg-surface);
       border: 1px solid var(--border);
@@ -550,29 +856,29 @@
       gap: 8px;
       background: #fff;
     }
-    .search-row {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
+    .search-row { display: flex; align-items: center; gap: 5px; }
     .search-box {
       flex: 1;
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 5px;
       border: 1px solid var(--border);
       border-radius: 6px;
-      padding: 5px 8px;
+      padding: 4px 7px;
       background: #F8FAFC;
     }
     .search-box:focus-within { border-color: var(--accent); background: #fff; }
-    .search-box input {
-      border: none;
-      outline: none;
-      background: transparent;
-      width: 100%;
-      font-size: 12px;
+    .search-box input { border: none; outline: none; background: transparent; width: 100%; font-size: 12px; }
+    .pin-f {
+      font-size: 11px;
+      font-weight: 800;
+      padding: 4px 7px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #fff;
+      color: var(--text-secondary);
     }
+    .pin-f.on { background: #1E293B; color: #fff; border-color: #1E293B; }
     .stepper {
       display: flex;
       align-items: center;
@@ -583,15 +889,10 @@
       font-size: 11px;
       font-weight: 600;
     }
-    .stepper button { padding: 4px 6px; border-radius: 4px; }
-    .stepper span { padding: 0 5px; color: var(--text-secondary); white-space: nowrap; }
+    .stepper button { padding: 4px 5px; border-radius: 4px; }
+    .stepper span { padding: 0 4px; color: var(--text-secondary); white-space: nowrap; }
 
-    .filter-chips {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 4px;
-      align-items: center;
-    }
+    .filter-chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
     .chip {
       font-size: 11px;
       font-weight: 600;
@@ -603,31 +904,12 @@
       gap: 5px;
     }
     .chip:hover { background: var(--bg-muted); color: var(--text-primary); }
-    .chip.on {
-      background: var(--text-primary);
-      color: #fff;
-      border-color: var(--text-primary);
-    }
-    .dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      display: inline-block;
-      flex-shrink: 0;
-    }
+    .chip.on { background: var(--text-primary); color: #fff; border-color: var(--text-primary); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 
     /* TABLE */
-    .table-wrap {
-      flex: 1;
-      overflow: auto;
-      background: #fff;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      table-layout: fixed;
-      font-size: 12px;
-    }
+    .table-wrap { flex: 1; overflow: auto; background: #fff; outline: none; }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
     thead th {
       position: sticky;
       top: 0;
@@ -640,26 +922,43 @@
       font-weight: 700;
       color: var(--text-secondary);
       text-transform: uppercase;
-      letter-spacing: 0.02em;
     }
-    tbody tr {
-      border-bottom: 1px solid #F1F5F9;
-      cursor: pointer;
-    }
+    tbody tr { border-bottom: 1px solid #F1F5F9; cursor: pointer; }
     tbody tr:hover { background: #F8FAFC; }
-    tbody tr.focused { background: #EFF6FF; }
+    tbody tr.focused { background: #DBEAFE !important; }
     tbody tr.selected { background: #F0F9FF; }
-    tbody td {
-      padding: 6px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      vertical-align: middle;
-    }
-    .num-cell {
+    tbody tr.linked-highlight { background: #FEF2F2; }
+    tbody td { padding: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+    .num-cell { font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+    .eq-badge {
+      display: inline-block;
+      font-size: 10px;
       font-weight: 700;
-      font-variant-numeric: tabular-nums;
-      color: var(--text-secondary);
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: #FEE2E2;
+      color: #991B1B;
+      margin-left: 4px;
+    }
+    .remate-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: #E0E7FF;
+      color: #1E40AF;
+      margin-left: 4px;
+    }
+    .link-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: #F1F5F9;
+      color: #475569;
+      margin-left: 4px;
     }
     .zone-pill {
       display: inline-flex;
@@ -692,27 +991,27 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 6px;
+      gap: 5px;
       flex-wrap: wrap;
     }
     .ctx-bar.hidden { display: none; }
     .ctx-bar button {
       color: #fff;
-      background: rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.14);
       font-size: 11px;
       font-weight: 600;
-      padding: 5px 8px;
+      padding: 5px 7px;
     }
-    .ctx-bar button:hover { background: rgba(255,255,255,0.22); }
+    .ctx-bar button:hover { background: rgba(255,255,255,0.24); }
     .ctx-bar button.ctx-accent { background: var(--accent); }
     .ctx-bar button.ctx-danger { background: var(--danger); }
 
-    /* POPOVER / DROPDOWN */
+    /* POPOVER */
     .popover {
       pointer-events: auto;
       position: fixed;
-      min-width: 240px;
-      max-width: 340px;
+      min-width: 260px;
+      max-width: 360px;
       background: #fff;
       border: 1px solid var(--border);
       border-radius: 10px;
@@ -723,38 +1022,15 @@
       flex-direction: column;
       gap: 4px;
     }
-    .pop-title {
-      font-size: 11px;
-      font-weight: 700;
-      color: var(--text-secondary);
-      text-transform: uppercase;
-      padding: 4px 6px 2px;
-    }
-    .pop-item {
-      width: 100%;
-      justify-content: flex-start;
-      padding: 6px 8px;
-      font-size: 12px;
-      border-radius: 6px;
-    }
+    .pop-title { font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; padding: 4px 6px 2px; }
+    .pop-item { width: 100%; justify-content: flex-start; padding: 6px 8px; font-size: 12px; border-radius: 6px; }
     .pop-sep { height: 1px; background: var(--border); margin: 4px 0; }
-    .palette-grid {
-      display: grid;
-      grid-template-columns: repeat(5, 1fr);
-      gap: 6px;
-      padding: 6px;
-    }
-    .swatch {
-      width: 26px;
-      height: 26px;
-      border-radius: 6px;
-      border: 2px solid rgba(0,0,0,0.12);
-      cursor: pointer;
-      padding: 0;
-    }
-    .swatch:hover { transform: scale(1.1); }
+    .palette-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; padding: 6px; }
+    .swatch { width: 22px; height: 22px; border-radius: 6px; border: 2px solid rgba(0,0,0,0.14); cursor: pointer; padding: 0; flex-shrink: 0; }
+    .inline-input-row { display: flex; gap: 4px; padding: 3px; align-items: center; }
+    .inline-input-row input { flex: 1; border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font-size: 12px; min-width: 0; }
 
-    /* MODAL / START SCREEN */
+    /* MODAL */
     .modal-backdrop {
       pointer-events: auto;
       position: fixed;
@@ -766,7 +1042,7 @@
     }
     .modal-backdrop.hidden { display: none; }
     .modal-card {
-      width: min(560px, 94vw);
+      width: min(600px, 94vw);
       max-height: 86vh;
       background: #fff;
       border-radius: 12px;
@@ -775,43 +1051,17 @@
       flex-direction: column;
       overflow: hidden;
     }
-    .modal-head {
-      padding: 14px 18px;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
+    .modal-head { padding: 14px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
     .modal-head h2 { margin: 0; font-size: 16px; }
-    .modal-body {
-      padding: 16px 18px;
-      overflow: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .dropzone {
-      border: 2px dashed var(--border-strong);
-      border-radius: 10px;
-      padding: 22px;
-      text-align: center;
-      background: #F8FAFC;
-      cursor: pointer;
-      transition: border-color 150ms, background 150ms;
-    }
+    .modal-body { padding: 16px 18px; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
+    .dropzone { border: 2px dashed var(--border-strong); border-radius: 10px; padding: 20px; text-align: center; background: #F8FAFC; cursor: pointer; }
     .dropzone.drag { border-color: var(--accent); background: var(--accent-soft); }
-    .recent-item {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 9px 11px;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      cursor: pointer;
-    }
+    .recent-item { display: flex; align-items: center; justify-content: space-between; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
     .recent-item:hover { background: #F8FAFC; border-color: var(--border-strong); }
+    .form-grid { display: grid; grid-template-columns: 115px 1fr; gap: 8px 10px; align-items: center; font-size: 12px; }
+    .form-grid input, .form-grid select { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; width: 100%; }
 
-    /* BANNER DE MODO ACTIVO & TOAST */
+    /* MODE BANNER & TOAST */
     .mode-banner {
       pointer-events: auto;
       position: fixed;
@@ -850,12 +1100,10 @@
     }
     .toast.show { opacity: 1; }
     .toast.err { background: #991B1B; }
-
-    /* INLINE PIN POPOVER */
     .pin-form {
       pointer-events: auto;
       position: fixed;
-      width: 260px;
+      width: 280px;
       background: #fff;
       border: 1px solid var(--border);
       border-radius: 10px;
@@ -866,14 +1114,7 @@
       flex-direction: column;
       gap: 8px;
     }
-    .pin-form input, .pin-form select {
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 6px 8px;
-      width: 100%;
-    }
-
-    /* COLLAPSED FAB */
+    .pin-form input, .pin-form select { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; width: 100%; }
     .fab {
       pointer-events: auto;
       position: fixed;
@@ -905,15 +1146,18 @@
   };
 
   // =========================================================================
-  // 6. CONSTRUCCIÓN DE LA INTERFAZ (3 ZONAS)
+  // 7. CONSTRUCCIÓN DE LA INTERFAZ (3 ZONAS)
   // =========================================================================
-  // 6.1 TOPBAR
   const topbar = el("header", "topbar");
   const topLeft = el("div", "topbar-left", null, topbar);
   const topRight = el("div", "topbar-right", null, topbar);
 
   const btnArchivo = el("button", "btn-outline", "📁 Archivo ▾", topLeft);
-  btnArchivo.title = "Proyectos recientes, importar o guardar copia";
+  btnArchivo.title = "Proyectos recientes, importar KMZ/JSON/Preset PT o exportar CSV";
+
+  const btnQuickSave = el("button", "btn-outline icon-btn", "💾", topLeft);
+  btnQuickSave.title = "Guardar copia del proyecto (.json)";
+  btnQuickSave.onclick = () => downloadJSON();
 
   const projNameInput = el("input", "proj-name", null, topLeft);
   projNameInput.type = "text";
@@ -928,34 +1172,47 @@
   const saveBadge = el("span", "save-badge", "Sin datos", topLeft);
   el("div", "divider", null, topLeft);
 
-  const btnZonas = el("button", "btn-outline", "Zonas ▾", topLeft);
-  btnZonas.title = "Crear, filtrar o cambiar colores de zonas desconectadas";
+  const btnZonas = el("button", "btn-outline", "Zonas y Polígonos (D/T/F) ▾", topLeft);
+  btnZonas.title = "Generar, editar o dibujar polígonos de Zona Desconectada (D), Zona de Trabajo (T) y Punto de Faenas (F)";
+
+  const btnAnalyzeMt = el("button", "btn-primary", "⚡ Analizar Red MT (Aperturas y Remates)", topLeft);
+  btnAnalyzeMt.title = "Recorre los tramos MT desde los postes seleccionados (o Zona T), dibuja vectores A→B y detecta aperturas cercanas y remates aguas abajo";
 
   const btnVista = el("button", "btn-outline", "Vista mapa ▾", topLeft);
-  btnVista.title = "Envolventes, línea de ruta 1→2→3, etiquetas y detalle MT/BT";
+  btnVista.title = "Mostrar/ocultar postes, polígonos, tramos MT, etiquetas y detalle WMTS";
 
   const btnHerramientas = el("button", "btn-outline", "Herramientas ▾", topLeft);
-  btnHerramientas.title = "Pegar lista de códigos, equipo/supervisores y exportar plano PDF";
+  btnHerramientas.title = "Buscar/pegar lista de códigos en GNAT, equipo de supervisores y demo Atlas PDF";
+
+  const btnHidePoles = el("button", "btn-outline", "👁 Postes", topRight);
+  btnHidePoles.title = "Ocultar o mostrar pines de postes para editar polígonos cómodamente";
+  btnHidePoles.onclick = () => {
+    state.hidePoles = !state.hidePoles;
+    btnHidePoles.classList.toggle("active-pill", state.hidePoles);
+    btnHidePoles.textContent = state.hidePoles ? "🚫 Postes ocultos" : "👁 Postes";
+    rebuildOverlayLayers();
+  };
+
+  const btnFitAll = el("button", "btn-outline icon-btn", "⛶", topRight);
+  btnFitAll.title = "Encuadrar todos los elementos visibles";
+  btnFitAll.onclick = () => {
+    const vis = getFilteredPoints().map(f => state.points.indexOf(f));
+    if (vis.length) fitPoints(vis);
+  };
 
   const btnToggleDrawer = el("button", "active-pill", "☰ Tabla", topRight);
-  btnToggleDrawer.title = "Mostrar u ocultar listado lateral de postes";
+  const btnCollapse = el("button", "btn-outline icon-btn", "—", topRight);
+  const btnClose = el("button", "btn-outline icon-btn", "×", topRight);
 
-  const btnCollapse = el("button", "btn-outline", "—", topRight);
-  btnCollapse.title = "Minimizar barra";
-
-  const btnClose = el("button", "btn-outline", "×", topRight);
-  btnClose.title = "Cerrar Centrality V10 (no cierra GNAT)";
-
-  // 6.2 DOCK INFERIOR DE CURSOR
+  // DOCK INFERIOR
   const dock = el("div", "dock");
   const btnModeNav = el("button", "active", "↖ Navegar", dock);
-  btnModeNav.title = "Clic para centrar punto · Ctrl+clic para multiselección";
   const btnModeBox = el("button", "", "⬚ Seleccionar área", dock);
-  btnModeBox.title = "Arrastra un rectángulo en el mapa para seleccionar varios puntos (atajo: Shift+arrastrar)";
   const btnModeAdd = el("button", "", "+ Agregar en mapa", dock);
-  btnModeAdd.title = "Pincha en el mapa para crear un poste o apertura nueva";
+  const btnModePoly = el("button", "", "✏️ Editar polígono", dock);
+  btnModePoly.title = "Arrastrar vértices de polígonos D/T/F (oculta o ignora pines de postes al arrastrar)";
 
-  // 6.3 CAJÓN LATERAL DE TABLA
+  // CAJÓN LATERAL
   const drawer = el("aside", "drawer");
   const drawerHead = el("div", "drawer-head", null, drawer);
   const searchRow = el("div", "search-row", null, drawerHead);
@@ -964,36 +1221,39 @@
   el("span", "", "🔍", searchBox);
   const searchInput = el("input", "", null, searchBox);
   searchInput.type = "search";
-  searchInput.placeholder = "Buscar N°, código o zona...";
+  searchInput.placeholder = "Filtrar o Enter para buscar en GNAT...";
+  searchInput.title = "Filtra la tabla o presiona Enter para buscar el código directamente en GNAT";
+
+  const btnPinF = el("button", "pin-f on", "F", searchRow);
+  btnPinF.title = "Autocompletar prefijo 'F' (Frontel) en búsquedas de postes (activo)";
+  btnPinF.onclick = () => {
+    state.autoPrefixF = !state.autoPrefixF;
+    btnPinF.classList.toggle("on", state.autoPrefixF);
+    showToast(state.autoPrefixF ? "Prefijo automático 'F' (Frontel) activado." : "Prefijo automático 'F' desactivado.");
+  };
 
   const stepper = el("div", "stepper", null, searchRow);
   const btnPrev = el("button", "", "◀", stepper);
-  btnPrev.title = "Poste anterior";
   const stepLabel = el("span", "", "0/0", stepper);
   const btnNext = el("button", "", "▶", stepper);
-  btnNext.title = "Siguiente poste";
 
   const filterChips = el("div", "filter-chips", null, drawerHead);
-
   const tableWrap = el("div", "table-wrap", null, drawer);
+  tableWrap.tabIndex = 0;
   const table = el("table", "", null, tableWrap);
   const thead = el("thead", "", null, table);
   const tbody = el("tbody", "", null, table);
-
   const ctxBar = el("div", "ctx-bar hidden", null, drawer);
 
-  // 6.4 BANNER, TOAST, MODAL, FAB
   const modeBanner = el("div", "mode-banner hidden");
   const modeBannerText = el("span", "", "", modeBanner);
-  const modeBannerCancel = el("button", "", "Cancelar (Esc)", modeBanner);
-  modeBannerCancel.style.cssText = "background:rgba(255,255,255,0.18);color:#fff;padding:2px 8px;font-size:11px;";
+  const modeBannerAction = el("button", "", "Terminar (Esc)", modeBanner);
+  modeBannerAction.style.cssText = "background:rgba(255,255,255,0.22);color:#fff;padding:3px 9px;font-size:11px;";
 
   const toastEl = el("div", "toast");
   const modalBackdrop = el("div", "modal-backdrop hidden");
   const fab = el("button", "fab hidden", "☰");
-  fab.title = "Restaurar Centrality V10";
 
-  // Inputs ocultos para archivos
   const hiddenFileInput = el("input", "", null, root);
   hiddenFileInput.type = "file";
   hiddenFileInput.accept = ".kmz,.kml,.json,.csv";
@@ -1009,7 +1269,7 @@
     toastEl.textContent = msg;
     toastEl.className = "toast show" + (isError ? " err" : "");
     w.clearTimeout(toastTimer);
-    toastTimer = w.setTimeout(() => toastEl.classList.remove("show"), 3200);
+    toastTimer = w.setTimeout(() => toastEl.classList.remove("show"), 3600);
   }
 
   function closePopover() {
@@ -1020,7 +1280,7 @@
   }
 
   // =========================================================================
-  // 7. MOTOR DE CAPAS OPENLAYERS (PUNTOS + ENVOLVENTES + RUTA)
+  // 8. CAPAS OPENLAYERS: PUNTOS, VECTORES MT (A->B), POLÍGONOS EDITABLES D/T/F
   // =========================================================================
   function getFilteredPoints() {
     const q = state.search.trim().toLocaleLowerCase("es");
@@ -1034,9 +1294,10 @@
       }
       if (state.filterSups.size > 0 && !state.filterSups.has(getSupId(f))) return false;
       if (q) {
-        const zId = String(f.get("bloqueId") || "");
-        const zName = state.zones.get(zId)?.name || "";
-        const haystack = `${f.get("numero")} ${getPointCode(f)} ${zId} ${zName}`.toLocaleLowerCase("es");
+        const zids = getPointZoneIds(f).join(" ");
+        const eq = String(f.get("tipoEquipo") || "");
+        const rol = String(f.get("rolPT") || "");
+        const haystack = `${f.get("numero")} ${getPointCode(f)} ${zids} ${eq} ${rol}`.toLocaleLowerCase("es");
         if (!haystack.includes(q)) return false;
       }
       return true;
@@ -1044,17 +1305,21 @@
   }
 
   function pointStyleFn(f, resolution) {
+    if (state.hidePoles) return null;
     const visibleSet = pointStyleFn._visibleSet;
     if (visibleSet && !visibleSet.has(f)) return null;
 
     const idx = state.points.indexOf(f);
     const isOpening = f.get("tipo") === "APERTURA";
+    const isRemate = Boolean(f.get("esRemate"));
     const isFocused = state.focused === idx;
     const isSelected = state.selected.has(idx);
+    const isLinkedPeer = pointStyleFn._linkedSet?.has(f) || false;
     const color = getPointColor(f);
-    const showText = state.labelMode === "siempre" ||
+    const rolPT = String(f.get("rolPT") || "").trim();
+    const showText = state.labelMode === "siempre" || isFocused || isLinkedPeer ||
       (state.labelMode === "cerca" && resolution < UMBRAL_ETIQUETA);
-    const key = `${color}|${isOpening}|${isFocused}|${isSelected}|${showText}|${state.labelContent}`;
+    const key = `${color}|${isOpening}|${isRemate}|${isFocused}|${isSelected}|${isLinkedPeer}|${showText}|${state.labelContent}|${rolPT}`;
 
     let cache = styleCache.get(f);
     if (!cache) {
@@ -1063,45 +1328,53 @@
     }
     if (cache.has(key)) return cache.get(key);
 
+    let labelStr = state.labelContent === "completo"
+      ? `${rolPT || f.get("numero")} · ${getPointCode(f)}`
+      : String(rolPT || f.get("numero"));
+
     const style = new ol.style.Style({
       image: isOpening
         ? new ol.style.RegularShape({
             points: 4,
-            radius: isFocused ? 13 : isSelected ? 12 : 10,
+            radius: isFocused ? 14 : (isSelected || isLinkedPeer) ? 12 : 10,
             radius2: 0,
             angle: Math.PI / 4,
             stroke: new ol.style.Stroke({
-              color: isSelected ? "#1D4ED8" : OPENING_COLOR,
-              width: isFocused ? 5 : 4
+              color: isSelected ? "#1D4ED8" : color,
+              width: isFocused || isLinkedPeer ? 5 : 4
             })
           })
-        : new ol.style.Circle({
-            radius: isFocused ? 10 : isSelected ? 9 : 7,
-            fill: new ol.style.Fill({ color }),
-            stroke: new ol.style.Stroke({
-              color: isSelected ? "#1D4ED8" : isFocused ? "#0F172A" : "#FFFFFF",
-              width: isSelected || isFocused ? 3 : 2
+        : isRemate
+          ? new ol.style.RegularShape({
+              points: 3,
+              radius: isFocused ? 11 : 9,
+              fill: new ol.style.Fill({ color }),
+              stroke: new ol.style.Stroke({ color: "#FFFFFF", width: 2.5 })
             })
-          }),
+          : new ol.style.Circle({
+              radius: isFocused ? 10.5 : (isSelected || isLinkedPeer) ? 9 : 7,
+              fill: new ol.style.Fill({ color }),
+              stroke: new ol.style.Stroke({
+                color: isSelected ? "#1D4ED8" : isFocused ? "#0F172A" : isLinkedPeer ? "#DC2626" : "#FFFFFF",
+                width: isSelected || isFocused || isLinkedPeer ? 3 : 2
+              })
+            }),
       text: showText ? new ol.style.Text({
-        text: state.labelContent === "completo"
-          ? `${f.get("numero")} · ${getPointCode(f)}`
-          : String(f.get("numero")),
+        text: labelStr,
         font: "700 12px Arial,sans-serif",
         offsetY: isFocused ? -22 : -18,
         fill: new ol.style.Fill({ color: "#FFFFFF" }),
         stroke: new ol.style.Stroke({ color: "#0F172A", width: 3.5 })
       }) : undefined,
-      zIndex: isFocused ? 100 : isSelected ? 50 : 10
+      zIndex: isFocused ? 100 : isLinkedPeer ? 80 : isSelected ? 50 : 10
     });
     cache.set(key, style);
     return style;
   }
 
-  // Convex Hull simple (Andrew's monotone chain) para dibujar envolventes de zona
-  function convexHull(coords) {
-    if (coords.length < 3) return coords;
-    const pts = coords.slice().sort((a, b) => a[0] === b[0] ? a[1] - b[1] : a[0] - b[0]);
+  function convexHullLonLat(lonLatPairs) {
+    if (lonLatPairs.length < 3) return lonLatPairs.slice();
+    const pts = lonLatPairs.slice().sort((a, b) => a[0] === b[0] ? a[1] - b[1] : a[0] - b[0]);
     const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
     const lower = [];
     for (const p of pts) {
@@ -1116,54 +1389,196 @@
     }
     lower.pop();
     upper.pop();
+    // Expandir un pequeño margen visual (~14 metros) alrededor de los postes para que el polígono envuelva limpio
+    if (lower.length + upper.length >= 3) {
+      const ring = lower.concat(upper);
+      const cx = ring.reduce((s, p) => s + p[0], 0) / ring.length;
+      const cy = ring.reduce((s, p) => s + p[1], 0) / ring.length;
+      return ring.map(p => {
+        const dx = p[0] - cx, dy = p[1] - cy;
+        const dist = Math.hypot(dx, dy) || 1;
+        return [Number((p[0] + (dx / dist) * 0.00014).toFixed(7)), Number((p[1] + (dy / dist) * 0.00012).toFixed(7))];
+      });
+    }
     return lower.concat(upper);
+  }
+
+  function getZoneRingLonLat(zoneId) {
+    const z = state.zones.get(zoneId);
+    if (!z) return null;
+    if (Array.isArray(z.customRing) && z.customRing.length >= 3) {
+      return z.customRing;
+    }
+    const proj = map.getView().getProjection();
+    const zPts = state.points
+      .filter(f => getPointZoneIds(f).includes(zoneId))
+      .map(f => ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj));
+    if (zPts.length < 3) return null;
+    return convexHullLonLat(zPts);
+  }
+
+  function generateZonePolygonFromPoints(zoneId) {
+    const z = state.zones.get(zoneId);
+    if (!z) return false;
+    const proj = map.getView().getProjection();
+    const zPts = state.points
+      .filter(f => getPointZoneIds(f).includes(zoneId))
+      .map(f => ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj));
+    if (zPts.length < 3) {
+      showToast(`La zona "${z.name}" necesita al menos 3 puntos para autogenerar polígono (o dibújalo a mano).`, true);
+      return false;
+    }
+    z.customRing = convexHullLonLat(zPts);
+    markDirty();
+    rebuildOverlayLayers();
+    showToast(`Polígono de "${z.name}" generado y listo para editar.`);
+    return true;
   }
 
   function rebuildOverlayLayers() {
     const visible = getFilteredPoints();
     pointStyleFn._visibleSet = new Set(visible);
+    const proj = map.getView().getProjection();
 
-    if (hullLayer) {
-      map.removeLayer(hullLayer);
-      hullLayer = null;
-    }
-    if (routeLayer) {
-      map.removeLayer(routeLayer);
-      routeLayer = null;
-    }
+    const focusedFeat = state.points[state.focused];
+    const linkedPeers = focusedFeat
+      ? (focusedFeat.get("tipo") === "APERTURA"
+          ? getLinkedPostesForOpening(focusedFeat)
+          : getLinkedOpeningsForPoste(focusedFeat))
+      : [];
+    pointStyleFn._linkedSet = new Set(linkedPeers);
 
-    if (state.showHulls && ol.geom?.Polygon && state.zones.size > 0) {
+    if (hullLayer) { map.removeLayer(hullLayer); hullLayer = null; }
+    if (spanLayer) { map.removeLayer(spanLayer); spanLayer = null; }
+    if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+    if (linkLayer) { map.removeLayer(linkLayer); linkLayer = null; }
+
+    // 1. Polígonos D / T / F + Vértices de edición nativos
+    if (state.showHulls && ol.geom?.Polygon) {
       const hullFeatures = [];
       for (const z of state.zones.values()) {
-        const zCoords = visible
-          .filter(f => getPointZoneIds(f).includes(z.id))
-          .map(f => f.getGeometry().getCoordinates().slice(0, 2));
-        if (zCoords.length >= 3) {
-          const hull = convexHull(zCoords);
-          hull.push(hull[0]);
-          const hf = new ol.Feature({ geometry: new ol.geom.Polygon([hull]) });
-          hf.setStyle(new ol.style.Style({
-            fill: new ol.style.Fill({ color: hexToRgba(z.color, 0.12) }),
-            stroke: new ol.style.Stroke({ color: z.color, width: 2, lineDash: [6, 4] }),
+        if (state.filterZones.size > 0 && !state.filterZones.has(z.id)) continue;
+        const ringLonLat = getZoneRingLonLat(z.id);
+        if (!ringLonLat || ringLonLat.length < 3) continue;
+
+        const mapRing = ringLonLat.map(pt => ol.proj.fromLonLat([Number(pt[0]), Number(pt[1])], proj));
+        mapRing.push(mapRing[0]);
+        const hf = new ol.Feature({ geometry: new ol.geom.Polygon([mapRing]), zoneId: z.id });
+
+        const isEditingThis = (state.cursorMode === "edit-poly") && (!state.editingZoneId || state.editingZoneId === z.id);
+        const styles = [
+          new ol.style.Style({
+            fill: new ol.style.Fill({ color: hexToRgba(z.color, isEditingThis ? 0.18 : 0.12) }),
+            stroke: new ol.style.Stroke({
+              color: z.color,
+              width: isEditingThis ? 3 : 2.2,
+              lineDash: z.id === "D" ? [8, 5] : undefined
+            }),
             text: new ol.style.Text({
               text: z.name || z.id,
               font: "700 13px Arial,sans-serif",
               fill: new ol.style.Fill({ color: z.color }),
               stroke: new ol.style.Stroke({ color: "#FFFFFF", width: 4 })
             })
+          })
+        ];
+
+        // Dibujar manillas de vértices blancos y puntos medios azules cuando estamos editando polígonos
+        if (isEditingThis) {
+          for (let i = 0; i < mapRing.length - 1; i++) {
+            const curr = mapRing[i];
+            const next = mapRing[i + 1];
+            const vStyle = new ol.style.Style({
+              geometry: new ol.geom.Point(curr),
+              image: new ol.style.Circle({
+                radius: 7,
+                fill: new ol.style.Fill({ color: "#FFFFFF" }),
+                stroke: new ol.style.Stroke({ color: z.color, width: 3 })
+              }),
+              zIndex: 200
+            });
+            styles.push(vStyle);
+
+            // Punto medio para insertar un nuevo vértice arrastrando
+            const mid = [(curr[0] + next[0]) / 2, (curr[1] + next[1]) / 2];
+            const mStyle = new ol.style.Style({
+              geometry: new ol.geom.Point(mid),
+              image: new ol.style.Circle({
+                radius: 4.5,
+                fill: new ol.style.Fill({ color: z.color }),
+                stroke: new ol.style.Stroke({ color: "#FFFFFF", width: 1.5 })
+              }),
+              zIndex: 190
+            });
+            styles.push(mStyle);
+          }
+        }
+
+        hf.setStyle(styles);
+        hullFeatures.push(hf);
+      }
+
+      // Si está dibujando un polígono nuevo, mostrar vista previa
+      if (state.cursorMode === "draw-poly" && state.drawingCoords.length > 0) {
+        const z = state.zones.get(state.editingZoneId) || { color: "#1D4ED8" };
+        const ptsMap = state.drawingCoords.map(c => ol.proj.fromLonLat(c, proj));
+        if (ptsMap.length >= 2 && ol.geom?.LineString) {
+          const lf = new ol.Feature({ geometry: new ol.geom.LineString([...ptsMap, ptsMap[0]]) });
+          lf.setStyle(new ol.style.Style({
+            stroke: new ol.style.Stroke({ color: z.color, width: 2.5, lineDash: [5, 5] })
           }));
-          hullFeatures.push(hf);
+          hullFeatures.push(lf);
+        }
+        for (const pm of ptsMap) {
+          const pf = new ol.Feature({ geometry: new ol.geom.Point(pm) });
+          pf.setStyle(new ol.style.Style({
+            image: new ol.style.Circle({
+              radius: 6,
+              fill: new ol.style.Fill({ color: "#FFFFFF" }),
+              stroke: new ol.style.Stroke({ color: z.color, width: 3 })
+            })
+          }));
+          hullFeatures.push(pf);
         }
       }
+
       if (hullFeatures.length) {
         hullLayer = new ol.layer.Vector({
           source: new ol.source.Vector({ features: hullFeatures }),
-          zIndex: 99998
+          zIndex: 99996
         });
         map.addLayer(hullLayer);
       }
     }
 
+    // 2. Vectores de tramos MT (A->B) descubiertos en GNAT
+    if (state.showSpans && state.spans.length > 0 && ol.geom?.LineString) {
+      const spanFeats = [];
+      for (const sp of state.spans) {
+        if (!Array.isArray(sp.coords) || sp.coords.length < 2) continue;
+        const mapCoords = sp.coords.map(c => ol.proj.fromLonLat([Number(c[0]), Number(c[1])], proj));
+        const sf = new ol.Feature({ geometry: new ol.geom.LineString(mapCoords) });
+        sf.setStyle(new ol.style.Style({
+          stroke: new ol.style.Stroke({ color: "#DC2626", width: 3.5 }),
+          text: state.labelMode === "siempre" ? new ol.style.Text({
+            text: sp.display || `${sp.from}-${sp.to}`,
+            font: "600 10px Arial",
+            fill: new ol.style.Fill({ color: "#991B1B" }),
+            stroke: new ol.style.Stroke({ color: "#FFFFFF", width: 3 })
+          }) : undefined
+        }));
+        spanFeats.push(sf);
+      }
+      if (spanFeats.length) {
+        spanLayer = new ol.layer.Vector({
+          source: new ol.source.Vector({ features: spanFeats }),
+          zIndex: 99997
+        });
+        map.addLayer(spanLayer);
+      }
+    }
+
+    // 3. Línea secuencial de ruta (1->2->3)
     if (state.showRoute && ol.geom?.LineString) {
       const routePts = visible
         .filter(f => (f.get("tipo") || "PUNTO") === "PUNTO")
@@ -1177,10 +1592,28 @@
         }));
         routeLayer = new ol.layer.Vector({
           source: new ol.source.Vector({ features: [rf] }),
-          zIndex: 99999
+          zIndex: 99998
         });
         map.addLayer(routeLayer);
       }
+    }
+
+    // 4. Rayos entre poste enfocado y sus aperturas vinculadas
+    if (state.showLinks && focusedFeat && linkedPeers.length > 0 && ol.geom?.LineString) {
+      const origin = focusedFeat.getGeometry().getCoordinates().slice(0, 2);
+      const linkFeats = linkedPeers.map(peer => {
+        const dest = peer.getGeometry().getCoordinates().slice(0, 2);
+        const lf = new ol.Feature({ geometry: new ol.geom.LineString([origin, dest]) });
+        lf.setStyle(new ol.style.Style({
+          stroke: new ol.style.Stroke({ color: OPENING_COLOR, width: 2.2, lineDash: [4, 4] })
+        }));
+        return lf;
+      });
+      linkLayer = new ol.layer.Vector({
+        source: new ol.source.Vector({ features: linkFeats }),
+        zIndex: 99999
+      });
+      map.addLayer(linkLayer);
     }
 
     if (vectorLayer) vectorLayer.changed();
@@ -1204,15 +1637,14 @@
     const zoom = Math.max(Number.isFinite(view.getZoom()) ? view.getZoom() : 0, 17.5);
     const xy = f.getGeometry().getCoordinates();
     const res = view.getResolutionForZoom?.(zoom);
-    const drawerRightOffset = state.drawerOpen && !state.collapsed ? 180 : 0;
+    const drawerRightOffset = state.drawerOpen && !state.collapsed ? 188 : 0;
     const center = Number.isFinite(res) && drawerRightOffset
       ? [xy[0] + drawerRightOffset * res, xy[1]]
       : xy;
-    view.animate({ center, zoom, duration: 280 });
+    view.animate({ center, zoom, duration: 250 });
     renderTable();
     rebuildOverlayLayers();
-    const rowEl = tbody.querySelector(`tr[data-idx="${index}"]`);
-    rowEl?.scrollIntoView({ block: "nearest" });
+    tbody.querySelector(`tr[data-idx="${index}"]`)?.scrollIntoView({ block: "nearest" });
   }
 
   function fitPoints(indices) {
@@ -1220,22 +1652,407 @@
     if (!coords.length) return;
     if (coords.length === 1) { navigateTo(indices[0]); return; }
     const xs = coords.map(c => c[0]), ys = coords.map(c => c[1]);
-    const padRight = state.drawerOpen && !state.collapsed ? 380 : 40;
+    const padRight = state.drawerOpen && !state.collapsed ? 395 : 40;
     map.getView().fit([Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)], {
       size: map.getSize(),
       padding: [70, padRight, 70, 40],
       maxZoom: 17.5,
-      duration: 300
+      duration: 280
     });
   }
 
   // =========================================================================
-  // 8. RENDER DE TABLA, CHIPS DINÁMICOS Y BARRA CONTEXTUAL
+  // 9. ALGORITMO INTERACTIVO DE RED MT: TRAMOS A->B, APERTURAS Y REMATES
+  // =========================================================================
+  function upsertPointOnMap({ codigo, lonlat, tipo = "PUNTO", bloqueId = "D", bloques = ["D"], tipoEquipo = "", rolPT = "", accionPT = "", esRemate = false }) {
+    const cleanCode = String(codigo || "").trim().toUpperCase();
+    const proj = map.getView().getProjection();
+    let existing = state.points.find(f => getPointCode(f).toUpperCase() === cleanCode && (f.get("tipo") || "PUNTO") === tipo);
+    if (existing) {
+      existing.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(lonlat, proj)));
+      if (tipoEquipo && !existing.get("tipoEquipo")) existing.set("tipoEquipo", tipoEquipo);
+      if (esRemate) existing.set("esRemate", true);
+      if (bloqueId && !existing.get("bloqueId")) existing.set("bloqueId", bloqueId);
+      const curBloques = Array.isArray(existing.get("bloques")) ? existing.get("bloques") : [];
+      if (bloques.length) existing.set("bloques", [...new Set([...curBloques, ...bloques])]);
+      return existing;
+    }
+    const nextNum = 1 + Math.max(0, ...state.points.map(p => Number(p.get("numero")) || 0));
+    const feat = new ol.Feature({
+      geometry: new ol.geom.Point(ol.proj.fromLonLat(lonlat, proj)),
+      id: `${tipo === "APERTURA" ? "ap" : "p"}-${cleanCode}-${Date.now()}`,
+      numero: nextNum,
+      tipo,
+      codigo: cleanCode,
+      bloqueId,
+      bloques,
+      aperturasIds: [],
+      supervisorId: "default",
+      tipoEquipo,
+      rolPT,
+      accionPT,
+      esRemate
+    });
+    state.points.push(feat);
+    return feat;
+  }
+
+  async function runMtNetworkDiscovery() {
+    // 1. Determinar postes semilla (Seleccionados > Zona T > Zona F > Todos los postes)
+    const proj = map.getView().getProjection();
+    let seedFeats = [...state.selected].map(i => state.points[i]).filter(f => f && f.get("tipo") !== "APERTURA");
+    if (!seedFeats.length) {
+      seedFeats = state.points.filter(f => f.get("tipo") !== "APERTURA" && (getPointZoneIds(f).includes("T") || getPointZoneIds(f).includes("F")));
+    }
+    if (!seedFeats.length) {
+      seedFeats = state.points.filter(f => f.get("tipo") !== "APERTURA");
+    }
+    if (!seedFeats.length) {
+      showToast("Agrega o selecciona al menos un poste de trabajo para analizar la red MT.", true);
+      return;
+    }
+
+    // Aperturas ya declaradas en el proyecto (ej. FBE9179, FF4840) actúan como frontera inmediata
+    const knownOpenings = new Set(
+      state.points.filter(f => f.get("tipo") === "APERTURA").map(f => getPointCode(f).toUpperCase())
+    );
+
+    const visitedPoles = new Set();
+    const coordByCode = new Map();
+    const queue = [];
+
+    for (const f of state.points) {
+      const c = getPointCode(f).toUpperCase();
+      coordByCode.set(c, ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj));
+    }
+    for (const f of seedFeats) {
+      const c = getPointCode(f).toUpperCase();
+      if (!visitedPoles.has(c)) {
+        visitedPoles.add(c);
+        queue.push({ code: c, hops: 0 });
+      }
+    }
+
+    const discoveredOpenings = [];
+    const discoveredRemates = [];
+    const discoveredSpans = new Map(state.spans.map(s => [s.display, s]));
+    const MAX_HOPS = 18;
+    const MAX_NODES = 45;
+    let cancelled = false;
+
+    setCursorMode("nav", "⚡ Analizando red MT en GNAT... (Esc para detener)");
+    modeBannerAction.onclick = () => { cancelled = true; setCursorMode("nav"); };
+
+    try {
+      while (queue.length > 0 && visitedPoles.size <= MAX_NODES && !cancelled) {
+        const { code, hops } = queue.shift();
+        modeBannerText.textContent = `⚡ Analizando MT: poste ${code} (${visitedPoles.size} visitados · ${discoveredSpans.size} tramos)...`;
+
+        let gnatEntry = await resolveCodeInGnat(code, true);
+        let lonlat = gnatEntry?.lonlat || coordByCode.get(code);
+        if (!lonlat) continue;
+        coordByCode.set(code, lonlat);
+
+        // Asegurar que el poste esté dibujado en el mapa dentro de la Zona Desconectada (D)
+        upsertPointOnMap({ codigo: code, lonlat, tipo: "PUNTO", bloqueId: "D", bloques: ["D"] });
+
+        // Si este poste ya es una apertura conocida o GNAT informa un equipo de maniobra aquí
+        const devicesHere = [...(gnatEntry?.devices || [])];
+        const neighborhood = await inspectPoleNeighborhoodInGnat(code, lonlat);
+        for (const d of neighborhood.devices) {
+          if (!devicesHere.some(x => x.display === d.display)) devicesHere.push(d);
+        }
+
+        if (knownOpenings.has(code) || gnatEntry?.isOpeningDevice || devicesHere.length > 0) {
+          const eqName = devicesHere[0]?.type || devicesHere[0]?.display || "Equipo de apertura MT";
+          upsertPointOnMap({
+            codigo: code,
+            lonlat,
+            tipo: "APERTURA",
+            bloqueId: "D",
+            bloques: ["D"],
+            tipoEquipo: eqName
+          });
+          if (!discoveredOpenings.some(x => x.code === code)) {
+            discoveredOpenings.push({ code, equipo: eqName, lonlat });
+          }
+          // Si no es uno de los postes semilla de trabajo, la apertura corta esta rama aquí
+          const isSeed = seedFeats.some(f => getPointCode(f).toUpperCase() === code);
+          if (!isSeed) {
+            ensureVectorLayer();
+            rebuildOverlayLayers();
+            continue;
+          }
+        }
+
+        // Recolectar aristas MT (tanto de textual_search como de vecindad espacial)
+        const allSpansHere = [
+          ...(gnatEntry?.spans || []).filter(s => s.voltage === "mt"),
+          ...neighborhood.spans
+        ];
+
+        const neighbors = new Set();
+        for (const sp of allSpansHere) {
+          const other = sp.from === code ? sp.to : sp.to === code ? sp.from : null;
+          if (!other) continue;
+          neighbors.add(other);
+
+          // Resolver coordenada del vecino para trazar el vector A->B de inmediato
+          let otherCoord = coordByCode.get(other);
+          if (!otherCoord) {
+            const otherEntry = await resolveCodeInGnat(other, true);
+            if (otherEntry?.lonlat) {
+              otherCoord = otherEntry.lonlat;
+              coordByCode.set(other, otherCoord);
+              upsertPointOnMap({ codigo: other, lonlat: otherCoord, tipo: "PUNTO", bloqueId: "D", bloques: ["D"] });
+            }
+          }
+          if (otherCoord) {
+            const key = [code, other].sort().join(" - ");
+            discoveredSpans.set(key, {
+              id: sp.id || 0,
+              from: code,
+              to: other,
+              display: `${code} - ${other}`,
+              voltage: "mt",
+              coords: [lonlat, otherCoord]
+            });
+          }
+        }
+
+        state.spans = [...discoveredSpans.values()];
+
+        // ¿Es un remate aguas abajo? (Solo 1 vecino MT conectado)
+        if (neighbors.size === 1 && hops > 0) {
+          const feat = state.points.find(f => getPointCode(f).toUpperCase() === code && f.get("tipo") !== "APERTURA");
+          if (feat) feat.set("esRemate", true);
+          if (!discoveredRemates.includes(code)) discoveredRemates.push(code);
+        }
+
+        // Expandir hacia vecinos no visitados
+        if (hops < MAX_HOPS) {
+          for (const nb of neighbors) {
+            if (knownOpenings.has(nb)) {
+              const nbEntry = await resolveCodeInGnat(nb, true);
+              const nbCoord = nbEntry?.lonlat || coordByCode.get(nb);
+              if (nbCoord) {
+                upsertPointOnMap({ codigo: nb, lonlat: nbCoord, tipo: "APERTURA", bloqueId: "D", bloques: ["D"], tipoEquipo: nbEntry?.display || "Apertura MT" });
+                if (!discoveredOpenings.some(x => x.code === nb)) {
+                  discoveredOpenings.push({ code: nb, equipo: nbEntry?.display || "Apertura MT", lonlat: nbCoord });
+                }
+              }
+              continue;
+            }
+            if (!visitedPoles.has(nb)) {
+              visitedPoles.add(nb);
+              queue.push({ code: nb, hops: hops + 1 });
+            }
+          }
+        }
+
+        ensureVectorLayer();
+        renderTable();
+        rebuildOverlayLayers();
+      }
+    } finally {
+      setCursorMode("nav");
+    }
+
+    // Autogenerar el polígono de Zona Desconectada (D) con todos los postes alcanzados si aún no tenía edición manual
+    const zoneD = state.zones.get("D");
+    if (zoneD && (!Array.isArray(zoneD.customRing) || zoneD.customRing.length < 3)) {
+      generateZonePolygonFromPoints("D");
+    }
+    const zoneT = state.zones.get("T");
+    if (zoneT && (!Array.isArray(zoneT.customRing) || zoneT.customRing.length < 3)) {
+      const tPts = state.points.filter(f => getPointZoneIds(f).includes("T"));
+      if (tPts.length >= 3) generateZonePolygonFromPoints("T");
+    }
+
+    markDirty();
+    refreshAll();
+    openMtDiscoverySummaryModal({
+      visitedCount: visitedPoles.size,
+      spanCount: state.spans.length,
+      openings: discoveredOpenings,
+      remates: discoveredRemates,
+      openQueue: queue.map(q => q.code)
+    });
+  }
+
+  btnAnalyzeMt.onclick = runMtNetworkDiscovery;
+
+  function openMtDiscoverySummaryModal(summary) {
+    modalBackdrop.replaceChildren();
+    modalBackdrop.classList.remove("hidden");
+    const card = el("div", "modal-card", null, modalBackdrop);
+    const head = el("div", "modal-head", null, card);
+    el("h2", "", "Resultado de Análisis MT (Tramos, Aperturas y Remates)", head);
+    const bClose = el("button", "btn-outline", "Cerrar", head);
+    bClose.onclick = closeModal;
+
+    const body = el("div", "modal-body", null, card);
+    const isClosed = summary.openings.length > 0 && summary.openQueue.length === 0;
+    const banner = el("div", "", null, body);
+    banner.style.cssText = `padding:10px 12px;border-radius:8px;font-weight:700;background:${isClosed ? "#DCFCE7" : "#FEF3C7"};color:${isClosed ? "#15803D" : "#92400E"};`;
+    banner.textContent = isClosed
+      ? `✓ Zona MT delimitada: ${summary.openings.length} apertura(s) y ${summary.remates.length} remate(s) cierran el tramo.`
+      : `⚠️ Análisis parcial / para revisión del supervisor (${summary.openings.length} apertura(s) · ${summary.openQueue.length} rama(s) por verificar).`;
+
+    el("div", "", `Postes MT trazados: ${summary.visitedCount} · Vectores A→B dibujados: ${summary.spanCount}`, body).style.fontSize = "12px";
+
+    if (summary.openings.length) {
+      el("div", "pop-title", "Aperturas detectadas / confirmadas (✕)", body);
+      for (const op of summary.openings) {
+        const row = el("div", "recent-item", null, body);
+        el("strong", "", `✕ ${op.code}`, row).style.color = OPENING_COLOR;
+        el("span", "", op.equipo, row).style.cssText = "font-size:12px;color:var(--text-secondary);";
+      }
+    }
+
+    if (summary.remates.length) {
+      el("div", "pop-title", "Remates aguas abajo detectados (▲)", body);
+      el("div", "", summary.remates.join(", "), body).style.cssText = "font-size:12px;font-weight:600;color:#1E40AF;";
+    }
+
+    if (summary.openQueue.length) {
+      el("div", "pop-title", "Ramas pendientes de cierre manual", body);
+      el("div", "", summary.openQueue.join(", "), body).style.cssText = "font-size:12px;color:#92400E;";
+    }
+
+    const footer = el("div", "", null, body);
+    footer.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:6px;";
+    const bEditPoly = el("button", "btn-outline", "✏️ Ajustar polígono D en mapa", footer);
+    bEditPoly.onclick = () => {
+      closeModal();
+      startPolygonEditMode("D");
+    };
+    const bOk = el("button", "btn-primary", "Aceptar", footer);
+    bOk.onclick = closeModal;
+  }
+
+  // =========================================================================
+  // 10. EDITOR NATIVO DE POLÍGONOS (D / T / F) CON AUTOGUARDADO REAL
+  // =========================================================================
+  function startPolygonEditMode(zoneId = null) {
+    state.editingZoneId = zoneId;
+    if (zoneId) {
+      const ring = getZoneRingLonLat(zoneId);
+      const z = state.zones.get(zoneId);
+      if (z && (!z.customRing || z.customRing.length < 3) && ring && ring.length >= 3) {
+        z.customRing = ring.map(p => [p[0], p[1]]);
+      }
+    }
+    setCursorMode(
+      "edit-poly",
+      `✏️ Editando polígono ${zoneId || "D/T/F"} · Arrastra círculos blancos · Arrastra punto medio para añadir · Clic derecho en vértice para borrar`
+    );
+    rebuildOverlayLayers();
+  }
+
+  function startPolygonDrawMode(zoneId) {
+    state.editingZoneId = zoneId;
+    state.drawingCoords = [];
+    const z = state.zones.get(zoneId);
+    setCursorMode(
+      "draw-poly",
+      `🖊 Dibujando polígono "${z?.name || zoneId}" · Haz clic en el mapa para marcar cada esquina (mín. 3) y pulsa Terminar`
+    );
+    rebuildOverlayLayers();
+  }
+
+  function finishPolygonDrawMode() {
+    if (state.cursorMode === "draw-poly" && state.editingZoneId) {
+      const z = state.zones.get(state.editingZoneId);
+      if (z && state.drawingCoords.length >= 3) {
+        z.customRing = state.drawingCoords.slice();
+        markDirty();
+        showToast(`Polígono "${z.name}" guardado. Puedes ajustar sus vértices.`);
+      }
+    }
+    state.drawingCoords = [];
+    state.editingZoneId = null;
+    setCursorMode("nav");
+    rebuildOverlayLayers();
+  }
+
+  // Hit-test sobre vértices y puntos medios de los polígonos en píxeles de pantalla
+  function findPolygonVertexAtPixel(pixel) {
+    const proj = map.getView().getProjection();
+    for (const z of state.zones.values()) {
+      if (state.editingZoneId && state.editingZoneId !== z.id) continue;
+      const ring = getZoneRingLonLat(z.id);
+      if (!ring || ring.length < 3) continue;
+      // 1. Revisar vértices principales
+      for (let i = 0; i < ring.length; i++) {
+        const px = map.getPixelFromCoordinate(ol.proj.fromLonLat(ring[i], proj));
+        if (px && Math.hypot(px[0] - pixel[0], px[1] - pixel[1]) <= 13) {
+          return { zoneId: z.id, vertexIdx: i, isMidpoint: false };
+        }
+      }
+      // 2. Revisar puntos medios de aristas (para insertar nuevo vértice)
+      for (let i = 0; i < ring.length; i++) {
+        const next = ring[(i + 1) % ring.length];
+        const midLonLat = [(ring[i][0] + next[0]) / 2, (ring[i][1] + next[1]) / 2];
+        const px = map.getPixelFromCoordinate(ol.proj.fromLonLat(midLonLat, proj));
+        if (px && Math.hypot(px[0] - pixel[0], px[1] - pixel[1]) <= 11) {
+          return { zoneId: z.id, vertexIdx: i + 1, isMidpoint: true, midLonLat };
+        }
+      }
+    }
+    return null;
+  }
+
+  const viewportEl = map.getViewport?.();
+  if (viewportEl) {
+    viewportEl.addEventListener("pointerdown", (ev) => {
+      if (state.cursorMode !== "edit-poly" || ev.button !== 0) return;
+      const pixel = map.getEventPixel(ev);
+      const hit = findPolygonVertexAtPixel(pixel);
+      if (!hit) return;
+      ev.stopPropagation();
+      ev.preventDefault();
+      const z = state.zones.get(hit.zoneId);
+      if (!z.customRing) z.customRing = getZoneRingLonLat(hit.zoneId).map(p => [p[0], p[1]]);
+      if (hit.isMidpoint) {
+        z.customRing.splice(hit.vertexIdx, 0, [hit.midLonLat[0], hit.midLonLat[1]]);
+      }
+      draggingVertex = { zoneId: hit.zoneId, vertexIdx: hit.vertexIdx };
+      rebuildOverlayLayers();
+    }, true);
+
+    viewportEl.addEventListener("pointermove", (ev) => {
+      if (!draggingVertex) return;
+      ev.stopPropagation();
+      ev.preventDefault();
+      const pixel = map.getEventPixel(ev);
+      const coord = map.getCoordinateFromPixel(pixel);
+      if (!coord) return;
+      const [lon, lat] = ol.proj.toLonLat(coord, map.getView().getProjection());
+      const z = state.zones.get(draggingVertex.zoneId);
+      if (z && Array.isArray(z.customRing) && z.customRing[draggingVertex.vertexIdx]) {
+        z.customRing[draggingVertex.vertexIdx] = [Number(lon.toFixed(7)), Number(lat.toFixed(7))];
+        rebuildOverlayLayers();
+      }
+    }, true);
+
+    w.addEventListener("pointerup", () => {
+      if (draggingVertex) {
+        draggingVertex = null;
+        markDirty();
+        showToast("Polígono actualizado y guardado.");
+      }
+    }, true);
+  }
+
+  // =========================================================================
+  // 11. RENDER DE TABLA, CHIPS DINÁMICOS Y BARRA CONTEXTUAL
   // =========================================================================
   function renderFilterChips() {
     filterChips.replaceChildren();
-    const makeChip = (label, isOn, onClick, dotColor = null) => {
+    const makeChip = (label, isOn, onClick, dotColor = null, title = "") => {
       const c = el("button", "chip" + (isOn ? " on" : ""), null, filterChips);
+      if (title) c.title = title;
       if (dotColor) {
         const d = el("span", "dot", null, c);
         d.style.background = dotColor;
@@ -1245,29 +2062,37 @@
       return c;
     };
 
-    makeChip("Todos", state.filterType === "all", () => { state.filterType = "all"; refreshAll(); });
+    const hasAnyFilter = state.filterType !== "all" || state.filterZones.size > 0 || state.filterSups.size > 0;
+    makeChip("Todos", !hasAnyFilter, () => {
+      state.filterType = "all";
+      state.filterZones.clear();
+      state.filterSups.clear();
+      refreshAll();
+    });
+
     makeChip("Postes", state.filterType === "PUNTO", () => {
       state.filterType = state.filterType === "PUNTO" ? "all" : "PUNTO";
       refreshAll();
     });
+
     makeChip("Aperturas ✕", state.filterType === "APERTURA", () => {
       state.filterType = state.filterType === "APERTURA" ? "all" : "APERTURA";
       refreshAll();
     }, OPENING_COLOR);
+
+    for (const z of state.zones.values()) {
+      makeChip(z.id, state.filterZones.has(z.id), () => {
+        if (state.filterZones.has(z.id)) state.filterZones.delete(z.id);
+        else state.filterZones.add(z.id);
+        refreshAll();
+      }, z.color, z.name);
+    }
 
     makeChip("Sin zona", state.filterZones.has("__NONE__"), () => {
       if (state.filterZones.has("__NONE__")) state.filterZones.delete("__NONE__");
       else state.filterZones.add("__NONE__");
       refreshAll();
     });
-
-    for (const z of state.zones.values()) {
-      makeChip(z.name || z.id, state.filterZones.has(z.id), () => {
-        if (state.filterZones.has(z.id)) state.filterZones.delete(z.id);
-        else state.filterZones.add(z.id);
-        refreshAll();
-      }, z.color);
-    }
 
     if (isMultiSupActive()) {
       for (const s of state.supervisors.values()) {
@@ -1276,7 +2101,7 @@
           if (state.filterSups.has(s.id)) state.filterSups.delete(s.id);
           else state.filterSups.add(s.id);
           refreshAll();
-        }, s.color);
+        }, s.color, s.name);
       }
     }
   }
@@ -1284,15 +2109,21 @@
   function renderTable() {
     const visible = getFilteredPoints();
     const multiSup = isMultiSupActive();
+    const focusedFeat = state.points[state.focused];
+    const linkedPeerSet = new Set(
+      focusedFeat
+        ? (focusedFeat.get("tipo") === "APERTURA"
+            ? getLinkedPostesForOpening(focusedFeat)
+            : getLinkedOpeningsForPoste(focusedFeat))
+        : []
+    );
 
-    // Header
     thead.replaceChildren();
     const trh = el("tr", "", null, thead);
     const thCheck = el("th", "", null, trh);
-    thCheck.style.width = "30px";
+    thCheck.style.width = "28px";
     const checkAll = el("input", "", null, thCheck);
     checkAll.type = "checkbox";
-    checkAll.title = "Seleccionar todos los visibles";
     checkAll.checked = visible.length > 0 && visible.every(f => state.selected.has(state.points.indexOf(f)));
     checkAll.indeterminate = !checkAll.checked && visible.some(f => state.selected.has(state.points.indexOf(f)));
     checkAll.onchange = () => {
@@ -1305,26 +2136,30 @@
       rebuildOverlayLayers();
     };
 
-    const thN = el("th", "", "N°", trh);
-    thN.style.width = "40px";
+    const thN = el("th", "", "Rol/N°", trh);
+    thN.style.width = "48px";
     el("th", "", "Código", trh);
-    const thZ = el("th", "", "Zona", trh);
-    thZ.style.width = "92px";
+    const thZ = el("th", "", "D / T / F", trh);
+    thZ.style.width = "88px";
     if (multiSup) {
       const thS = el("th", "", "Sup.", trh);
-      thS.style.width = "42px";
+      thS.style.width = "40px";
     }
 
-    // Body via DocumentFragment
     const frag = doc.createDocumentFragment();
     for (const f of visible) {
       const idx = state.points.indexOf(f);
       const isSel = state.selected.has(idx);
       const isFoc = state.focused === idx;
+      const isLinked = linkedPeerSet.has(f);
       const tr = doc.createElement("tr");
       tr.dataset.idx = String(idx);
       if (isSel) tr.classList.add("selected");
       if (isFoc) tr.classList.add("focused");
+      else if (isLinked) tr.classList.add("linked-highlight");
+
+      const pColor = getPointColor(f);
+      tr.style.borderLeft = `3px solid ${pColor}`;
 
       const tdCb = doc.createElement("td");
       const cb = doc.createElement("input");
@@ -1342,29 +2177,57 @@
 
       const tdN = doc.createElement("td");
       tdN.className = "num-cell";
-      tdN.textContent = String(f.get("numero"));
+      tdN.textContent = String(f.get("rolPT") || f.get("numero"));
       tr.appendChild(tdN);
 
       const tdCode = doc.createElement("td");
       const isAp = f.get("tipo") === "APERTURA";
-      tdCode.textContent = (isAp ? "✕ " : "") + getPointCode(f);
-      tdCode.title = tdCode.textContent;
-      if (isAp) tdCode.style.color = OPENING_COLOR;
-      tdCode.style.fontWeight = "600";
+      const codeSpan = doc.createElement("span");
+      codeSpan.textContent = (isAp ? "✕ " : "") + getPointCode(f);
+      if (isAp) codeSpan.style.color = OPENING_COLOR;
+      codeSpan.style.fontWeight = "600";
+      tdCode.appendChild(codeSpan);
+
+      const eqType = String(f.get("tipoEquipo") || "").trim();
+      if (eqType) {
+        const eq = doc.createElement("span");
+        eq.className = "eq-badge";
+        eq.textContent = eqType;
+        tdCode.appendChild(eq);
+      }
+      if (f.get("esRemate")) {
+        const rb = doc.createElement("span");
+        rb.className = "remate-badge";
+        rb.textContent = "▲ Remate";
+        tdCode.appendChild(rb);
+      }
+
+      const linkedCount = isAp ? getLinkedPostesForOpening(f).length : getLinkedOpeningsForPoste(f).length;
+      if (linkedCount > 0) {
+        const lb = doc.createElement("span");
+        lb.className = "link-badge";
+        lb.textContent = isAp ? `${linkedCount}p` : `${linkedCount}✕`;
+        tdCode.appendChild(lb);
+      }
+      tdCode.title = `${getPointCode(f)} ${f.get("accionPT") ? "· " + f.get("accionPT") : ""}`;
       tr.appendChild(tdCode);
 
       const tdZ = doc.createElement("td");
       const zids = getPointZoneIds(f);
       if (zids.length) {
-        const z = state.zones.get(zids[0]);
-        const pill = doc.createElement("span");
-        pill.className = "zone-pill";
-        const c = z?.color || HIGH_CONTRAST_PALETTE[0];
-        pill.style.background = hexToRgba(c, 0.16);
-        pill.style.color = "#0F172A";
-        pill.style.border = `1px solid ${c}`;
-        pill.textContent = zids.length > 1 ? `${z?.name || zids[0]} +${zids.length - 1}` : (z?.name || zids[0]);
-        tdZ.appendChild(pill);
+        for (const zid of zids.slice(0, 3)) {
+          const z = state.zones.get(zid);
+          const pill = doc.createElement("span");
+          pill.className = "zone-pill";
+          pill.style.marginRight = "2px";
+          const c = z?.color || HIGH_CONTRAST_PALETTE[0];
+          pill.style.background = hexToRgba(c, 0.16);
+          pill.style.color = "#0F172A";
+          pill.style.border = `1px solid ${c}`;
+          pill.textContent = zid;
+          pill.title = z?.name || zid;
+          tdZ.appendChild(pill);
+        }
       } else {
         tdZ.textContent = "—";
         tdZ.style.color = "#94A3B8";
@@ -1379,12 +2242,12 @@
         b.style.background = sup.color;
         b.style.color = contrastText(sup.color);
         b.textContent = sup.initials;
-        b.title = sup.name;
         tdS.appendChild(b);
         tr.appendChild(tdS);
       }
 
       tr.onclick = () => navigateTo(idx);
+      tr.ondblclick = (ev) => { ev.stopPropagation(); openEditPointModal(idx); };
       tr.oncontextmenu = (ev) => {
         ev.preventDefault();
         if (!state.selected.has(idx)) {
@@ -1399,11 +2262,9 @@
     }
     tbody.replaceChildren(frag);
 
-    // Stepper
     const pos = visible.findIndex(f => state.points.indexOf(f) === state.focused);
     stepLabel.textContent = visible.length ? `${pos >= 0 ? pos + 1 : 0}/${visible.length}` : "0/0";
     btnPrev.disabled = btnNext.disabled = visible.length === 0;
-
     renderContextActionBar();
   }
 
@@ -1414,14 +2275,24 @@
       return;
     }
     ctxBar.classList.remove("hidden");
-    const count = el("span", "", `${state.selected.size} sel.`, ctxBar);
-    count.style.fontWeight = "700";
+    el("span", "", `${state.selected.size} sel.`, ctxBar).style.fontWeight = "700";
 
-    const btnZone = el("button", "ctx-accent", "Zona ▾", ctxBar);
+    const btnD = el("button", "", "→ D", ctxBar);
+    btnD.title = "Asignar a Zona Desconectada (D)";
+    btnD.onclick = () => assignZoneToIndices([...state.selected], "D");
+
+    const btnT = el("button", "", "→ T", ctxBar);
+    btnT.title = "Asignar a Zona de Trabajo (T)";
+    btnT.onclick = () => assignZoneToIndices([...state.selected], "T");
+
+    const btnF = el("button", "", "→ F", ctxBar);
+    btnF.title = "Asignar a Punto de Faenas (F)";
+    btnF.onclick = () => assignZoneToIndices([...state.selected], "F");
+
+    const btnZone = el("button", "ctx-accent", "Zonas ▾", ctxBar);
     btnZone.onclick = (ev) => openAssignZonePopover(ev.currentTarget);
 
     const btnLink = el("button", "", "Vincular ✕", ctxBar);
-    btnLink.title = "Clic en una apertura del mapa (o en punto vacío para crearla) y asociar los postes seleccionados";
     btnLink.onclick = () => startLinkOpeningMode([...state.selected]);
 
     const btnMore = el("button", "", "Más ▾", ctxBar);
@@ -1431,7 +2302,6 @@
     };
 
     const btnClear = el("button", "", "×", ctxBar);
-    btnClear.title = "Deseleccionar (Esc)";
     btnClear.onclick = () => { state.selected.clear(); refreshAll(); };
   }
 
@@ -1442,56 +2312,53 @@
   }
 
   // =========================================================================
-  // 9. ACCIONES DE ASIGNACIÓN, ZONAS, SUPERVISORES Y EDICIÓN
+  // 12. ASIGNACIÓN DE ZONAS, COLORES, SUPERVISORES Y POPOVERS
   // =========================================================================
-  function assignZoneToIndices(indices, zoneId) {
+  function assignZoneToIndices(indices, zoneId, additive = true) {
     if (!indices.length) return;
     for (const idx of indices) {
       const f = state.points[idx];
       if (!f) continue;
-      if (f.get("tipo") === "APERTURA") {
-        const cur = Array.isArray(f.get("bloques")) ? f.get("bloques") : [];
-        f.set("bloques", zoneId ? [...new Set([...cur, zoneId])] : []);
+      if (!zoneId) {
+        f.set("bloqueId", "");
+        f.set("bloques", []);
       } else {
-        f.set("bloqueId", zoneId || "");
+        const cur = Array.isArray(f.get("bloques")) ? f.get("bloques") : [];
+        const next = additive ? [...new Set([...cur, zoneId])] : [zoneId];
+        f.set("bloqueId", zoneId);
+        f.set("bloques", next);
       }
     }
     styleCache = new WeakMap();
     markDirty();
     refreshAll();
-    showToast(zoneId ? `Asignados ${indices.length} punto(s) a ${state.zones.get(zoneId)?.name || zoneId}.` : "Zona quitada.");
+    showToast(zoneId ? `Asignados ${indices.length} elemento(s) a ${state.zones.get(zoneId)?.name || zoneId}.` : "Zona quitada.");
+  }
+
+  function assignCustomColorToIndices(indices, hexColor) {
+    for (const idx of indices) {
+      const f = state.points[idx];
+      if (f) f.set("colorPersonalizado", hexColor || "");
+    }
+    styleCache = new WeakMap();
+    markDirty();
+    refreshAll();
   }
 
   function assignSupervisorToIndices(indices, supId) {
-    if (!indices.length) return;
     if (supId !== "default") state.multiSupervisorEnabled = true;
     for (const idx of indices) {
       const f = state.points[idx];
-      if (!f) continue;
-      f.set("supervisorId", supId);
+      if (f) f.set("supervisorId", supId);
     }
     styleCache = new WeakMap();
     markDirty();
     refreshAll();
-    const s = state.supervisors.get(supId);
-    showToast(`Responsable: ${s?.name || supId} (${indices.length} punto(s)).`);
   }
 
   function deleteIndices(indices) {
-    if (!indices.length) return;
     const toRemove = new Set(indices);
-    const removedOpeningIds = new Set(
-      indices.map(i => state.points[i]).filter(f => f?.get("tipo") === "APERTURA").map(f => String(f.get("id")))
-    );
     state.points = state.points.filter((_, i) => !toRemove.has(i));
-    if (removedOpeningIds.size) {
-      for (const f of state.points) {
-        const refs = f.get("aperturasIds");
-        if (Array.isArray(refs)) {
-          f.set("aperturasIds", refs.filter(id => !removedOpeningIds.has(String(id))));
-        }
-      }
-    }
     state.selected.clear();
     state.focused = -1;
     ensureVectorLayer();
@@ -1502,19 +2369,16 @@
 
   function createZone(name, color) {
     let n = state.zones.size + 1;
-    while (state.zones.has("D" + n)) n++;
-    const id = "D" + n;
+    while (state.zones.has("Z" + n)) n++;
+    const id = "Z" + n;
     const used = new Set([...state.zones.values()].map(z => z.color.toUpperCase()));
     const chosenColor = isHex(color) ? color : nextHighContrastColor(used);
-    state.zones.set(id, { id, name: name || `Zona ${n}`, color: chosenColor });
+    state.zones.set(id, { id, name: name || `Zona ${n}`, color: chosenColor, customRing: null });
     markDirty();
     refreshAll();
     return id;
   }
 
-  // =========================================================================
-  // 10. POPOVERS Y MENÚ CONTEXTUAL
-  // =========================================================================
   function showPopoverAt(x, y, buildFn, anchorBottom = false) {
     closePopover();
     const pop = el("div", "popover");
@@ -1534,34 +2398,43 @@
   function openAssignZonePopover(anchorEl) {
     const r = anchorEl.getBoundingClientRect();
     showPopoverAt(r.left, r.top - 6, (pop) => {
-      el("div", "pop-title", "Agrupar en Zona", pop);
+      el("div", "pop-title", "Asignar seleccionados a Zona", pop);
       for (const z of state.zones.values()) {
         const b = el("button", "pop-item", null, pop);
         const d = el("span", "dot", null, b);
         d.style.background = z.color;
-        el("span", "", z.name || z.id, b);
-        b.onclick = () => { closePopover(); assignZoneToIndices([...state.selected], z.id); };
+        el("span", "", `${z.id} · ${z.name}`, b);
+        b.onclick = () => { closePopover(); assignZoneToIndices([...state.selected], z.id, true); };
       }
-      const bNone = el("button", "pop-item", "Quitar de zona", pop);
-      bNone.onclick = () => { closePopover(); assignZoneToIndices([...state.selected], ""); };
+      const bNone = el("button", "pop-item", "Quitar de todas las zonas", pop);
+      bNone.onclick = () => { closePopover(); assignZoneToIndices([...state.selected], "", false); };
+
       el("div", "pop-sep", null, pop);
-      const bNew = el("button", "pop-item", "+ Crear zona con seleccionados...", pop);
-      bNew.style.fontWeight = "600";
-      bNew.style.color = "var(--accent)";
-      bNew.onclick = () => {
-        const nombre = w.prompt("Nombre de la nueva zona (ej. Desconexión 1):", `Zona ${state.zones.size + 1}`);
-        if (!nombre) return;
-        const zid = createZone(nombre.trim());
+      const newRow = el("div", "inline-input-row", null, pop);
+      const inpName = el("input", "", null, newRow);
+      inpName.placeholder = "Nueva zona...";
+      const bCreate = el("button", "btn-primary", "Crear", newRow);
+      bCreate.onclick = () => {
+        if (!inpName.value.trim()) return;
+        const zid = createZone(inpName.value.trim());
         closePopover();
-        assignZoneToIndices([...state.selected], zid);
+        assignZoneToIndices([...state.selected], zid, false);
       };
     }, true);
   }
 
   function openSelectionMorePopover(x, y) {
     showPopoverAt(x, y, (pop) => {
+      if (state.selected.size === 1) {
+        const onlyIdx = [...state.selected][0];
+        const bEdit = el("button", "pop-item", "✏️ Editar código / tipo / condición...", pop);
+        bEdit.onclick = () => { closePopover(); openEditPointModal(onlyIdx); };
+      }
       const bFit = el("button", "pop-item", "🔍 Encuadrar selección en mapa", pop);
       bFit.onclick = () => { closePopover(); fitPoints([...state.selected]); };
+
+      const bColor = el("button", "pop-item", "🎨 Cambiar color individual ▾", pop);
+      bColor.onclick = () => openColorPickerPopover(bColor, "#00C853", (c) => assignCustomColorToIndices([...state.selected], c), true);
 
       el("div", "pop-sep", null, pop);
       el("div", "pop-title", "Responsable (opcional)", pop);
@@ -1583,15 +2456,27 @@
   function openContextMenu(x, y, idx) {
     showPopoverAt(x, y, (pop) => {
       const f = state.points[idx];
-      el("div", "pop-title", `${f.get("numero")} · ${getPointCode(f)}`, pop);
+      el("div", "pop-title", `${f.get("rolPT") || f.get("numero")} · ${getPointCode(f)}`, pop);
       const bCenter = el("button", "pop-item", "🎯 Centrar en mapa", pop);
       bCenter.onclick = () => { closePopover(); navigateTo(idx); };
 
-      const bZone = el("button", "pop-item", "🏷 Asignar a Zona ▾", pop);
+      const bEdit = el("button", "pop-item", "✏️ Editar propiedades...", pop);
+      bEdit.onclick = () => { closePopover(); openEditPointModal(idx); };
+
+      const bToggleType = el("button", "pop-item", f.get("tipo") === "APERTURA" ? "🔄 Convertir en Poste normal" : "✕ Marcar como Apertura (✕)", pop);
+      bToggleType.onclick = () => {
+        closePopover();
+        f.set("tipo", f.get("tipo") === "APERTURA" ? "PUNTO" : "APERTURA");
+        styleCache = new WeakMap();
+        markDirty();
+        refreshAll();
+      };
+
+      const bZone = el("button", "pop-item", "🏷 Asignar a Zona (D / T / F) ▾", pop);
       bZone.onclick = () => openAssignZonePopover(bZone);
 
-      const bLink = el("button", "pop-item", "✕ Vincular con apertura...", pop);
-      bLink.onclick = () => { closePopover(); startLinkOpeningMode([...state.selected]); };
+      const bColor = el("button", "pop-item", "🎨 Cambiar color ▾", pop);
+      bColor.onclick = () => openColorPickerPopover(bColor, getPointColor(f), (c) => assignCustomColorToIndices([...state.selected], c));
 
       el("div", "pop-sep", null, pop);
       const bDel = el("button", "pop-item", "🗑 Eliminar", pop);
@@ -1600,21 +2485,41 @@
     });
   }
 
+  function openColorPickerPopover(anchorEl, currentColor, onPick, anchorAbove = false) {
+    const r = anchorEl.getBoundingClientRect();
+    showPopoverAt(anchorAbove ? r.left : r.right + 6, anchorAbove ? r.top - 6 : r.top, (pop) => {
+      el("div", "pop-title", "Paleta de alto contraste", pop);
+      const grid = el("div", "palette-grid", null, pop);
+      for (const c of HIGH_CONTRAST_PALETTE) {
+        const sw = el("button", "swatch", "", grid);
+        sw.style.background = c;
+        if (c.toUpperCase() === String(currentColor || "").toUpperCase()) sw.style.outline = "2px solid #0F172A";
+        sw.onclick = () => { onPick(c); closePopover(); };
+      }
+      el("div", "pop-sep", null, pop);
+      const customRow = el("label", "pop-item", "Color libre:", pop);
+      customRow.style.justifyContent = "space-between";
+      const inp = el("input", "", null, customRow);
+      inp.type = "color";
+      inp.value = isHex(currentColor) ? currentColor : "#00C853";
+      inp.oninput = () => onPick(inp.value);
+    }, anchorAbove);
+  }
+
   // =========================================================================
-  // 11. MENÚS DE LA BARRA SUPERIOR
+  // 13. MENÚS DE LA BARRA SUPERIOR (ARCHIVO, ZONAS D/T/F, VISTA, HERRAMIENTAS)
   // =========================================================================
   btnArchivo.onclick = () => {
     const r = btnArchivo.getBoundingClientRect();
     showPopoverAt(r.left, r.bottom + 6, (pop) => {
-      const bRec = el("button", "pop-item", "🏠 Proyectos recientes (Inicio)", pop);
+      const bRec = el("button", "pop-item", "🏠 Proyectos recientes / Nuevo en blanco", pop);
       bRec.onclick = () => { closePopover(); openStartModal(); };
 
-      const bImp = el("button", "pop-item", "📂 Abrir / Importar archivo...", pop);
+      const bImp = el("button", "pop-item", "📂 Abrir / Importar (KMZ, JSON, Preset PT, CSV)...", pop);
       bImp.onclick = () => { closePopover(); hiddenFileInput.click(); };
 
       el("div", "pop-sep", null, pop);
-      const bSaveCopy = el("button", "pop-item", "💾 Guardar copia (.json)", pop);
-      bSaveCopy.disabled = state.points.length === 0;
+      const bSaveCopy = el("button", "pop-item", "💾 Guardar como (.json en PC)", pop);
       bSaveCopy.onclick = () => { closePopover(); downloadJSON(); };
 
       const bExpCsv = el("button", "pop-item", "📊 Exportar tabla (.csv)", pop);
@@ -1623,13 +2528,30 @@
 
       if (typeof w.showDirectoryPicker === "function") {
         el("div", "pop-sep", null, pop);
-        const bDir = el("button", "pop-item", state.backupDirHandle ? "📁 Carpeta respaldo: Activa ✓" : "📁 Vincular carpeta respaldo...", pop);
+        const label = !state.backupDirHandle
+          ? "📁 Definir carpeta de respaldo en PC..."
+          : state.backupDirPerm === "granted"
+            ? `📁 Carpeta respaldo: ${state.backupDirHandle.name} (Activa ✓)`
+            : `⚠️ Reactivar permiso carpeta (${state.backupDirHandle.name})...`;
+        const bDir = el("button", "pop-item", label, pop);
         bDir.onclick = async () => {
           closePopover();
           try {
-            state.backupDirHandle = await w.showDirectoryPicker({ mode: "readwrite" });
-            showToast("Carpeta de respaldo vinculada.");
-            autosaveNow();
+            if (state.backupDirHandle && state.backupDirPerm !== "granted") {
+              const p = await state.backupDirHandle.requestPermission({ mode: "readwrite" });
+              state.backupDirPerm = p;
+              if (p === "granted") {
+                await autosaveNow();
+                showToast(`Carpeta "${state.backupDirHandle.name}" reconectada.`);
+                return;
+              }
+            }
+            const handle = await w.showDirectoryPicker({ mode: "readwrite" });
+            state.backupDirHandle = handle;
+            state.backupDirPerm = "granted";
+            await dbSaveSetting("backupDirHandle", handle);
+            await autosaveNow();
+            showToast(`Carpeta "${handle.name}" vinculada.`);
           } catch (_) {}
         };
       }
@@ -1639,14 +2561,11 @@
   btnZonas.onclick = () => {
     const r = btnZonas.getBoundingClientRect();
     showPopoverAt(r.left, r.bottom + 6, (pop) => {
-      el("div", "pop-title", "Zonas y colores", pop);
+      el("div", "pop-title", "Zonas (D: Desconectada · T: Trabajo · F: Faenas)", pop);
       for (const z of state.zones.values()) {
-        const row = el("div", "", null, pop);
-        row.style.cssText = "display:flex;align-items:center;gap:6px;padding:3px 4px;";
+        const row = el("div", "inline-input-row", null, pop);
         const colorBtn = el("button", "swatch", "", row);
         colorBtn.style.background = z.color;
-        colorBtn.style.width = "20px";
-        colorBtn.style.height = "20px";
         colorBtn.title = "Cambiar color";
         colorBtn.onclick = () => openColorPickerPopover(colorBtn, z.color, (newColor) => {
           z.color = newColor;
@@ -1654,81 +2573,79 @@
           markDirty();
           refreshAll();
         });
-        const nameSpan = el("span", "", z.name || z.id, row);
-        nameSpan.style.cssText = "flex:1;font-size:12px;font-weight:600;cursor:pointer;";
-        nameSpan.title = "Clic para renombrar";
-        nameSpan.onclick = () => {
-          const n = w.prompt("Nuevo nombre de zona:", z.name);
-          if (n && n.trim()) { z.name = n.trim(); markDirty(); refreshAll(); closePopover(); }
-        };
-      }
-      if (state.zones.size === 0) {
-        const empty = el("div", "", "Sin zonas aún. Crea una o agrupa puntos.", pop);
-        empty.style.cssText = "font-size:12px;color:var(--text-secondary);padding:4px 6px;";
-      }
-      el("div", "pop-sep", null, pop);
-      const bAuto = el("button", "pop-item", "🎨 Auto-asignar colores alto contraste", pop);
-      bAuto.disabled = state.zones.size === 0;
-      bAuto.onclick = () => { closePopover(); autoAssignHighContrastZones(); };
 
-      const bNew = el("button", "pop-item", "+ Nueva zona", pop);
-      bNew.style.color = "var(--accent)";
-      bNew.style.fontWeight = "600";
-      bNew.onclick = () => {
-        const n = w.prompt("Nombre de la nueva zona:", `Zona ${state.zones.size + 1}`);
-        if (n && n.trim()) { createZone(n.trim()); closePopover(); }
+        const nameInp = el("input", "", null, row);
+        nameInp.type = "text";
+        nameInp.value = z.name || z.id;
+        nameInp.onchange = () => {
+          z.name = nameInp.value.trim() || z.id;
+          markDirty();
+          refreshAll();
+        };
+
+        const bAutoPoly = el("button", "btn-outline icon-btn", "🔄", row);
+        bAutoPoly.title = `Autogenerar polígono de "${z.name}" envolviendo sus puntos`;
+        bAutoPoly.onclick = () => { closePopover(); generateZonePolygonFromPoints(z.id); };
+
+        const bEditPoly = el("button", "btn-outline icon-btn", "✏️", row);
+        bEditPoly.title = `Editar vértices del polígono "${z.name}"`;
+        bEditPoly.onclick = () => { closePopover(); startPolygonEditMode(z.id); };
+
+        const bDrawPoly = el("button", "btn-outline icon-btn", "🖊", row);
+        bDrawPoly.title = `Dibujar polígono nuevo a mano para "${z.name}"`;
+        bDrawPoly.onclick = () => { closePopover(); startPolygonDrawMode(z.id); };
+      }
+
+      el("div", "pop-sep", null, pop);
+      const newRow = el("div", "inline-input-row", null, pop);
+      const inpNew = el("input", "", null, newRow);
+      inpNew.placeholder = "Crear otra zona (ej. Tramo 2)...";
+      const bAdd = el("button", "btn-primary", "+ Crear", newRow);
+      bAdd.onclick = () => {
+        const val = inpNew.value.trim();
+        if (!val) return;
+        createZone(val);
+        btnZonas.click();
+      };
+
+      el("div", "pop-sep", null, pop);
+      const bAutoAll = el("button", "pop-item", "⚡ Autogenerar polígonos D, T y F desde sus puntos", pop);
+      bAutoAll.onclick = () => {
+        closePopover();
+        for (const z of state.zones.values()) {
+          const pts = state.points.filter(f => getPointZoneIds(f).includes(z.id));
+          if (pts.length >= 3) generateZonePolygonFromPoints(z.id);
+        }
       };
     });
   };
 
-  function openColorPickerPopover(anchorEl, currentColor, onPick) {
-    const r = anchorEl.getBoundingClientRect();
-    showPopoverAt(r.right + 6, r.top, (pop) => {
-      el("div", "pop-title", "Paleta alto contraste", pop);
-      const grid = el("div", "palette-grid", null, pop);
-      for (const c of HIGH_CONTRAST_PALETTE) {
-        const sw = el("button", "swatch", "", grid);
-        sw.style.background = c;
-        if (c.toUpperCase() === currentColor.toUpperCase()) sw.style.outline = "2px solid #0F172A";
-        sw.onclick = () => { onPick(c); closePopover(); };
-      }
-      el("div", "pop-sep", null, pop);
-      const customRow = el("label", "pop-item", "Color libre: ", pop);
-      customRow.style.justifyContent = "space-between";
-      const inp = el("input", "", null, customRow);
-      inp.type = "color";
-      inp.value = isHex(currentColor) ? currentColor : "#00C853";
-      inp.oninput = () => onPick(inp.value);
-    });
-  }
-
   btnVista.onclick = () => {
     const r = btnVista.getBoundingClientRect();
     showPopoverAt(r.left, r.bottom + 6, (pop) => {
-      el("div", "pop-title", "Capas de análisis", pop);
-      const bHulls = el("button", "pop-item", (state.showHulls ? "☑ " : "☐ ") + "Envolventes de zona", pop);
+      el("div", "pop-title", "Capas visuales", pop);
+      const bPoles = el("button", "pop-item", (!state.hidePoles ? "☑ " : "☐ ") + "Mostrar pines de postes (desmarca para editar polígonos)", pop);
+      bPoles.onclick = () => { btnHidePoles.click(); closePopover(); };
+
+      const bHulls = el("button", "pop-item", (state.showHulls ? "☑ " : "☐ ") + "Polígonos de zonas (D / T / F)", pop);
       bHulls.onclick = () => { state.showHulls = !state.showHulls; rebuildOverlayLayers(); closePopover(); };
 
-      const bRoute = el("button", "pop-item", (state.showRoute ? "☑ " : "☐ ") + "Línea de ruta (1→2→3)", pop);
+      const bSpans = el("button", "pop-item", (state.showSpans ? "☑ " : "☐ ") + "Vectores de tramos MT (A→B)", pop);
+      bSpans.onclick = () => { state.showSpans = !state.showSpans; rebuildOverlayLayers(); closePopover(); };
+
+      const bRoute = el("button", "pop-item", (state.showRoute ? "☑ " : "☐ ") + "Línea secuencial de ruta (1→2→3)", pop);
       bRoute.onclick = () => { state.showRoute = !state.showRoute; rebuildOverlayLayers(); closePopover(); };
 
-      if (isMultiSupActive()) {
-        const bColBy = el("button", "pop-item", `🎨 Colorear por: ${state.colorBy === "zone" ? "Zona" : "Supervisor"}`, pop);
-        bColBy.onclick = () => {
-          state.colorBy = state.colorBy === "zone" ? "supervisor" : "zone";
-          styleCache = new WeakMap();
-          rebuildOverlayLayers();
-          closePopover();
-        };
-      }
+      const bLinks = el("button", "pop-item", (state.showLinks ? "☑ " : "☐ ") + "Rayos a aperturas vinculadas al enfocar", pop);
+      bLinks.onclick = () => { state.showLinks = !state.showLinks; rebuildOverlayLayers(); closePopover(); };
 
       el("div", "pop-sep", null, pop);
-      el("div", "pop-title", "Etiquetas de mapa", pop);
+      el("div", "pop-title", "Etiquetas", pop);
       for (const [val, lbl] of [["cerca", "Al acercar zoom"], ["siempre", "Siempre visibles"], ["ninguna", "Ocultar etiquetas"]]) {
         const b = el("button", "pop-item", (state.labelMode === val ? "● " : "○ ") + lbl, pop);
         b.onclick = () => { state.labelMode = val; styleCache = new WeakMap(); rebuildOverlayLayers(); closePopover(); };
       }
-      const bTxt = el("button", "pop-item", state.labelContent === "numero" ? "Texto: Solo N° (clic para N° + Código)" : "Texto: N° + Código", pop);
+      const bTxt = el("button", "pop-item", state.labelContent === "numero" ? "Texto: Rol/N° (clic para Rol/N° + Código)" : "Texto: Rol/N° + Código", pop);
       bTxt.onclick = () => {
         state.labelContent = state.labelContent === "numero" ? "completo" : "numero";
         styleCache = new WeakMap();
@@ -1749,419 +2666,42 @@
     });
   };
 
-  /**
-   * Load a permit preset: the supervisor's form (codes and roles, no coordinates)
-   * is resolved against GNAT and becomes a normal project, so the map, the table
-   * and the PDF keep working without a single console command.
-   */
-  async function openPresetPicker() {
-    const picker = doc.createElement("input");
-    picker.type = "file";
-    picker.accept = ".json,application/json";
-    picker.style.display = "none";
-    doc.body.appendChild(picker);
-    picker.onchange = async () => {
-      const file = picker.files && picker.files[0];
-      picker.remove();
-      if (!file) return;
-      const zoneApi = (w && w.__gnatZone) || (typeof globalThis !== "undefined" ? globalThis.__gnatZone : null);
-      if (!zoneApi || typeof zoneApi.buildProjectFromPresetLive !== "function") {
-        showToast("El motor de zona no está cargado: revisá la extensión.", true);
-        return;
-      }
-      let preset = null;
-      try {
-        preset = JSON.parse(await file.text());
-      } catch (error) {
-        showToast("El archivo no es un preset JSON válido.", true);
-        return;
-      }
-      showToast("Resolviendo los puntos del permiso en GNAT...");
-      try {
-        const payload = await zoneApi.buildProjectFromPresetLive(preset, {
-          settings: { maxRequests: 240, maxMilliseconds: 180000 }
-        });
-        loadProjectData(payload);
-        state.projectName = payload.nombre || state.projectName;
-        autosaveNow().catch(() => {});
-        const faltan = Array.isArray(payload.unresolved) ? payload.unresolved.length : 0;
-        showToast(
-          "Permiso cargado: " + payload.registros.length + " punto(s)" +
-          (faltan ? " — " + faltan + " código(s) sin resolver" : "") + "."
-        );
-      } catch (error) {
-        showToast("No se pudo cargar el permiso: " + (error && error.message ? error.message : error), true);
-      }
-    };
-    picker.click();
-  }
-
-  // =========================================================================
-  // VERIFICACIÓN DE ZONA (T/D/F) — el permiso se contrasta contra la red
-  // =========================================================================
-  let zoneResultLayer = null;
-  let zoneModify = null;
-  let zoneGenerated = null;
-  let zoneGeneratedAislada = false;
-
-  function permitFromMap() {
-    const rows = state.points
-      .map((f) => ({
-        codigo: String(f.get("codigo") || ""),
-        tipo: String(f.get("tipo") || ""),
-        bloque: String(f.get("bloqueId") || ""),
-        equipo: String(f.get("tipoEquipo") || ""),
-      }))
-      .filter((r) => r.codigo);
-    const uniq = (list) => [...new Set(list)];
-    const trabajo = rows.filter((r) => r.bloque === "T" && r.tipo !== "APERTURA").map((r) => r.codigo);
-    const aperturas = rows.filter((r) => r.tipo === "APERTURA").map((r) => r.codigo);
-    const tierras = rows.filter((r) => r.bloque !== "" && r.tipo === "PUNTO" && r.equipo !== "" && /tierra/i.test(r.equipo)).map((r) => r.codigo);
-    const frontera = rows.filter((r) => r.bloque === "F").map((r) => r.codigo);
-    return {
-      objectCode: uniq(frontera)[0] || uniq(trabajo)[0] || null,
-      workCodes: uniq(trabajo),
-      openCodes: uniq(aperturas),
-      groundCodes: uniq(tierras),
-      siteCodes: uniq(frontera),
-    };
-  }
-
-  function clearZoneLayer() {
-    if (zoneModify) {
-      try { map.removeInteraction(zoneModify); } catch (error) { /* already gone */ }
-      zoneModify = null;
-    }
-    if (zoneResultLayer) {
-      try { map.removeLayer(zoneResultLayer); } catch (error) { /* already gone */ }
-      zoneResultLayer = null;
-    }
-  }
-
-  /**
-   * The generated outline is a visual reference, not the electrical boundary: a real
-   * feeder drops spurs that a hull cannot follow. So it is drawn and then left
-   * editable — drag a vertex, ctrl+click on an edge to add one, alt+click to remove
-   * it. Editing never recalculates anything; "Restaurar" puts the generated shape back.
-   */
-  function paintZoneOutline(outline, aislada) {
-    clearZoneLayer();
-    if (!Array.isArray(outline) || outline.length < 3) return;
-    const ring = outline.map((pair) => ol.proj.fromLonLat([Number(pair[0]), Number(pair[1])]));
-    ring.push(ring[0]);
-    const feature = new ol.Feature({ geometry: new ol.geom.Polygon([ring]) });
-    const edgeColor = aislada ? "#1f9d55" : "#d92b2b";
-    const handleStyle = () => new ol.style.Style({
-      image: new ol.style.Circle({
-        radius: 7,
-        fill: new ol.style.Fill({ color: "#ffffff" }),
-        stroke: new ol.style.Stroke({ color: edgeColor, width: 3 })
-      })
-    });
-    // A polygon with invisible vertices cannot be edited by hand: the handles have
-    // to be drawn, one per vertex, or nobody knows what to grab.
-    const zoneStyle = (feat) => {
-      const styles = [new ol.style.Style({
-        fill: new ol.style.Fill({ color: aislada ? "rgba(31,157,85,.10)" : "rgba(217,43,43,.14)" }),
-        stroke: new ol.style.Stroke({ color: edgeColor, width: 2.5, lineDash: [7, 5] })
-      })];
-      try {
-        for (const ring of feat.getGeometry().getCoordinates()) {
-          for (const coord of ring) {
-            const dot = handleStyle();
-            dot.setGeometry(new ol.geom.Point(coord));
-            styles.push(dot);
-          }
-        }
-      } catch (error) { /* a degenerate ring still draws its edge */ }
-      return styles;
-    };
-    zoneResultLayer = new ol.layer.Vector({
-      source: new ol.source.Vector({ features: [feature] }),
-      style: zoneStyle,
-      zIndex: 60
-    });
-    map.addLayer(zoneResultLayer);
-    if (ol.interaction && ol.interaction.Modify) {
-      showToast("Zona dibujada. Usá Herramientas ▾ → ✏️ Editar zona para ajustarla.");
-    } else {
-      showToast("Zona dibujada. Este mapa no expone el editor de vértices.", true);
-    }
-  }
-
-  let zoneRouteLayer = null;
-  let zoneEditBanner = null;
-
-  function clearZoneRoute() {
-    if (zoneRouteLayer) {
-      try { map.removeLayer(zoneRouteLayer); } catch (error) { /* already gone */ }
-      zoneRouteLayer = null;
-    }
-  }
-
-  /**
-   * The pole route: the medium-voltage spans the walk actually followed, drawn in
-   * order. Coordinates come from the points already resolved, so it costs nothing.
-   */
-  function drawZoneRoute(result) {
-    clearZoneRoute();
-    const route = (result.verification && result.verification.route) || [];
-    if (!route.length) return;
-    const byCode = new Map();
-    for (const entry of result.points || []) {
-      if (entry && entry.code && entry.lonlat) byCode.set(entry.code, entry.lonlat);
-    }
-    for (const feature of state.points) {
-      const code = String(feature.get("codigo") || "");
-      if (!code || byCode.has(code)) continue;
-      const coords = feature.getGeometry() && feature.getGeometry().getCoordinates();
-      if (!coords) continue;
-      const lonlat = ol.proj.toLonLat(coords, map.getView().getProjection());
-      byCode.set(code, { lon: lonlat[0], lat: lonlat[1] });
-    }
-    const segments = [];
-    for (const step of route) {
-      const from = byCode.get(step.from);
-      const to = byCode.get(step.to);
-      if (!from || !to) continue;
-      segments.push(new ol.Feature({
-        geometry: new ol.geom.LineString([
-          ol.proj.fromLonLat([from.lon, from.lat]),
-          ol.proj.fromLonLat([to.lon, to.lat])
-        ])
-      }));
-    }
-    if (!segments.length) return;
-    zoneRouteLayer = new ol.layer.Vector({
-      source: new ol.source.Vector({ features: segments }),
-      style: new ol.style.Style({ stroke: new ol.style.Stroke({ color: "#2f6fd0", width: 4 }) }),
-      zIndex: 59
-    });
-    map.addLayer(zoneRouteLayer);
-  }
-
-  function setZoneEditMode(on) {
-    if (!zoneResultLayer) {
-      showToast("Primero generá la zona.", true);
-      return;
-    }
-    if (on) {
-      if (!(ol.interaction && ol.interaction.Modify)) {
-        showToast("Este mapa no expone el editor de vértices.", true);
-        return;
-      }
-      try { setCursorMode("nav"); } catch (error) { /* toolbar may be hidden */ }
-      if (!zoneModify) {
-        zoneModify = new ol.interaction.Modify({
-          source: zoneResultLayer.getSource(),
-          pixelTolerance: 14,
-          // Plain click on an edge inserts a node; Alt+click removes one.
-          insertVertexCondition: () => true,
-          deleteCondition: (event) => Boolean(event.originalEvent && event.originalEvent.altKey)
-        });
-        map.addInteraction(zoneModify);
-      }
-      if (!zoneEditBanner) {
-        zoneEditBanner = doc.createElement("div");
-        zoneEditBanner.textContent = "EDITANDO ZONA · arrastrá un nodo blanco · clic sobre el borde agrega uno · Alt+clic borra · volvé a Herramientas ▾ → Terminar edición";
-        zoneEditBanner.style.cssText = "position:fixed;left:50%;bottom:64px;transform:translateX(-50%);z-index:2147483000;" +
-          "background:#e0761a;color:#fff;font:600 12px/1.4 system-ui,sans-serif;padding:8px 14px;border-radius:8px;" +
-          "box-shadow:0 4px 14px rgba(0,0,0,.3);max-width:92vw;text-align:center";
-        doc.body.appendChild(zoneEditBanner);
-      }
-      showToast("Edición de zona activada.");
-    } else {
-      if (zoneModify) {
-        try { map.removeInteraction(zoneModify); } catch (error) { /* already gone */ }
-        zoneModify = null;
-      }
-      if (zoneEditBanner) {
-        zoneEditBanner.remove();
-        zoneEditBanner = null;
-      }
-      showToast("Edición de zona terminada.");
-    }
-  }
-
-  /** The edited outline travels with the project: it is the supervisor's own drawing. */
-  function zoneOutlineForSave() {
-    if (!zoneResultLayer) return null;
-    try {
-      const geometry = zoneResultLayer.getSource().getFeatures()[0].getGeometry();
-      const ring = geometry.getCoordinates()[0];
-      const outline = [];
-      for (const coord of ring) {
-        const lonlat = ol.proj.toLonLat(coord, map.getView().getProjection());
-        outline.push([Number(lonlat[0].toFixed(7)), Number(lonlat[1].toFixed(7))]);
-      }
-      return { outline, aislada: zoneGeneratedAislada, guardada: Date.now() };
-    } catch (error) {
-      return null;
-    }
-  }
-
-  function restoreZoneOutline() {
-    if (!zoneGenerated) {
-      showToast("No hay un polígono generado para restaurar.", true);
-      return;
-    }
-    paintZoneOutline(zoneGenerated, zoneGeneratedAislada);
-  }
-
-  /** The zone polygon is the shape of the poles the walk actually reached. */
-  function outlineFromZone(result) {
-    const island = (result.verification && result.verification.island) || [];
-    const wanted = new Set(island);
-    const pts = [];
-    for (const entry of result.points || []) {
-      if (entry && wanted.has(entry.code) && entry.lonlat) pts.push([entry.lonlat.lon, entry.lonlat.lat]);
-    }
-    if (pts.length < 3) return Array.isArray(result.outline) ? result.outline : null;
-    const sorted = [...pts].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-    const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
-    const lower = [];
-    for (const p of sorted) {
-      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
-      lower.push(p);
-    }
-    const upper = [];
-    for (const p of [...sorted].reverse()) {
-      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
-      upper.push(p);
-    }
-    return lower.slice(0, -1).concat(upper.slice(0, -1));
-  }
-
-  function drawZoneResult(result) {
-    zoneGenerated = outlineFromZone(result);
-    zoneGeneratedAislada = Boolean(result.verification && result.verification.valid);
-    paintZoneOutline(zoneGenerated, zoneGeneratedAislada);
-  }
-
-
-  function showZoneReport(result) {
-    modalBackdrop.replaceChildren();
-    modalBackdrop.classList.remove("hidden");
-    const card = el("div", "modal-card", null, modalBackdrop);
-    const head = el("div", "modal-head", null, card);
-    el("h2", "", "Zona de trabajo (T/D/F)", head);
-    const bClose = el("button", "btn-outline", "Cerrar", head);
-    bClose.onclick = closeModal;
-
-    const body = el("div", "modal-body", null, card);
-    const verdict = el("div", "", null, body);
-    const aislada = Boolean(result.verification && result.verification.valid);
-    verdict.style.cssText = "font-weight:800;font-size:15px;margin-bottom:6px;color:" + (aislada ? "#1f9d55" : "#d92b2b");
-    verdict.textContent = aislada ? "La zona queda aislada." : "La zona NO queda aislada.";
-    const why = el("div", "", (result.verification && result.verification.reason ? result.verification.reason + " — " : "") + "las aperturas y su suficiencia son criterio del supervisor.", body);
-    why.style.cssText = "font-size:12px;color:var(--text-secondary);margin-bottom:12px;line-height:1.4;";
-
-    const island = (result.verification && result.verification.island) || [];
-    el("div", "", "Códigos en la zona (" + island.length + "): " + (island.length ? island.join(", ") : "—"), body);
-    const diagnostics = (result.verification && result.verification.diagnostics) || [];
-    const sinTramos = diagnostics.filter((entry) => entry.tramos === 0);
-    const viaMetadata = diagnostics.filter((entry) => entry.fuente === "metadata" || entry.fuente === "busqueda").length;
-    const viaAnillo = diagnostics.length - viaMetadata;
-    const walkInfo = el("div", "", "Postes recorridos: " + diagnostics.length +
-      " (metadata/búsqueda: " + viaMetadata + " · anillo: " + viaAnillo + ")" +
-      (sinTramos.length ? " · sin tramos MT: " + sinTramos.map((entry) => entry.code).join(", ") : ""), body);
-    walkInfo.style.cssText = "font-size:12px;color:var(--text-secondary);margin-top:4px";
-    const boundary = (result.verification && result.verification.boundary) || [];
-    el("div", "", "Aparatos de maniobra hallados: " + (boundary.length ? boundary.join(", ") : "—"), body).style.marginTop = "6px";
-    el("div", "", result.budget ? "Coste: " + result.budget.requests + " requests · " + Math.round(result.budget.elapsedMs / 1000) + " s" : "", body).style.cssText = "font-size:12px;color:var(--text-secondary);margin-top:10px";
-
-    el("div", "", "Polígono: referencia visual de la zona verificada. No se guarda con el proyecto; se regenera al verificar. Para ajustarlo: modo Navegar, arrastrar los nodos blancos.", body)
-      .style.cssText = "font-size:12px;color:var(--text-secondary);margin-top:10px;line-height:1.4";
-
-    const sinTramosDiag = diagnostics.filter((entry) => entry.tramos === 0 && entry.muestras && entry.muestras.length);
-    if (sinTramosDiag.length) {
-      el("div", "", "Qué devolvió GNAT en esos postes", body).style.cssText = "font-weight:700;margin-top:12px;margin-bottom:4px";
-      sinTramosDiag.forEach((entry) => {
-        el("div", "", entry.code + " — " + entry.objetos + " objeto(s)", body).style.cssText = "font-size:12px;font-weight:600;margin-top:6px";
-        entry.muestras.forEach((muestra) => {
-          const row = el("div", "", "· " + (muestra.display || "(sin nombre)") + "  [" + (muestra.voltaje || "?") + "]  " + (muestra.tipo || ""), body);
-          row.style.cssText = "font-size:11px;color:var(--text-secondary);margin-left:8px";
-        });
-      });
-    }
-
-    const findings = (result.findings || []).filter((f) => f.level !== "info");
-    if (findings.length) {
-      el("div", "", "Notas", body).style.cssText = "font-weight:700;margin-top:12px;margin-bottom:4px";
-      findings.forEach((f) => {
-        const row = el("div", "", (f.level === "bloqueante" ? "⛔ " : "⚠️ ") + f.text, body);
-        row.style.cssText = "font-size:12px;margin-bottom:3px;color:" + (f.level === "bloqueante" ? "#d92b2b" : "var(--text-secondary)");
-      });
-    }
-  }
-
-  async function verificarZona() {
-    const zoneApi = (w && w.__gnatZone) || (typeof globalThis !== "undefined" ? globalThis.__gnatZone : null);
-    if (!zoneApi || typeof zoneApi.auditPermitLive !== "function") {
-      showToast("El motor de zona no está cargado: revisá la extensión.", true);
-      return;
-    }
-    const permit = permitFromMap();
-    if (!permit.workCodes.length) {
-      showToast("El proyecto no tiene zona de trabajo (T). Cargá un permiso primero.", true);
-      return;
-    }
-    showToast("Verificando la zona contra GNAT...");
-    try {
-      const result = await zoneApi.auditPermitLive(permit, {
-        settings: { maxRequests: 260, maxMilliseconds: 180000, readSources: true }
-      });
-      drawZoneResult(result);
-      drawZoneRoute(result);
-      showZoneReport(result);
-    } catch (error) {
-      showToast("No se pudo verificar: " + (error && error.message ? error.message : error), true);
-    }
-  }
-
   btnHerramientas.onclick = () => {
     const r = btnHerramientas.getBoundingClientRect();
     showPopoverAt(r.left, r.bottom + 6, (pop) => {
-      const bPaste = el("button", "pop-item", "📋 Seleccionar por lista de códigos...", pop);
+      const bPaste = el("button", "pop-item", "📋 Buscar / agregar lista de códigos o tabla en GNAT...", pop);
       bPaste.onclick = () => { closePopover(); openPasteCodesModal(); };
 
       const bTeam = el("button", "pop-item", "👥 Equipo / Supervisores (CC, TL, RD, JB)...", pop);
       bTeam.onclick = () => { closePopover(); openSupervisorsModal(); };
 
-      const bPreset = el("button", "pop-item", "📄 Cargar permiso PT (preset .json)...", pop);
-      bPreset.onclick = () => { closePopover(); openPresetPicker(); };
-
-      const bVerify = el("button", "pop-item", "🗺 Generar zona de trabajo (T/D/F)...", pop);
-      bVerify.onclick = () => { closePopover(); verificarZona(); };
-
-      const bEditZone = el("button", "pop-item", "✏️ Editar zona (arrastrar nodos)", pop);
-      bEditZone.onclick = () => { closePopover(); setZoneEditMode(true); };
-
-      const bRestore = el("button", "pop-item", "↺ Restaurar polígono generado", pop);
-      bRestore.onclick = () => { closePopover(); restoreZoneOutline(); };
-
-      const bEditOff = el("button", "pop-item", "✔️ Terminar edición de zona", pop);
-      bEditOff.onclick = () => { closePopover(); setZoneEditMode(false); };
+      const bClearSpans = el("button", "pop-item", "🧹 Limpiar vectores MT trazados", pop);
+      bClearSpans.onclick = () => {
+        closePopover();
+        state.spans = [];
+        markDirty();
+        rebuildOverlayLayers();
+      };
 
       el("div", "pop-sep", null, pop);
-      const bPdf = el("button", "pop-item", "🖨 Exportar plano PDF (A1 / Atlas)...", pop);
+      const bPdf = el("button", "pop-item", "🖨 Exportar plano PDF (Demo)...", pop);
       bPdf.onclick = () => { closePopover(); openAtlasPdfModal(); };
     });
   };
 
   // =========================================================================
-  // 12. INTERACCIÓN CON EL MAPA OPENLAYERS (CLIC, CAJA, AGREGAR, VINCULAR)
+  // 14. INTERACCIÓN CON EL MAPA OPENLAYERS
   // =========================================================================
   function setCursorMode(mode, bannerMsg = "") {
     state.cursorMode = mode;
     btnModeNav.classList.toggle("active", mode === "nav");
     btnModeBox.classList.toggle("active", mode === "box");
-    btnModeAdd.classList.toggle("active", mode === "add" || mode === "link-opening");
+    btnModeAdd.classList.toggle("active", mode === "add" || mode === "link-opening" || mode === "place-missing");
+    btnModePoly.classList.toggle("active", mode === "edit-poly" || mode === "draw-poly");
 
-    const viewport = map.getViewport?.();
-    if (viewport) {
-      viewport.style.cursor = (mode === "add" || mode === "link-opening") ? "crosshair"
-        : mode === "box" ? "crosshair" : "";
+    if (viewportEl) {
+      viewportEl.style.cursor = (mode === "add" || mode === "link-opening" || mode === "place-missing" || mode === "draw-poly" || mode === "box")
+        ? "crosshair" : "";
     }
 
     if (dragBoxInteraction) {
@@ -2169,7 +2709,7 @@
       dragBoxInteraction = null;
     }
 
-    if (ol.interaction?.DragBox) {
+    if (ol.interaction?.DragBox && mode !== "edit-poly" && mode !== "draw-poly") {
       dragBoxInteraction = new ol.interaction.DragBox({
         condition: mode === "box"
           ? () => true
@@ -2189,7 +2729,7 @@
         });
         renderTable();
         rebuildOverlayLayers();
-        if (added) showToast(`${added} punto(s) seleccionado(s) en el área.`);
+        if (added) showToast(`${added} punto(s) seleccionado(s).`);
         if (mode === "box") setCursorMode("nav");
       });
       map.addInteraction(dragBoxInteraction);
@@ -2205,15 +2745,48 @@
 
   function startLinkOpeningMode(indices) {
     state.pendingLinkIndices = indices;
-    setCursorMode("link-opening", `Haz clic en una apertura (✕) del mapa o en un punto vacío para vincular ${indices.length} elemento(s)`);
+    setCursorMode("link-opening", `Haz clic en una apertura (✕) o en un punto vacío para vincular ${indices.length} elemento(s)`);
+  }
+
+  function startPlaceMissingCodesQueue(codes) {
+    state.pendingMissingCodes = [...codes];
+    if (!state.pendingMissingCodes.length) return;
+    setCursorMode("place-missing", `Haz clic en el mapa para ubicar "${state.pendingMissingCodes[0]}" (${state.pendingMissingCodes.length} restante(s))`);
   }
 
   const onMapSingleClick = (evt) => {
     closePopover();
+    if (state.cursorMode === "draw-poly") {
+      const [lon, lat] = ol.proj.toLonLat(evt.coordinate, map.getView().getProjection());
+      state.drawingCoords.push([Number(lon.toFixed(7)), Number(lat.toFixed(7))]);
+      rebuildOverlayLayers();
+      return;
+    }
+    if (state.cursorMode === "edit-poly") {
+      return;
+    }
+    if (state.cursorMode === "place-missing" && state.pendingMissingCodes.length > 0) {
+      const code = state.pendingMissingCodes.shift();
+      const [lon, lat] = ol.proj.toLonLat(evt.coordinate, map.getView().getProjection());
+      const feat = upsertPointOnMap({ codigo: code, lonlat: [lon, lat], tipo: "PUNTO", bloqueId: "T", bloques: ["T"] });
+      state.selected.add(state.points.indexOf(feat));
+      ensureVectorLayer();
+      markDirty();
+      refreshAll();
+      if (state.pendingMissingCodes.length > 0) {
+        setCursorMode("place-missing", `Haz clic en el mapa para ubicar "${state.pendingMissingCodes[0]}" (${state.pendingMissingCodes.length} restante(s))`);
+      } else {
+        setCursorMode("nav");
+        showToast("Todos los códigos pendientes fueron ubicados.");
+      }
+      return;
+    }
+
     if (state.cursorMode === "add") {
       openDropPointPopover(evt.pixel, evt.coordinate, false);
       return;
     }
+
     if (state.cursorMode === "link-opening") {
       let hitOpening = null;
       map.forEachFeatureAtPixel(evt.pixel, (feat, layer) => {
@@ -2244,6 +2817,7 @@
       return;
     }
 
+    if (state.hidePoles) return;
     let hitFeature = null;
     map.forEachFeatureAtPixel(evt.pixel, (feat, layer) => {
       if (layer === vectorLayer) {
@@ -2271,6 +2845,25 @@
 
   const onMapContextMenu = (ev) => {
     const pixel = map.getEventPixel(ev);
+    // En modo edición de polígono, clic derecho sobre un vértice lo elimina
+    if (state.cursorMode === "edit-poly") {
+      const vHit = findPolygonVertexAtPixel(pixel);
+      if (vHit && !vHit.isMidpoint) {
+        ev.preventDefault();
+        const z = state.zones.get(vHit.zoneId);
+        if (z?.customRing && z.customRing.length > 3) {
+          z.customRing.splice(vHit.vertexIdx, 1);
+          markDirty();
+          rebuildOverlayLayers();
+          showToast("Vértice eliminado del polígono.");
+        } else {
+          showToast("Un polígono requiere mínimo 3 vértices.", true);
+        }
+        return;
+      }
+    }
+
+    if (state.hidePoles) return;
     let hit = null;
     map.forEachFeatureAtPixel(pixel, (feat, layer) => {
       if (layer === vectorLayer) {
@@ -2292,25 +2885,33 @@
   };
 
   map.on("singleclick", onMapSingleClick);
-  map.getViewport?.()?.addEventListener("contextmenu", onMapContextMenu);
+  viewportEl?.addEventListener("contextmenu", onMapContextMenu);
 
   function openDropPointPopover(pixel, coordinate, forceOpening) {
     if (addPointDropCoord) addPointDropCoord.remove();
-    const mapRect = map.getViewport().getBoundingClientRect();
+    const mapRect = viewportEl.getBoundingClientRect();
     const form = el("div", "pin-form");
-    form.style.left = Math.min(mapRect.left + pixel[0] + 10, w.innerWidth - 275) + "px";
-    form.style.top = Math.min(mapRect.top + pixel[1] + 10, w.innerHeight - 210) + "px";
+    form.style.left = Math.min(mapRect.left + pixel[0] + 10, w.innerWidth - 295) + "px";
+    form.style.top = Math.min(mapRect.top + pixel[1] + 10, w.innerHeight - 260) + "px";
 
-    el("strong", "", forceOpening ? "Nueva apertura vinculada" : "Nuevo punto en mapa", form);
+    el("strong", "", forceOpening ? "Nueva apertura vinculada" : "Nuevo elemento en mapa", form);
     const inpCode = el("input", "", null, form);
     inpCode.type = "text";
-    inpCode.placeholder = forceOpening ? "Código apertura (ej. DF-412)" : "Código poste / equipo";
+    inpCode.placeholder = forceOpening ? "Código apertura (ej. FF4840)" : "Código poste (ej. FAG1672)";
 
     const selType = el("select", "", null, form);
-    const optP = el("option", "", "Poste / Punto", selType); optP.value = "PUNTO";
-    const optA = el("option", "", "Apertura (✕ roja)", selType); optA.value = "APERTURA";
+    [["PUNTO", "Poste / Punto"], ["APERTURA", "Apertura (✕ roja)"]].forEach(([v, t]) => {
+      const o = el("option", "", t, selType); o.value = v;
+    });
     selType.value = forceOpening ? "APERTURA" : "PUNTO";
     selType.disabled = forceOpening;
+
+    const selZone = el("select", "", null, form);
+    for (const z of state.zones.values()) {
+      const o = el("option", "", `${z.id} · ${z.name}`, selZone);
+      o.value = z.id;
+    }
+    selZone.value = forceOpening ? "D" : "T";
 
     const btnRow = el("div", "", null, form);
     btnRow.style.cssText = "display:flex;gap:6px;justify-content:flex-end;";
@@ -2326,28 +2927,16 @@
 
     const submit = () => {
       const code = inpCode.value.trim() || "Sin código";
-      const tipo = selType.value;
-      const usedIds = new Set(state.points.map(p => String(p.get("id"))));
-      let n = state.points.length + 1;
-      const prefix = tipo === "APERTURA" ? "ap-" : "marker-";
-      while (usedIds.has(prefix + n)) n++;
-      const newId = prefix + n;
-      const nextNum = 1 + Math.max(0, ...state.points.filter(p => (p.get("tipo") || "PUNTO") === tipo).map(p => Number(p.get("numero")) || 0));
-
-      const feat = new ol.Feature({
-        geometry: new ol.geom.Point(coordinate),
-        id: newId,
-        numero: nextNum,
-        tipo,
+      const [lon, lat] = ol.proj.toLonLat(coordinate, map.getView().getProjection());
+      const feat = upsertPointOnMap({
         codigo: code,
-        bloqueId: "",
-        bloques: [],
-        aperturasIds: [],
-        supervisorId: "default"
+        lonlat: [lon, lat],
+        tipo: selType.value,
+        bloqueId: selZone.value,
+        bloques: [selZone.value]
       });
-      state.points.push(feat);
-
       if (forceOpening && state.pendingLinkIndices.length) {
+        const newId = String(feat.get("id"));
         for (const idx of state.pendingLinkIndices) {
           const p = state.points[idx];
           if (p && p.get("tipo") !== "APERTURA") {
@@ -2356,12 +2945,10 @@
           }
         }
       }
-
       ensureVectorLayer();
       markDirty();
       refreshAll();
       cleanup();
-      showToast(forceOpening ? `Apertura ${code} creada y vinculada.` : `Punto ${code} creado.`);
     };
 
     bCancel.onclick = cleanup;
@@ -2377,10 +2964,26 @@
   btnModeNav.onclick = () => setCursorMode("nav");
   btnModeBox.onclick = () => setCursorMode("box", "Arrastra un rectángulo sobre el mapa para seleccionar puntos");
   btnModeAdd.onclick = () => setCursorMode("add", "Haz clic en el mapa para ubicar el nuevo punto");
-  modeBannerCancel.onclick = () => { state.pendingLinkIndices = []; setCursorMode("nav"); };
+  btnModePoly.onclick = () => {
+    if (state.cursorMode === "edit-poly" || state.cursorMode === "draw-poly") {
+      finishPolygonDrawMode();
+    } else {
+      startPolygonEditMode(null);
+    }
+  };
+  modeBannerAction.onclick = () => {
+    if (state.cursorMode === "draw-poly") finishPolygonDrawMode();
+    else {
+      state.pendingLinkIndices = [];
+      state.pendingMissingCodes = [];
+      state.editingZoneId = null;
+      setCursorMode("nav");
+      rebuildOverlayLayers();
+    }
+  };
 
   // =========================================================================
-  // 13. CARGA INTELIGENTE DE ARCHIVOS (CONTENT-SNIFFING) + EXPORTACIÓN
+  // 15. CARGA DE ARCHIVOS (KMZ, JSON, PRESET PT-263781, CSV) Y PORTAPAPELES
   // =========================================================================
   async function readKmzBytes(ab) {
     const v = new DataView(ab);
@@ -2411,7 +3014,6 @@
     const inicio = a.loc + 30 + v.getUint16(a.loc + 26, true) + v.getUint16(a.loc + 28, true);
     const bytes = new Uint8Array(ab, inicio, a.comp);
     if (a.metodo === 0) return new TextDecoder().decode(bytes);
-    if (a.metodo !== 8) throw Error("Compresión ZIP no compatible.");
     const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
     return new TextDecoder().decode(await new Response(stream).arrayBuffer());
   }
@@ -2427,26 +3029,31 @@
 
   function loadProjectData(data) {
     state.zones.clear();
-    // The saved outline is restored once this function has built the features, so a
-    // project opens with the zone exactly as it was left.
-    w.setTimeout(() => {
-      try {
-        if (data && data.zona && Array.isArray(data.zona.outline) && data.zona.outline.length >= 3) {
-          zoneGenerated = data.zona.outline;
-          zoneGeneratedAislada = Boolean(data.zona.aislada);
-          paintZoneOutline(zoneGenerated, zoneGeneratedAislada);
-        } else {
-          clearZoneLayer();
-        }
-      } catch (error) { /* an unreadable outline must not block the project */ }
-    }, 0);
+    for (const [id, def] of [
+      ["D", { id: "D", name: "Zona desconectada (D)", color: "#DC2626", customRing: null }],
+      ["T", { id: "T", name: "Zona de trabajo (T)", color: "#00C853", customRing: null }],
+      ["F", { id: "F", name: "Punto de faenas (F)", color: "#FF6D00", customRing: null }]
+    ]) {
+      state.zones.set(id, def);
+    }
+
     let idx = 0;
     for (const b of data.bloques || []) {
       const color = isHex(b.color) ? b.color : HIGH_CONTRAST_PALETTE[idx % HIGH_CONTRAST_PALETTE.length];
-      state.zones.set(b.id, { id: b.id, name: b.nombre || b.id, color });
+      state.zones.set(b.id, {
+        id: b.id,
+        name: b.nombre || b.id,
+        color,
+        customRing: Array.isArray(b.customRing) ? b.customRing : null
+      });
       idx++;
     }
-    if (Array.isArray(data.supervisors)) {
+    // Compatibilidad con campo legacy `data.zona.outline`
+    if (Array.isArray(data?.zona?.outline) && data.zona.outline.length >= 3 && state.zones.has("D")) {
+      state.zones.get("D").customRing = data.zona.outline;
+    }
+
+    if (Array.isArray(data.supervisors) && data.supervisors.length) {
       state.supervisors.clear();
       for (const s of data.supervisors) {
         if (s?.id) state.supervisors.set(s.id, { ...s });
@@ -2455,9 +3062,11 @@
       state.supervisors = new Map(DEFAULT_SUPERVISORS.map(s => [s.id, { ...s }]));
     }
     state.multiSupervisorEnabled = Boolean(data.multiSupervisorEnabled);
+    state.spans = Array.isArray(data.spans) ? data.spans : [];
 
     const feats = (data.registros || []).map(r => {
       const sid = r.supervisorId || LEGACY_COLOR_TO_SUP[r.supervisorColor] || "default";
+      const zId = String(r.bloqueId || "");
       return new ol.Feature({
         geometry: new ol.geom.Point(ol.proj.fromLonLat([Number(r.longitud), Number(r.latitud)], map.getView().getProjection())),
         id: String(r.id),
@@ -2465,10 +3074,13 @@
         tipo: r.tipo || "PUNTO",
         codigo: String(r.codigo || ""),
         supervisorId: sid,
-        bloqueId: String(r.bloqueId || ""),
-        bloques: Array.isArray(r.bloques) ? r.bloques : [],
+        bloqueId: zId,
+        bloques: Array.isArray(r.bloques) ? r.bloques : (zId ? [zId] : []),
         aperturasIds: Array.isArray(r.aperturasIds) ? r.aperturasIds : [],
         tipoEquipo: String(r.tipoEquipo || ""),
+        rolPT: String(r.rolPT || r.rol || ""),
+        accionPT: String(r.accionPT || ""),
+        esRemate: Boolean(r.esRemate),
         colorPersonalizado: String(r.colorPersonalizado || "")
       });
     });
@@ -2484,8 +3096,62 @@
     styleCache = new WeakMap();
     ensureVectorLayer();
     refreshAll();
-    fitPoints(state.points.map((_, i) => i));
+    if (state.points.length) fitPoints(state.points.map((_, i) => i));
     autosaveNow();
+  }
+
+  // Carga directa de un archivo Preset de Permiso de Trabajo (como pt-263781.json)
+  async function loadPermitPresetData(preset) {
+    closeModal();
+    state.projectId = "preset-" + (preset.preset || Date.now());
+    state.projectName = preset.nombre || preset.preset || "Permiso PT";
+    projNameInput.value = state.projectName;
+    state.points = [];
+    state.spans = [];
+    state.selected.clear();
+    state.zones.get("D").customRing = null;
+    state.zones.get("T").customRing = null;
+    state.zones.get("F").customRing = null;
+
+    const roles = Array.isArray(preset.roles) ? preset.roles : [];
+    setCursorMode("nav", `⏳ Resolviendo ${roles.length} referencias del PT en GNAT...`);
+    let resolvedCount = 0;
+
+    for (const r of roles) {
+      const code = String(r.codigo || "").trim().toUpperCase();
+      if (!code) continue;
+      modeBannerText.textContent = `⏳ Resolviendo ${r.rol || ""} (${code}) en GNAT...`;
+      const hit = await resolveCodeInGnat(code, true);
+      if (!hit?.lonlat) continue;
+      resolvedCount++;
+
+      // Clasificación fiel al PDF del PT: D = Zona desconectada, T = Zona de trabajo, F = Punto de faenas
+      const rolStr = String(r.rol || "").toUpperCase();
+      const zoneId = rolStr.startsWith("F") ? "F" : rolStr.startsWith("T") ? "T" : "D";
+      const isOpening = String(r.tipo || "").toLowerCase() === "apertura" || String(r.estadoPT || "").toLowerCase() === "abierto";
+
+      upsertPointOnMap({
+        codigo: hit.code || code,
+        lonlat: hit.lonlat,
+        tipo: isOpening ? "APERTURA" : "PUNTO",
+        bloqueId: zoneId,
+        bloques: [zoneId],
+        tipoEquipo: r.equipo || (r.estadoPT === "Aterrizado" ? "EPT" : ""),
+        rolPT: rolStr,
+        accionPT: r.accion || ""
+      });
+      ensureVectorLayer();
+      refreshAll();
+    }
+
+    setCursorMode("nav");
+    if (state.points.length) {
+      fitPoints(state.points.map((_, i) => i));
+      // Ejecutar automáticamente el trazado de tramos MT, aperturas y remates
+      await runMtNetworkDiscovery();
+    } else {
+      showToast(`No se pudieron resolver las coordenadas en GNAT (${resolvedCount}/${roles.length}).`, true);
+    }
   }
 
   async function handleSmartFile(file) {
@@ -2497,7 +3163,7 @@
 
       if (isZip) {
         const kmlText = await readKmzBytes(ab);
-        await applyKmlText(kmlText, file.name.replace(/\.(kmz|kml)$/i, ""));
+        await parseAndRouteKml(kmlText, file.name.replace(/\.(kmz|kml)$/i, ""));
         return;
       }
 
@@ -2505,71 +3171,53 @@
       if (text.startsWith("{")) {
         const data = JSON.parse(text);
         if (data?.formato === "CentralityLocal" && Array.isArray(data.registros)) {
-          if (state.points.length > 0 && state.dirty) {
-            if (!w.confirm("¿Abrir este proyecto y reemplazar el actual?")) return;
-          }
           loadProjectData(data);
           closeModal();
-          showToast(`Proyecto cargado (${state.points.length} puntos).`);
+          showToast(`Proyecto "${state.projectName}" abierto (${state.points.length} registros).`);
+          return;
+        }
+        if (Array.isArray(data?.roles) || data?.permiso) {
+          await loadPermitPresetData(data);
           return;
         }
       }
 
       if (text.includes("<kml") || text.includes("<Placemark")) {
-        await applyKmlText(text, file.name.replace(/\.(kmz|kml)$/i, ""));
+        await parseAndRouteKml(text, file.name.replace(/\.(kmz|kml)$/i, ""));
         return;
       }
 
-      // CSV simple (recorrido o aperturas)
       const lines = text.split(/\r?\n/).filter(l => l.trim());
       if (lines.length >= 2 && (lines[0].includes(";") || lines[0].includes(","))) {
         const sep = lines[0].includes(";") ? ";" : ",";
-        const cols = lines[0].split(sep).map(c => c.trim().toLowerCase());
+        const cols = lines[0].split(sep).map(c => c.trim().replace(/^"|"$/g, "").toLowerCase());
         const lonIdx = cols.findIndex(c => c.includes("long"));
         const latIdx = cols.findIndex(c => c.includes("lat"));
         const codeIdx = cols.findIndex(c => c.includes("subest") || c.includes("cod"));
         if (lonIdx >= 0 && latIdx >= 0) {
-          const isOpeningCsv = cols.some(c => c === "bloques") && !cols.some(c => c.includes("subest"));
-          const feats = [];
           for (let i = 1; i < lines.length; i++) {
-            const parts = lines[i].split(sep);
+            const parts = lines[i].split(sep).map(s => s.trim().replace(/^"|"$/g, ""));
             const lon = Number(String(parts[lonIdx] || "").replace(",", "."));
             const lat = Number(String(parts[latIdx] || "").replace(",", "."));
             if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
-            feats.push(new ol.Feature({
-              geometry: new ol.geom.Point(ol.proj.fromLonLat([lon, lat], map.getView().getProjection())),
-              id: `${isOpeningCsv ? "ap" : "marker"}-${i}`,
-              numero: i,
-              tipo: isOpeningCsv ? "APERTURA" : "PUNTO",
-              codigo: String(parts[codeIdx] || `Punto ${i}`).trim(),
-              bloqueId: "",
-              bloques: [],
-              aperturasIds: [],
-              supervisorId: "default"
-            }));
-          }
-          if (!feats.length) throw Error("No se encontraron coordenadas válidas en el CSV.");
-          const append = state.points.length > 0 && w.confirm("Ya hay puntos en el mapa.\nAceptar = Agregar al proyecto actual\nCancelar = Iniciar proyecto nuevo");
-          if (!append) {
-            state.points = feats;
-            state.zones.clear();
-            state.projectId = "proj-" + Date.now();
-            state.projectName = file.name.replace(/\.csv$/i, "");
-            projNameInput.value = state.projectName;
-          } else {
-            state.points.push(...feats);
+            upsertPointOnMap({
+              codigo: String(parts[codeIdx] || `P-${i}`),
+              lonlat: [lon, lat],
+              tipo: "PUNTO",
+              bloqueId: "T",
+              bloques: ["T"]
+            });
           }
           ensureVectorLayer();
           refreshAll();
           fitPoints(state.points.map((_, i) => i));
           closeModal();
           autosaveNow();
-          showToast(`Importados ${feats.length} registros desde CSV.`);
           return;
         }
       }
 
-      throw Error("Formato de archivo no reconocido. Usa KMZ, KML, Proyecto JSON o CSV con coordenadas.");
+      throw Error("Formato no reconocido. Usa KMZ, KML, Proyecto JSON, Preset PT o CSV.");
     } catch (e) {
       showToast("Error al abrir: " + e.message, true);
     } finally {
@@ -2577,7 +3225,7 @@
     }
   }
 
-  async function applyKmlText(kmlText, baseName) {
+  async function parseAndRouteKml(kmlText, baseName) {
     const xml = new DOMParser().parseFromString(kmlText, "application/xml");
     if (xml.querySelector("parsererror")) throw Error("El KML interno no es XML válido.");
     const fmt = new ol.format.KML({ extractStyles: false, showPointNames: false });
@@ -2585,54 +3233,26 @@
       dataProjection: "EPSG:4326",
       featureProjection: map.getView().getProjection()
     });
-    const newFeats = [];
+    const proj = map.getView().getProjection();
+    let count = 0;
     for (const orig of rawFeats) {
-      const code = String(orig.get("name") || "").trim() || "Sin código";
+      const code = String(orig.get("name") || "").trim() || `P-${count + 1}`;
       for (const xy of extractGeoms(orig.getGeometry())) {
         if (!xy.every(Number.isFinite)) continue;
-        newFeats.push(new ol.Feature({
-          geometry: new ol.geom.Point(xy),
-          id: "marker-" + (newFeats.length + 1),
-          numero: newFeats.length + 1,
-          tipo: "PUNTO",
-          codigo: code,
-          bloqueId: "",
-          bloques: [],
-          aperturasIds: [],
-          supervisorId: "default"
-        }));
+        const [lon, lat] = ol.proj.toLonLat(xy, proj);
+        upsertPointOnMap({ codigo: code, lonlat: [lon, lat], tipo: "PUNTO", bloqueId: "T", bloques: ["T"] });
+        count++;
       }
     }
-    if (!newFeats.length) throw Error("El archivo KMZ/KML no contiene puntos.");
-
-    let append = false;
-    if (state.points.length > 0) {
-      append = w.confirm(`Ya tienes ${state.points.length} punto(s) cargados.\n\nAceptar = AGREGAR estos ${newFeats.length} puntos al proyecto actual\nCancelar = CREAR un proyecto nuevo con este archivo`);
-    }
-
-    if (append) {
-      const startNum = 1 + Math.max(0, ...state.points.map(p => Number(p.get("numero")) || 0));
-      newFeats.forEach((f, i) => {
-        f.set("numero", startNum + i);
-        f.set("id", `marker-${startNum + i}-${Date.now()}`);
-      });
-      state.points.push(...newFeats);
-    } else {
-      state.projectId = "proj-" + Date.now();
-      state.projectName = baseName || "Nuevo proyecto";
-      projNameInput.value = state.projectName;
-      state.points = newFeats;
-      state.zones.clear();
-      state.selected.clear();
-      state.focused = -1;
-    }
-    styleCache = new WeakMap();
+    if (!count) throw Error("El archivo KMZ/KML no contiene puntos.");
+    state.projectName = baseName || state.projectName;
+    projNameInput.value = state.projectName;
     ensureVectorLayer();
     refreshAll();
     fitPoints(state.points.map((_, i) => i));
     closeModal();
-    await autosaveNow();
-    showToast(`${newFeats.length} puntos cargados desde ${baseName}.`);
+    autosaveNow();
+    showToast(`${count} punto(s) cargados desde KMZ.`);
   }
 
   hiddenFileInput.onchange = () => handleSmartFile(hiddenFileInput.files?.[0]);
@@ -2652,7 +3272,7 @@
     const payload = serializeProjectPayload();
     const safe = state.projectName.replace(/[^a-zA-Z0-9._-]+/g, "_") || "centrality-proyecto";
     downloadBlob(safe + ".json", JSON.stringify(payload, null, 2), "application/json;charset=utf-8");
-    showToast("Copia JSON descargada.");
+    showToast("Proyecto guardado en PC (.json).");
   }
 
   function downloadCSV() {
@@ -2660,12 +3280,20 @@
       const s = String(v ?? "");
       return /[;"\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
-    const rows = [["Tipo", "Numero", "Codigo", "Longitud", "Latitud", "Zona", "Supervisor"]];
+    const rows = [["Rol", "Tipo", "Numero", "Codigo", "TipoEquipo", "Longitud", "Latitud", "Zonas_DTF", "Accion"]];
     for (const f of state.points) {
       const [lon, lat] = ol.proj.toLonLat(f.getGeometry().getCoordinates(), map.getView().getProjection());
-      const zids = getPointZoneIds(f).map(id => state.zones.get(id)?.name || id).join("|");
-      const sup = state.supervisors.get(getSupId(f))?.name || "Sin asignar";
-      rows.push([f.get("tipo") || "PUNTO", f.get("numero"), getPointCode(f), lon, lat, zids, sup]);
+      rows.push([
+        f.get("rolPT") || "",
+        f.get("tipo") || "PUNTO",
+        f.get("numero"),
+        getPointCode(f),
+        f.get("tipoEquipo") || "",
+        lon,
+        lat,
+        getPointZoneIds(f).join("|"),
+        f.get("accionPT") || ""
+      ]);
     }
     const safe = state.projectName.replace(/[^a-zA-Z0-9._-]+/g, "_") || "centrality-tabla";
     downloadBlob(safe + ".csv", "\ufeff" + rows.map(r => r.map(q).join(";")).join("\r\n"), "text/csv;charset=utf-8");
@@ -2673,7 +3301,7 @@
   }
 
   // =========================================================================
-  // 14. MODALES: INICIO/RECIENTES, PEGAR CÓDIGOS, SUPERVISORES, ATLAS PDF
+  // 16. MODALES: INICIO, EDITAR PUNTO, BUSCADOR/PEGADO GNAT, EQUIPO, DEMO PDF
   // =========================================================================
   function closeModal() {
     modalBackdrop.classList.add("hidden");
@@ -2685,16 +3313,14 @@
     modalBackdrop.classList.remove("hidden");
     const card = el("div", "modal-card", null, modalBackdrop);
     const head = el("div", "modal-head", null, card);
-    el("h2", "", "Centrality · Proyectos", head);
-    // The way out must never depend on having data: an empty project is a valid
-    // place to work, and starting from zero is exactly when this modal opens.
-    const bClose = el("button", "btn-outline", state.points.length > 0 ? "Volver al mapa" : "Empezar en blanco", head);
-    bClose.onclick = closeModal;
+    el("h2", "", "Centrality · Planificación D / T / F", head);
+    const bBlank = el("button", "btn-primary", "Empezar en mapa vacío", head);
+    bBlank.onclick = closeModal;
 
     const body = el("div", "modal-body", null, card);
     const dz = el("div", "dropzone", null, body);
-    el("div", "", "📂 Arrastra aquí un KMZ, KML, Proyecto (.json) o CSV", dz).style.fontWeight = "700";
-    el("div", "", "Detección automática de formato · o haz clic para examinar", dz).style.cssText = "font-size:12px;color:var(--text-secondary);margin-top:4px;";
+    el("div", "", "📂 Arrastra aquí un KMZ, Proyecto (.json), Preset PT (ej. pt-263781.json) o CSV", dz).style.fontWeight = "700";
+    el("div", "", "O haz clic para examinar archivos · También puedes cerrar y buscar códigos directo en GNAT", dz).style.cssText = "font-size:12px;color:var(--text-secondary);margin-top:4px;";
     dz.onclick = () => hiddenFileInput.click();
     dz.ondragover = (e) => { e.preventDefault(); dz.classList.add("drag"); };
     dz.ondragleave = () => dz.classList.remove("drag");
@@ -2704,7 +3330,7 @@
       handleSmartFile(e.dataTransfer?.files?.[0]);
     };
 
-    const recHeader = el("div", "", "Proyectos recientes (guardados automáticamente)", body);
+    const recHeader = el("div", "", "Proyectos recientes (autoguardados en este navegador)", body);
     recHeader.style.cssText = "font-size:12px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;margin-top:6px;";
 
     const recList = el("div", "", null, body);
@@ -2712,20 +3338,15 @@
     try {
       const projs = await dbListProjects();
       if (!projs.length) {
-        const empty = el("div", "", "Aún no tienes proyectos guardados en este navegador.", recList);
-        empty.style.cssText = "font-size:12px;color:var(--text-secondary);padding:8px 0;";
+        el("div", "", "Sin proyectos recientes. Usa 'Empezar en mapa vacío' o importa un archivo.", recList).style.cssText = "font-size:12px;color:var(--text-secondary);";
       } else {
-        for (const p of projs.slice(0, 8)) {
+        for (const p of projs.slice(0, 10)) {
           const item = el("div", "recent-item", null, recList);
           const info = el("div", "", null, item);
           el("div", "", p.name, info).style.fontWeight = "600";
           const dt = new Date(p.updatedAt || Date.now()).toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" });
-          el("div", "", `${p.pointCount || 0} puntos · ${p.zoneCount || 0} zonas · ${dt}`, info).style.cssText = "font-size:11px;color:var(--text-secondary);";
-
-          const actions = el("div", "", null, item);
-          actions.style.cssText = "display:flex;gap:4px;";
-          const bDel = el("button", "btn-outline", "🗑", actions);
-          bDel.title = "Eliminar del historial local";
+          el("div", "", `${p.pointCount || 0} puntos · ${dt}`, info).style.cssText = "font-size:11px;color:var(--text-secondary);";
+          const bDel = el("button", "btn-outline icon-btn", "🗑", item);
           bDel.onclick = async (ev) => {
             ev.stopPropagation();
             await dbDeleteProject(p.id);
@@ -2738,9 +3359,82 @@
           };
         }
       }
-    } catch (e) {
-      el("div", "", "No se pudo leer IndexedDB.", recList);
+    } catch (_) {}
+  }
+
+  function openEditPointModal(idx) {
+    const f = state.points[idx];
+    if (!f) return;
+    modalBackdrop.replaceChildren();
+    modalBackdrop.classList.remove("hidden");
+    const card = el("div", "modal-card", null, modalBackdrop);
+    const head = el("div", "modal-head", null, card);
+    el("h2", "", `Editar ${getPointCode(f)}`, head);
+    const bClose = el("button", "btn-outline", "×", head);
+    bClose.onclick = closeModal;
+
+    const body = el("div", "modal-body", null, card);
+    const grid = el("div", "form-grid", null, body);
+
+    el("label", "", "Rol PT (ej. T1, F1):", grid);
+    const inpRol = el("input", "", null, grid);
+    inpRol.value = String(f.get("rolPT") || "");
+
+    el("label", "", "Código de placa:", grid);
+    const inpCode = el("input", "", null, grid);
+    inpCode.value = getPointCode(f);
+
+    el("label", "", "Categoría:", grid);
+    const selKind = el("select", "", null, grid);
+    [["PUNTO", "Poste / Punto"], ["APERTURA", "Apertura (✕ roja)"]].forEach(([v, t]) => {
+      const o = el("option", "", t, selKind); o.value = v;
+    });
+    selKind.value = f.get("tipo") || "PUNTO";
+
+    el("label", "", "Equipo / EPT:", grid);
+    const selEq = el("select", "", null, grid);
+    EQUIPMENT_TYPES.forEach(t => {
+      const o = el("option", "", t || "— Ninguno —", selEq); o.value = t;
+    });
+    selEq.value = String(f.get("tipoEquipo") || "");
+
+    el("label", "", "Acción a ejecutar:", grid);
+    const inpAccion = el("input", "", null, grid);
+    inpAccion.value = String(f.get("accionPT") || "");
+
+    const footer = el("div", "", null, body);
+    footer.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:6px;";
+    const bCancel = el("button", "btn-outline", "Cancelar", footer);
+    bCancel.onclick = closeModal;
+    const bSave = el("button", "btn-primary", "Guardar", footer);
+    bSave.onclick = () => {
+      f.set("rolPT", inpRol.value.trim());
+      f.set("codigo", inpCode.value.trim() || "Sin código");
+      f.set("tipo", selKind.value);
+      f.set("tipoEquipo", selEq.value);
+      f.set("accionPT", inpAccion.value.trim());
+      styleCache = new WeakMap();
+      markDirty();
+      refreshAll();
+      closeModal();
+    };
+  }
+
+  // Extrae coordenadas desde texto libre, fila de Excel o link de Google Maps
+  function extractLatLonFromLine(line) {
+    const gmap = /@(-?\d+\.\d+),(-?\d+\.\d+)|[?&](?:q|ll)=(-?\d+\.\d+),(-?\d+\.\d+)|!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/.exec(line);
+    if (gmap) {
+      const lat = Number(gmap[1] || gmap[3] || gmap[5]);
+      const lon = Number(gmap[2] || gmap[4] || gmap[6]);
+      if (Math.abs(lat) <= 90 && Math.abs(lon) <= 180) return [lon, lat];
     }
+    const nums = [...line.matchAll(/(-?\d{2}[.,]\d{4,9})/g)].map(m => Number(m[1].replace(",", ".")));
+    if (nums.length >= 2) {
+      const [a, b] = nums;
+      if (Math.abs(a) <= 90 && Math.abs(b) <= 180 && Math.abs(b) > Math.abs(a)) return [b, a];
+      if (Math.abs(b) <= 90 && Math.abs(a) <= 180) return [a, b];
+    }
+    return null;
   }
 
   function openPasteCodesModal() {
@@ -2748,41 +3442,110 @@
     modalBackdrop.classList.remove("hidden");
     const card = el("div", "modal-card", null, modalBackdrop);
     const head = el("div", "modal-head", null, card);
-    el("h2", "", "Seleccionar por lista de códigos", head);
+    el("h2", "", "Buscar o importar códigos / tabla en GNAT", head);
     const bClose = el("button", "btn-outline", "×", head);
     bClose.onclick = closeModal;
 
     const body = el("div", "modal-body", null, card);
-    el("div", "", "Pega códigos de postes o aperturas desde Excel o WhatsApp (uno por línea, o separados por coma/espacio):", body).style.fontSize = "12px";
+    el("div", "", "Pega códigos de postes/aperturas (con o sin 'F') o filas desde Excel con coordenadas / links de Google Maps:", body).style.fontSize = "12px";
     const ta = el("textarea", "", null, body);
-    ta.style.cssText = "width:100%;height:170px;border:1px solid var(--border);border-radius:8px;padding:10px;font:12px monospace;";
-    ta.placeholder = "626402\nBE9950\n626401";
+    ta.style.cssText = "width:100%;height:150px;border:1px solid var(--border);border-radius:8px;padding:10px;font:12px monospace;";
+    ta.placeholder = "FAG1674\nFAG1665\nFAG1666\nFAG1671\nFAG1667";
+
+    const zoneRow = el("div", "inline-input-row", null, body);
+    el("span", "", "Asignar a:", zoneRow).style.fontWeight = "600";
+    const selTargetZone = el("select", "", null, zoneRow);
+    selTargetZone.style.cssText = "flex:1;padding:6px;border:1px solid var(--border);border-radius:6px;";
+    for (const z of state.zones.values()) {
+      const o = el("option", "", `${z.id} · ${z.name}`, selTargetZone);
+      o.value = z.id;
+    }
+    selTargetZone.value = "T";
+
+    const resultArea = el("div", "", null, body);
 
     const footer = el("div", "", null, body);
     footer.style.cssText = "display:flex;justify-content:flex-end;gap:8px;";
-    const bCancel = el("button", "btn-outline", "Cancelar", footer);
+    const bCancel = el("button", "btn-outline", "Cerrar", footer);
     bCancel.onclick = closeModal;
-    const bRun = el("button", "btn-primary", "Buscar y seleccionar en mapa", footer);
-    bRun.onclick = () => {
-      const tokens = [...new Set(ta.value.split(/[\s,;|]+/).map(s => s.trim().toUpperCase()).filter(Boolean))];
-      if (!tokens.length) return;
+    const bRun = el("button", "btn-primary", "🔍 Resolver en GNAT y agregar al mapa", footer);
+    bRun.onclick = async () => {
+      const rawLines = ta.value.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      if (!rawLines.length) return;
+      bRun.disabled = true;
       state.selected.clear();
-      const matched = [];
+      const targetZ = selTargetZone.value;
       const missing = [];
-      for (const tok of tokens) {
-        const foundIdx = state.points.findIndex(f => getPointCode(f).toUpperCase() === tok || String(f.get("numero")) === tok);
-        if (foundIdx >= 0) {
-          state.selected.add(foundIdx);
-          matched.push(foundIdx);
-        } else {
-          missing.push(tok);
+      const addedIndices = [];
+
+      for (const line of rawLines) {
+        const inlineLonLat = extractLatLonFromLine(line);
+        const tokens = line.split(/[\t,;| ]+/).map(s => s.trim()).filter(Boolean);
+        const firstToken = tokens[0] || "";
+
+        if (inlineLonLat) {
+          const feat = upsertPointOnMap({
+            codigo: firstToken,
+            lonlat: inlineLonLat,
+            tipo: "PUNTO",
+            bloqueId: targetZ,
+            bloques: [targetZ]
+          });
+          const idx = state.points.indexOf(feat);
+          state.selected.add(idx);
+          addedIndices.push(idx);
+          continue;
+        }
+
+        // Si son códigos separados en la línea
+        for (const tok of tokens) {
+          const existingIdx = state.points.findIndex(f => getPointCode(f).toUpperCase() === tok.toUpperCase() || getPointCode(f).toUpperCase() === "F" + tok.toUpperCase());
+          if (existingIdx >= 0) {
+            assignZoneToIndices([existingIdx], targetZ, true);
+            state.selected.add(existingIdx);
+            addedIndices.push(existingIdx);
+            continue;
+          }
+          bRun.textContent = `⏳ Buscando ${tok} en GNAT...`;
+          const hit = await resolveCodeInGnat(tok, true);
+          if (hit?.lonlat) {
+            const feat = upsertPointOnMap({
+              codigo: hit.code,
+              lonlat: hit.lonlat,
+              tipo: hit.isOpeningDevice ? "APERTURA" : "PUNTO",
+              bloqueId: targetZ,
+              bloques: [targetZ]
+            });
+            const idx = state.points.indexOf(feat);
+            state.selected.add(idx);
+            addedIndices.push(idx);
+          } else {
+            missing.push(tok);
+          }
         }
       }
-      renderTable();
-      rebuildOverlayLayers();
-      if (matched.length) fitPoints(matched);
-      closeModal();
-      showToast(missing.length ? `${matched.length} seleccionados · ${missing.length} no encontrados (${missing.slice(0, 3).join(", ")}...)` : `${matched.length} puntos seleccionados.`);
+
+      bRun.disabled = false;
+      bRun.textContent = "🔍 Resolver en GNAT y agregar al mapa";
+      ensureVectorLayer();
+      markDirty();
+      refreshAll();
+      if (addedIndices.length) fitPoints(addedIndices);
+
+      if (!missing.length) {
+        closeModal();
+        showToast(`${addedIndices.length} código(s) resueltos y seleccionados en el mapa.`);
+      } else {
+        resultArea.replaceChildren();
+        const box = el("div", "", null, resultArea);
+        box.style.cssText = "background:#FEF3C7;border:1px solid #F59E0B;border-radius:8px;padding:10px;font-size:12px;display:flex;flex-direction:column;gap:8px;";
+        el("div", "", `✓ ${addedIndices.length} resueltos en GNAT · ⚠️ ${missing.length} no encontrados: ${missing.join(", ")}`, box);
+        const bPlace = el("button", "btn-primary", `📍 Ubicar los ${missing.length} faltantes haciendo clic en el mapa`, box);
+        bPlace.onclick = () => {
+          closeModal();
+          startPlaceMissingCodesQueue(missing);
+        };
+      }
     };
   }
 
@@ -2801,13 +3564,13 @@
     const chk = el("input", "", null, chkRow);
     chk.type = "checkbox";
     chk.checked = state.multiSupervisorEnabled;
-    el("span", "", "Mostrar columna y filtros por supervisor (para repartir una zona entre varios)", chkRow);
+    el("span", "", "Mostrar columna y filtros por supervisor", chkRow);
     chk.onchange = () => { state.multiSupervisorEnabled = chk.checked; markDirty(); refreshAll(); };
 
     for (const s of state.supervisors.values()) {
       if (s.id === "default") continue;
-      const row = el("div", "", null, body);
-      row.style.cssText = "display:flex;align-items:center;gap:8px;border:1px solid var(--border);padding:8px;border-radius:8px;";
+      const row = el("div", "inline-input-row", null, body);
+      row.style.cssText = "display:flex;align-items:center;gap:8px;border:1px solid var(--border);padding:6px 8px;border-radius:8px;";
       const sw = el("button", "swatch", "", row);
       sw.style.background = s.color;
       sw.onclick = () => openColorPickerPopover(sw, s.color, (c) => {
@@ -2817,19 +3580,32 @@
         markDirty();
         refreshAll();
       });
-      el("strong", "", s.initials, row).style.width = "30px";
-      el("span", "", s.name, row).style.flex = "1";
+      const inpInit = el("input", "", null, row);
+      inpInit.value = s.initials;
+      inpInit.style.maxWidth = "52px";
+      inpInit.onchange = () => { s.initials = inpInit.value.trim().slice(0, 4) || s.id; markDirty(); refreshAll(); };
+      const inpName = el("input", "", null, row);
+      inpName.value = s.name;
+      inpName.onchange = () => { s.name = inpName.value.trim() || s.initials; markDirty(); refreshAll(); };
     }
   }
 
+  function openAtlasPdfModal() {
+    modalBackdrop.replaceChildren();
+    modalBackdrop.classList.remove("hidden");
+    const card = el("div", "modal-card", null, modalBackdrop);
+    const head = el("div", "modal-head", null, card);
+    el("h2", "", "Exportar Planos PDF (A1 / Atlas · Demo)", head);
+    const bClose = el("button", "btn-outline", "Cerrar", head);
+    bClose.onclick = closeModal;
+    const body = el("div", "modal-body", null, card);
+    el("div", "", "Vista demostrativa del módulo de impresión A1.", body).style.cssText = "font-size:12px;color:var(--text-secondary);background:var(--bg-muted);padding:10px;border-radius:8px;";
+  }
+
   // =========================================================================
-  // 15. DETALLE MT/BT (WMTS) + MODAL ATLAS PDF A1 (MOTOR PRESERVADO)
+  // 17. DETALLE MT/BT (WMTS) Y EVENTOS DE TECLADO
   // =========================================================================
-  const MTBT_LAYERS = new Set([
-    "webmap.distribution.medium_voltage",
-    "webmap.distribution.low_voltage",
-    "webmap.infrastructure"
-  ]);
+  const MTBT_LAYERS = new Set(["webmap.distribution.medium_voltage", "webmap.distribution.low_voltage", "webmap.infrastructure"]);
   const mtbtSources = new Set();
   const originalGrids = new Map();
   (function scanLayers(col) {
@@ -2858,179 +3634,42 @@
     }
     mtbtSources.forEach(s => s.changed?.());
     map.render?.();
-    showToast(state.mtbtDetail ? `Detalle MT/BT forzado +${state.mtbtDetail}` : "Detalle MT/BT original");
   }
 
-  function openAtlasPdfModal() {
-    if (!state.points.length) { showToast("Carga puntos primero para generar planos.", true); return; }
-    modalBackdrop.replaceChildren();
-    modalBackdrop.classList.remove("hidden");
-    const card = el("div", "modal-card", null, modalBackdrop);
-    const head = el("div", "modal-head", null, card);
-    el("h2", "", "Exportar Planos PDF (A1 / Atlas)", head);
-    const bClose = el("button", "btn-outline", "×", head);
-    bClose.onclick = () => { if (!atlasRunning) closeModal(); };
-
-    const body = el("div", "modal-body", null, card);
-    const selModo = el("select", "", null, body);
-    selModo.style.cssText = "padding:8px;border:1px solid var(--border);border-radius:6px;";
-    [["ambos", "Plano general + Atlas de detalle"], ["general", "Solo Plano general"], ["atlas", "Solo Atlas de detalle"]].forEach(([v, t]) => {
-      const o = el("option", "", t, selModo); o.value = v;
-    });
-
-    const row2 = el("div", "", null, body);
-    row2.style.cssText = "display:flex;gap:8px;";
-    const selPapel = el("select", "", null, row2);
-    selPapel.style.cssText = "flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;";
-    [["A1L", "A1 Horizontal (841×594 mm)"], ["A1P", "A1 Vertical"], ["A3L", "A3 Horizontal"], ["A4L", "A4 Horizontal"]].forEach(([v, t]) => {
-      const o = el("option", "", t, selPapel); o.value = v;
-    });
-    const selDpi = el("select", "", null, row2);
-    selDpi.style.cssText = "flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;";
-    [["100", "100 dpi (Recomendado)"], ["150", "150 dpi (Alta)"], ["75", "75 dpi (Rápido)"]].forEach(([v, t]) => {
-      const o = el("option", "", t, selDpi); o.value = v;
-    });
-
-    const status = el("div", "", "Listo para preparar la exportación.", body);
-    status.style.cssText = "font-size:12px;color:var(--text-secondary);background:var(--bg-muted);padding:10px;border-radius:8px;";
-
-    const footer = el("div", "", null, body);
-    footer.style.cssText = "display:flex;justify-content:flex-end;gap:8px;";
-    const bPrep = el("button", "btn-primary", "Preparar planos", footer);
-    const bPrint = el("button", "btn-outline", "Abrir e imprimir / Guardar PDF", footer);
-    bPrint.disabled = true;
-
-    const PAPERS = { A1L: [841, 594], A1P: [594, 841], A3L: [420, 297], A4L: [297, 210] };
-    const getRes = (z) => map.getView().getResolutionForZoom?.(z) ?? (map.getView().getResolution() * Math.pow(2, map.getView().getZoom() - z));
-
-    bPrep.onclick = async () => {
-      if (atlasRunning) return;
-      atlasRunning = true;
-      atlasCancel = false;
-      bPrep.disabled = true;
-      bPrint.disabled = true;
-      try {
-        const dpi = Number(selDpi.value);
-        const [wMm, hMm] = PAPERS[selPapel.value];
-        const size = [Math.round((wMm - 20) * dpi / 25.4), Math.round((hMm - 36) * dpi / 25.4)];
-        const vis = getFilteredPoints().map(f => ({
-          numero: String(f.get("numero")),
-          codigo: getPointCode(f),
-          tipo: f.get("tipo") || "PUNTO",
-          color: getPointColor(f),
-          xy: f.getGeometry().getCoordinates().slice(0, 2)
-        }));
-        const xs = vis.map(p => p.xy[0]), ys = vis.map(p => p.xy[1]);
-        const xmin = Math.min(...xs), xmax = Math.max(...xs), ymin = Math.min(...ys), ymax = Math.max(...ys);
-        const tasks = [];
-        if (selModo.value !== "atlas") {
-          const res = Math.max((xmax - xmin) * 1.14 / size[0], (ymax - ymin) * 1.14 / size[1], getRes(18));
-          tasks.push({ center: [(xmin + xmax) / 2, (ymin + ymax) / 2], resolution: res, titulo: "Plano general" });
-        }
-        if (selModo.value !== "general") {
-          const res = getRes(16.5) * 100 / dpi;
-          const width = size[0] * res, height = size[1] * res;
-          const sx = width * 0.88, sy = height * 0.88;
-          const cols = Math.max(1, 1 + Math.ceil(Math.max(0, xmax - xmin - width) / sx));
-          const rows = Math.max(1, 1 + Math.ceil(Math.max(0, ymax - ymin - height) / sy));
-          for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-            tasks.push({
-              center: [cols === 1 ? (xmin + xmax) / 2 : xmin + width / 2 + c * sx, rows === 1 ? (ymin + ymax) / 2 : ymax - height / 2 - r * sy],
-              resolution: res,
-              titulo: "Detalle MT/BT"
-            });
-          }
-        }
-        if (tasks.length > 40 && !w.confirm(`Se generarán ${tasks.length} páginas. ¿Continuar?`)) throw Error("Cancelado.");
-
-        const target = doc.createElement("div");
-        target.style.cssText = `position:fixed;left:0;top:0;width:${size[0]}px;height:${size[1]}px;overflow:hidden;pointer-events:none;opacity:0.01;z-index:-1;`;
-        doc.body.appendChild(target);
-        const layers = [];
-        const allowed = new Set(["webmap.osm", "webmap.gm", "webmap.gs", "webmap.cartography", "webmap.distribution.medium_voltage", "webmap.distribution.low_voltage", "webmap.infrastructure"]);
-        (function walk(col) {
-          for (const l of col?.getArray?.() || []) {
-            if (l.getVisible?.() === false) continue;
-            if (l.getLayers) { walk(l.getLayers()); continue; }
-            const n = l.get?.("title") || l.get?.("name");
-            if (allowed.has(n) && l.getSource?.()) {
-              const Cls = (ol.source?.ImageWMS && l.getSource() instanceof ol.source.ImageWMS) ? ol.layer.Image : ol.layer.Tile;
-              layers.push(new Cls({ source: l.getSource(), visible: true, opacity: l.getOpacity?.() ?? 1 }));
-            }
-          }
-        })(map.getLayers());
-
-        const rMap = new ol.Map({
-          target, layers, pixelRatio: 1, controls: [], interactions: [],
-          view: new ol.View({ projection: map.getView().getProjection(), center: map.getView().getCenter().slice(), resolution: getRes(15) })
-        });
-        rMap.updateSize();
-        rendererExport = { rendererMap: rMap, target };
-
-        atlasCaptures = [];
-        for (let i = 0; i < tasks.length; i++) {
-          if (atlasCancel) throw Error("Cancelado.");
-          status.textContent = `Renderizando hoja ${i + 1} de ${tasks.length}...`;
-          rMap.getView().setCenter(tasks[i].center);
-          rMap.getView().setResolution(tasks[i].resolution);
-          await new Promise(res => {
-            const done = () => { rMap.un("rendercomplete", done); res(); };
-            rMap.on("rendercomplete", done);
-            w.setTimeout(done, 12000);
-            rMap.renderSync();
-          });
-          const canvas = doc.createElement("canvas");
-          canvas.width = size[0]; canvas.height = size[1];
-          const ctx = canvas.getContext("2d", { alpha: false });
-          ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, size[0], size[1]);
-          for (const c of rMap.getViewport().querySelectorAll("canvas")) {
-            if (c.width > 0 && c.height > 0) ctx.drawImage(c, 0, 0);
-          }
-          const blob = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.9));
-          const url = w.URL.createObjectURL(blob);
-          atlasCaptures.push({ ...tasks[i], image: url, size, dpi, vis });
-        }
-        bPrint.disabled = false;
-        status.textContent = `Listo: ${atlasCaptures.length} página(s) preparadas.`;
-      } catch (e) {
-        status.textContent = "Detenido: " + e.message;
-      } finally {
-        if (rendererExport) {
-          try { rendererExport.rendererMap.setTarget(null); rendererExport.target.remove(); } catch (_) {}
-          rendererExport = null;
-        }
-        atlasRunning = false;
-        bPrep.disabled = false;
-      }
-    };
-
-    bPrint.onclick = () => {
-      if (!atlasCaptures?.length) return;
-      const [wMm, hMm] = PAPERS[selPapel.value];
-      const win = w.open("", "_blank");
-      if (!win) return showToast("Permite ventanas emergentes para imprimir.", true);
-      const pages = atlasCaptures.map((p, i) => {
-        const [W, H] = p.size;
-        const svg = p.vis.map(pt => {
-          const x = W / 2 + (pt.xy[0] - p.center[0]) / p.resolution;
-          const y = H / 2 - (pt.xy[1] - p.center[1]) / p.resolution;
-          if (x < 0 || x > W || y < 0 || y > H) return "";
-          return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="7" fill="${pt.color}" stroke="#fff" stroke-width="2"/>` +
-            `<text x="${(x + 9).toFixed(1)}" y="${(y - 9).toFixed(1)}" font-family="Arial" font-size="14" font-weight="bold" paint-order="stroke" stroke="#fff" stroke-width="3" fill="#0f172a">${esc(pt.numero)}</text>`;
-        }).join("");
-        return `<section class="sheet"><header><b>${esc(state.projectName)} · ${esc(p.titulo)} (${i + 1}/${atlasCaptures.length})</b></header><div class="frame"><img src="${p.image}"><svg viewBox="0 0 ${W} ${H}">${svg}</svg></div></section>`;
-      }).join("");
-      win.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(state.projectName)}</title><style>@page{size:${wMm}mm ${hMm}mm;margin:0}body{margin:0;background:#e2e8f0;font:12px Arial}.bar{padding:10px;background:#0f172a;color:#fff}.sheet{width:${wMm}mm;height:${hMm}mm;padding:8mm 10mm;background:#fff;margin:10px auto;display:flex;flex-direction:column;page-break-after:always}.frame{flex:1;position:relative;overflow:hidden}.frame img,.frame svg{position:absolute;inset:0;width:100%;height:100%}@media print{.bar{display:none}.sheet{margin:0}}</style></head><body><div class="bar"><button onclick="window.print()">Imprimir / Guardar PDF</button></div>${pages}</body></html>`);
-      win.document.close();
-    };
-  }
-
-  // =========================================================================
-  // 16. EVENTOS GLOBALES, ATAJOS Y CICLO DE VIDA
-  // =========================================================================
+  // Búsqueda instantánea local + Enter para resolver el código en GNAT
   searchInput.oninput = () => {
     state.search = searchInput.value;
     refreshAll();
+  };
+  searchInput.onkeydown = async (ev) => {
+    if (ev.key === "Enter" && searchInput.value.trim()) {
+      const q = searchInput.value.trim();
+      const vis = getFilteredPoints();
+      if (vis.length > 0) {
+        navigateTo(state.points.indexOf(vis[0]));
+        return;
+      }
+      showToast(`Buscando "${q}" en GNAT...`);
+      const hit = await resolveCodeInGnat(q, true);
+      if (hit?.lonlat) {
+        const feat = upsertPointOnMap({
+          codigo: hit.code,
+          lonlat: hit.lonlat,
+          tipo: hit.isOpeningDevice ? "APERTURA" : "PUNTO",
+          bloqueId: "T",
+          bloques: ["T"]
+        });
+        searchInput.value = "";
+        state.search = "";
+        ensureVectorLayer();
+        markDirty();
+        refreshAll();
+        navigateTo(state.points.indexOf(feat));
+        showToast(`Agregado desde GNAT: ${hit.code}`);
+      } else {
+        showToast(`No se encontró "${q}" en GNAT.`, true);
+      }
+    }
   };
 
   const stepFocus = (delta) => {
@@ -3042,6 +3681,12 @@
   };
   btnPrev.onclick = () => stepFocus(-1);
   btnNext.onclick = () => stepFocus(1);
+
+  tableWrap.addEventListener("keydown", (ev) => {
+    if (ev.key === "ArrowDown") { ev.preventDefault(); stepFocus(1); }
+    else if (ev.key === "ArrowUp") { ev.preventDefault(); stepFocus(-1); }
+    else if (ev.key === "Enter" && state.focused >= 0) { ev.preventDefault(); openEditPointModal(state.focused); }
+  });
 
   btnToggleDrawer.onclick = () => {
     state.drawerOpen = !state.drawerOpen;
@@ -3068,9 +3713,12 @@
   const onKeyDown = (ev) => {
     if (ev.key === "Escape") {
       closePopover();
+      if (!modalBackdrop.classList.contains("hidden")) {
+        closeModal();
+        return;
+      }
       if (state.cursorMode !== "nav") {
-        state.pendingLinkIndices = [];
-        setCursorMode("nav");
+        finishPolygonDrawMode();
       } else if (state.selected.size > 0) {
         state.selected.clear();
         refreshAll();
@@ -3079,22 +3727,21 @@
   };
   doc.addEventListener("keydown", onKeyDown);
   doc.addEventListener("mousedown", (ev) => {
-    if (activePopover && !ev.composedPath().includes(activePopover)) {
-      closePopover();
-    }
+    if (activePopover && !ev.composedPath().includes(activePopover)) closePopover();
   });
 
   function destroy() {
     w.clearTimeout(autosaveTimer);
-    atlasCancel = true;
     setCursorMode("nav");
     if (dragBoxInteraction) map.removeInteraction(dragBoxInteraction);
     map.un("singleclick", onMapSingleClick);
-    map.getViewport?.()?.removeEventListener("contextmenu", onMapContextMenu);
+    viewportEl?.removeEventListener("contextmenu", onMapContextMenu);
     doc.removeEventListener("keydown", onKeyDown);
     if (vectorLayer) map.removeLayer(vectorLayer);
     if (hullLayer) map.removeLayer(hullLayer);
+    if (spanLayer) map.removeLayer(spanLayer);
     if (routeLayer) map.removeLayer(routeLayer);
+    if (linkLayer) map.removeLayer(linkLayer);
     setMtBtDetail(0);
     host.remove();
     if (w.__centralityV10?.destroy === destroy) delete w.__centralityV10;
@@ -3108,8 +3755,28 @@
     openRecent: openStartModal
   };
 
-  // Inicialización
+  restoreBackupFolderHandle();
   setCursorMode("nav");
-  refreshAll();
-  openStartModal();
+
+  if (prevPoints.length > 0) {
+    state.points = prevPoints.map(p => new ol.Feature({
+      geometry: new ol.geom.Point(p.xy),
+      id: p.id,
+      numero: p.numero,
+      tipo: p.tipo,
+      codigo: p.codigo,
+      bloqueId: p.bloqueId || "T",
+      bloques: p.bloques?.length ? p.bloques : ["T"],
+      aperturasIds: p.aperturasIds,
+      supervisorId: LEGACY_COLOR_TO_SUP[p.bloque] || "default",
+      tipoEquipo: p.tipoEquipo,
+      colorPersonalizado: p.colorPersonalizado
+    }));
+    ensureVectorLayer();
+    refreshAll();
+    autosaveNow();
+  } else {
+    refreshAll();
+    openStartModal();
+  }
 })();
