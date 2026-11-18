@@ -1,5 +1,5 @@
-build 1.7
+build 1.7.1
 generado desde: C:\Users\Supervisor\Desktop\Proyectos\GNAT-Centrality-V10-Tools-Test
-archivos: 8
+archivos: 6
 
 Cargar: chrome://extensions -> Modo de desarrollador -> Cargar descomprimida -> esta carpeta
