@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "Centrality Local V10 (build 1.9.2)",
-  "version": "1.9.2",
+  "name": "Centrality Local V10 (build 1.9.3)",
+  "version": "1.9.3",
   "description": "Centrality Local V10: planificación visual en mapa, zonas de alto contraste, autoguardado y tabla rápida",
   "action": {
     "default_title": "Abrir Centrality Local V10"
