@@ -1,4 +1,4 @@
-build 1.9.1
+build 1.9.2
 generado desde: C:\Users\Supervisor\Desktop\Proyectos\GNAT-Centrality-V10-Tools-Test
 archivos: 6
 
