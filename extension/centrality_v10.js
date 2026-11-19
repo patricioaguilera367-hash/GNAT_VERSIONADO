@@ -142,6 +142,7 @@
     filterZones: new Set(), // empty = all; "__NONE__" = sin zona
     filterSups: new Set(),  // empty = all
     showIntermediosInTable: false,
+    selectedIntermedios: new Set(),
     // Opciones de visualización en mapa
     colorBy: "zone",        // "zone" | "supervisor"
     hidePoles: false,       // Ocultar pines de postes para editar polígonos cómodamente
@@ -517,13 +518,13 @@
   const COCI_3F_REGEX = /<td>\s*(\d+(?:\.\d+)?)\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>/i;
   const REAL_STATE_REGEX = /<b>\s*Real:\s*<\/b>\s*([^<]+)/i;
   // Equipos de maniobra EN SERIE con línea MT (siempre cortan el grafo)
-  const LINE_OPENING_REGEX = /\b(reconectador|seccionador|seccional|cuchill[ao]|interruptor|pole\s*top|\bddcc\b|\bdbc\b|\bdc\b|\brc\d*\b)/i;
+  const LINE_OPENING_REGEX = /\b(reconectador|seccionador|seccional|cuchill[ao]|interruptor|pole\s*top|bajo\s+carga|sin\s+carga|desconectador\s+(?:bajo\s+carga|sin\s+carga|tripolar|monopolar|en\s+aire|de\s+l[ií]nea|a[eé]reo)|\bddcc\b|\bdbc\b|\bdc\b|\brc\d*\b)/i;
   // Fusibles (pueden ser de arranque MT o de protección de transformador/SSEE)
   const FUSE_DEVICE_REGEX = /\b(desconectador\s+fusible|fusible|\bddff\b|\bdf\b)\b/i;
   const OPENING_DEVICE_REGEX = /\b(desconectador|fusible|seccionador|seccional|reconectador|cuchill[ao]|interruptor|pole\s*top|\bddff\b|\bddcc\b|\bdf\b|\bdbc\b|\bdc\b|\brc\d*\b)/i;
   const SSEE_CLASS_REGEX = /\b(subestaci[oó]n|ssee|transformador|\bsed\b)\b/i;
   const SSEE_BRACKET_TAG = /\[\s*F?\d{4,}\s*\]/i;
-  const POLE_CLASS_REGEX = /\b(poste|ensamblado|estructura|torre|c\.a\.)\b/i;
+  const POLE_CLASS_REGEX = /\b(poste|soporte|apoyo|retenci[oó]n|ensamblado|estructura|torre|c\.a\.)\b/i;
   const EXCLUDE_NON_POLE_REGEX = /\b(medidor|punto de consumo|cliente|acometida|luminaria)\b/i;
   const BT_AP_SPAN_REGEX = /\b(tramo a[eé]reo ap|alumbrado|\bbt\b|baja tensi[oó]n|preensamblado\s+1x)\b/i;
 
@@ -728,7 +729,7 @@
 
   // Descubre tramos MT, SSEE, COCI_3F y aparatos de línea en una punta de cable (1 request + caché IndexedDB v5)
   async function inspectPoleNeighborhoodInGnat(code, lonlat, extraCoords = [], useCache = true) {
-    const cacheKey = `v7:${Number(lonlat[0]).toFixed(5)},${Number(lonlat[1]).toFixed(5)}`;
+    const cacheKey = `v8:${Number(lonlat[0]).toFixed(5)},${Number(lonlat[1]).toFixed(5)}`;
     if (useCache) {
       const cached = await dbGetGnatCache(cacheKey);
       if (cached && Array.isArray(cached.spans)) return cached;
@@ -778,9 +779,17 @@
           const sseeCode = sm ? sm[1].toUpperCase() : disp;
           if (sseeCode && !sseeList.includes(sseeCode)) sseeList.push(sseeCode);
         }
-        if (!detectedPoleCode && POLE_CLASS_REGEX.test(fullText) && !EXCLUDE_NON_POLE_REGEX.test(fullText)) {
+        if (POLE_CLASS_REGEX.test(fullText) && !EXCLUDE_NON_POLE_REGEX.test(fullText)) {
           const pm = CODE_AT_START.exec(disp);
-          if (pm) detectedPoleCode = pm[1].toUpperCase();
+          if (pm) {
+            const candCode = pm[1].toUpperCase();
+            // Priorizar siempre códigos alfanuméricos de poste (ej. FAB6532, F723319) sobre IDs numéricos puros
+            const candHasAlpha = /^[A-Z]/.test(candCode);
+            const curHasAlpha = /^[A-Z]/.test(detectedPoleCode);
+            if (!detectedPoleCode || (candHasAlpha && !curHasAlpha)) {
+              detectedPoleCode = candCode;
+            }
+          }
         }
       }
 
@@ -818,8 +827,9 @@
 
     parseItems(allItems);
     const hasFuseOrSseeHere = sseeList.length > 0 || allItems.some(it => FUSE_DEVICE_REGEX.test(`${it.display || ""} ${it.type || ""}`));
-    if (spans.length === 0 || (hasFuseOrSseeHere && spans.length < 3)) {
-      const wider = await queryPoint(lonlat, 8.0);
+    const hasAlphaPole = /^[A-Z]/.test(detectedPoleCode);
+    if (spans.length <= 1 || !hasAlphaPole || (hasFuseOrSseeHere && spans.length < 3)) {
+      const wider = await queryPoint(lonlat, 7.0);
       parseItems(wider);
     }
     const result = { code: cacheKey, spans, devices: lineDevices, sseeList, detectedPoleCode, coci3f };
@@ -1479,7 +1489,11 @@
   function getFilteredPoints() {
     const q = state.search.trim().toLocaleLowerCase("es");
     return state.points.filter(f => {
-      if (state.filterType !== "all" && (f.get("tipo") || "PUNTO") !== state.filterType) return false;
+      if (state.filterType === "REMATE") {
+        if (!f.get("esRemate")) return false;
+      } else if (state.filterType !== "all" && (f.get("tipo") || "PUNTO") !== state.filterType) {
+        return false;
+      }
       if (state.filterZones.size > 0) {
         const zids = getPointZoneIds(f);
         const matchNone = state.filterZones.has("__NONE__") && zids.length === 0;
@@ -1927,15 +1941,20 @@
   async function runMtNetworkDiscovery() {
     // 1. Determinar postes semilla (Seleccionados > Zona T > Zona F > Todos los postes)
     const proj = map.getView().getProjection();
-    let seedFeats = [...state.selected].map(i => state.points[i]).filter(f => f && f.get("tipo") !== "APERTURA");
+    let seedFeats = [...state.selected].map(i => state.points[i]).filter(Boolean);
+    const nonApSel = seedFeats.filter(f => f.get("tipo") !== "APERTURA");
+    if (nonApSel.length) seedFeats = nonApSel;
     if (!seedFeats.length) {
       seedFeats = state.points.filter(f => f.get("tipo") !== "APERTURA" && (getPointZoneIds(f).includes("T") || getPointZoneIds(f).includes("F")));
     }
     if (!seedFeats.length) {
       seedFeats = state.points.filter(f => f.get("tipo") !== "APERTURA");
     }
+    if (!seedFeats.length && state.points.length) {
+      seedFeats = [...state.points];
+    }
     if (!seedFeats.length) {
-      showToast("Agrega o selecciona al menos un poste de trabajo para analizar la red MT.", true);
+      showToast("Agrega o selecciona al menos un poste en el mapa para analizar la red MT.", true);
       return;
     }
 
@@ -1999,20 +2018,33 @@
         const labelNow = cur.hintCode || cur.id;
         modeBannerText.textContent = `⚡ Red MT: ${labelNow} (${nodeMeta.size} nodos · ${discoveredSpans.size} tramos · ${discoveredOpenings.length} aperturas)...`;
 
-        const neighborhood = await inspectPoleNeighborhoodInGnat(cur.hintCode, cur.lonlat, [], true);
-        const lineDevicesHere = neighborhood.devices.filter(d => d.isLineSeries);
+        let neighborhood = await inspectPoleNeighborhoodInGnat(cur.hintCode, cur.lonlat, [], true);
+        if (cur.isSeed && neighborhood.spans.length === 0 && cur.hintCode && !cur.hintCode.startsWith("N_") && cur.hintCode !== "SIN CÓDIGO") {
+          const snapped = await resolveCodeInGnat(cur.hintCode, true);
+          if (snapped?.lonlat) {
+            cur.lonlat = snapped.lonlat;
+            neighborhood = await inspectPoleNeighborhoodInGnat(cur.hintCode, cur.lonlat, snapped.extraCoords || [], true);
+          }
+        }
+        // Incluir tanto equipos en serie (Reconectador, Seccionador, Pole Top, DDCC) como Desconectadores Fusibles de arranque MT (ya filtrados sin fusibles de SSEE)
+        const lineDevicesHere = neighborhood.devices;
         const rawDevCode = (lineDevicesHere[0]?.code || "").toUpperCase();
-        // Priorizar código real del poste o del equipo de apertura (ej. FF4840) antes que el ID de coordenada N_...
-        let nodeCode = (neighborhood.detectedPoleCode || rawDevCode || cur.hintCode || cur.id).toUpperCase();
+        // Priorizar código real del poste (alfanumérico) o del equipo de apertura (ej. FF4840, FA4434) antes que IDs numéricos del tramo
+        const pickCode = () => {
+          const cands = [neighborhood.detectedPoleCode, rawDevCode, cur.hintCode].map(x => String(x || "").trim().toUpperCase()).filter(Boolean);
+          const alpha = cands.find(x => /^[A-Z]/.test(x) && !x.startsWith("N_"));
+          return alpha || cands[0] || cur.id;
+        };
+        let nodeCode = pickCode();
         const sseeTag = neighborhood.sseeList[0] ? `SSEE ${neighborhood.sseeList[0]}` : "";
 
-        // Verificar si coincide con una apertura ya declarada en el PT (por código o por cercanía <= 45m, ej. cuchilla FF4840 desplazada del poste D2)
+        // Verificar si coincide con una apertura ya declarada en el PT (por código o cercanía real <= 12m, sin cortar el poste anterior)
         const nearExistingOpening = state.points.find(f => {
           if (f.get("tipo") !== "APERTURA") return false;
           const fc = getPointCode(f).toUpperCase();
           if (fc === nodeCode || (rawDevCode && fc === rawDevCode)) return true;
           const fll = ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj);
-          return haversineMeters(fll, cur.lonlat) <= 45;
+          return haversineMeters(fll, cur.lonlat) <= 12;
         });
         if (nearExistingOpening) {
           nodeCode = getPointCode(nearExistingOpening).toUpperCase();
@@ -2360,6 +2392,14 @@
       refreshAll();
     }, OPENING_COLOR);
 
+    const remateCount = state.points.filter(f => f.get("esRemate")).length;
+    if (remateCount > 0 || state.filterType === "REMATE") {
+      makeChip(`▲ Remates (${remateCount})`, state.filterType === "REMATE", () => {
+        state.filterType = state.filterType === "REMATE" ? "all" : "REMATE";
+        refreshAll();
+      }, "#7C3AED", "Filtrar solo remates aguas abajo detectados");
+    }
+
     for (const z of state.zones.values()) {
       makeChip(z.id, state.filterZones.has(z.id), () => {
         if (state.filterZones.has(z.id)) state.filterZones.delete(z.id);
@@ -2559,14 +2599,55 @@
       const ptSet = new Set(state.points.map(p => getPointCode(p).toUpperCase()));
       const q = state.search.trim().toLocaleLowerCase("es");
       const interNodes = state.graphNodes.filter(gn => !ptSet.has(gn.code) && (!q || gn.code.toLocaleLowerCase("es").includes(q) || (gn.sseeCode || "").toLocaleLowerCase("es").includes(q)));
+      if (interNodes.length > 0) {
+        const trBar = doc.createElement("tr");
+        trBar.style.background = "#EEF2FF";
+        const tdBar = doc.createElement("td");
+        tdBar.colSpan = multiSup ? 5 : 4;
+        tdBar.style.cssText = "padding:4px 8px;font-size:11px;display:flex;align-items:center;justify-content:space-between;gap:6px;";
+        const allInterSel = interNodes.every(gn => state.selectedIntermedios.has(gn.code));
+        const bSelAllInter = el("button", "btn-outline", allInterSel ? "Desmarcar intermedios" : `Marcar ${interNodes.length} intermedios`, tdBar);
+        bSelAllInter.style.cssText = "padding:2px 6px;font-size:10px;";
+        bSelAllInter.onclick = (ev) => {
+          ev.stopPropagation();
+          if (allInterSel) interNodes.forEach(gn => state.selectedIntermedios.delete(gn.code));
+          else interNodes.forEach(gn => state.selectedIntermedios.add(gn.code));
+          renderTable();
+        };
+        const selInterCount = interNodes.filter(gn => state.selectedIntermedios.has(gn.code)).length;
+        if (selInterCount > 0) {
+          const bProm = el("button", "btn-primary", `+ Agregar ${selInterCount} al PT`, tdBar);
+          bProm.style.cssText = "padding:2px 8px;font-size:10px;";
+          bProm.onclick = (ev) => {
+            ev.stopPropagation();
+            for (const gn of interNodes) {
+              if (!state.selectedIntermedios.has(gn.code)) continue;
+              upsertPointOnMap({ codigo: gn.code, lonlat: gn.lonlat, tipo: "PUNTO", bloqueId: "D", bloques: ["D"], esIntermedio: true, sseeCode: gn.sseeCode || "" });
+              state.selectedIntermedios.delete(gn.code);
+            }
+            markDirty();
+            refreshAll();
+            showToast(`${selInterCount} poste(s) intermedio(s) agregados a la tabla del PT.`);
+          };
+        }
+        trBar.appendChild(tdBar);
+        frag.appendChild(trBar);
+      }
       for (let gi = 0; gi < interNodes.length; gi++) {
         const gn = interNodes[gi];
         const tr = doc.createElement("tr");
-        tr.style.background = "#F8FAFC";
+        tr.style.background = state.selectedIntermedios.has(gn.code) ? "#E0E7FF" : "#F8FAFC";
         const tdCb = doc.createElement("td");
-        tdCb.textContent = "•";
-        tdCb.style.color = "#94A3B8";
-        tdCb.style.textAlign = "center";
+        const cbI = doc.createElement("input");
+        cbI.type = "checkbox";
+        cbI.checked = state.selectedIntermedios.has(gn.code);
+        cbI.onclick = (ev) => ev.stopPropagation();
+        cbI.onchange = () => {
+          if (cbI.checked) state.selectedIntermedios.add(gn.code);
+          else state.selectedIntermedios.delete(gn.code);
+          renderTable();
+        };
+        tdCb.appendChild(cbI);
         tr.appendChild(tdCb);
 
         const tdN = doc.createElement("td");
@@ -3286,12 +3367,12 @@
           if (!userTyped) inpCode.value = foundCode;
           const exact = await resolveCodeInGnat(foundCode, true);
           if (exact?.lonlat) snappedLonLat = exact.lonlat;
-          const extra = info.devices.find(d => d.isLineSeries)
+          const extra = info.devices.length
             ? ` · ${info.devices[0].type}`
             : detectedSsee ? ` · ${detectedSsee}` : "";
           gnatHint.textContent = `✓ GNAT: ${foundCode}${extra}`;
           gnatHint.style.color = "#15803D";
-          if (!forceOpening && info.devices.some(d => d.isLineSeries)) {
+          if (!forceOpening && info.devices.length > 0) {
             selType.value = "APERTURA";
             selZone.value = "D";
           }
@@ -3792,24 +3873,54 @@
       const s = String(v ?? "");
       return /[;"\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
-    const rows = [["Rol", "Tipo", "Numero", "Codigo", "TipoEquipo", "Longitud", "Latitud", "Zonas_DTF", "Accion"]];
+    const cociByCode = new Map((state.graphNodes || []).map(gn => [String(gn.code || "").toUpperCase(), gn]));
+    const rows = [["Categoria", "Rol", "Tipo", "Numero", "Codigo", "TipoEquipo", "SSEE", "COCI_3F_kA", "Longitud", "Latitud", "Zonas_DTF", "Accion"]];
+    const seenCodes = new Set();
     for (const f of state.points) {
       const [lon, lat] = ol.proj.toLonLat(f.getGeometry().getCoordinates(), map.getView().getProjection());
+      const code = getPointCode(f);
+      const uCode = code.toUpperCase();
+      seenCodes.add(uCode);
+      const gn = cociByCode.get(uCode);
+      const cat = f.get("tipo") === "APERTURA" ? "Apertura" : f.get("esRemate") ? "Remate" : f.get("esIntermedio") ? "Intermedio" : "Poste PT";
       rows.push([
+        cat,
         f.get("rolPT") || "",
         f.get("tipo") || "PUNTO",
         f.get("numero"),
-        getPointCode(f),
+        code,
         f.get("tipoEquipo") || "",
+        f.get("sseeCode") || gn?.sseeCode || "",
+        gn?.coci3f ?? "",
         lon,
         lat,
         getPointZoneIds(f).join("|"),
         f.get("accionPT") || ""
       ]);
     }
+    let gi = 1;
+    for (const gn of (state.graphNodes || [])) {
+      const uCode = String(gn.code || "").toUpperCase();
+      if (!uCode || seenCodes.has(uCode)) continue;
+      seenCodes.add(uCode);
+      rows.push([
+        "Intermedio",
+        `G${gi++}`,
+        "INTERMEDIO",
+        "",
+        gn.code,
+        "",
+        gn.sseeCode || "",
+        gn.coci3f ?? "",
+        gn.lonlat?.[0] ?? "",
+        gn.lonlat?.[1] ?? "",
+        "D",
+        ""
+      ]);
+    }
     const safe = state.projectName.replace(/[^a-zA-Z0-9._-]+/g, "_") || "centrality-tabla";
     downloadBlob(safe + ".csv", "\ufeff" + rows.map(r => r.map(q).join(";")).join("\r\n"), "text/csv;charset=utf-8");
-    showToast("Tabla CSV exportada.");
+    showToast(`CSV exportado (${rows.length - 1} registros incl. remates e intermedios).`);
   }
 
   // =========================================================================
