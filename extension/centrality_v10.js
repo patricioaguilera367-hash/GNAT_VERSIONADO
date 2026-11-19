@@ -146,7 +146,7 @@
     showHulls: true,        // Polígonos D / T / F
     showSpans: true,        // Vectores de tramos MT (A->B)
     showRoute: false,       // Línea secuencial 1->2->3
-    showLinks: true,        // Rayos punteados entre poste enfocado y sus aperturas
+    showLinks: false,       // Rayos punteados desactivados por defecto (usar tramos MT reales)
     labelMode: "cerca",     // "cerca" | "siempre" | "ninguna"
     labelContent: "numero", // "numero" | "completo"
     mtbtDetail: 0,          // 0 | 1 | 2
@@ -434,6 +434,8 @@
         rolPT: String(f.get("rolPT") || ""),
         accionPT: String(f.get("accionPT") || ""),
         esRemate: Boolean(f.get("esRemate")),
+        esIntermedio: Boolean(f.get("esIntermedio")),
+        sseeCode: f.get("sseeCode") || "",
         colorPersonalizado: String(f.get("colorPersonalizado") || "")
       };
     });
@@ -509,7 +511,13 @@
   const CODE_AT_START = /^([A-Z]{0,3}\d{3,8})\b/i;
   // Permite sufijos en textual_search como "FAG1674 - FAG1665 (Alambre Cu...)"
   const SPAN_PAIR_REGEX = /^([A-Z]{0,3}\d{3,8})\s*[-–]\s*([A-Z]{0,3}\d{3,8})\b/i;
-  const OPENING_DEVICE_REGEX = /\b(desconectador|fusible|seccionador|seccional|reconectador|cuchilla|interruptor|pole\s*top|\bddff\b|\bddcc\b|\bdf\b|\bdbc\b|\bdc\b|\brc\d*\b)/i;
+  // Equipos de maniobra EN SERIE con línea MT (siempre cortan el grafo)
+  const LINE_OPENING_REGEX = /\b(reconectador|seccionador|seccional|cuchill[ao]|interruptor|pole\s*top|\bddcc\b|\bdbc\b|\bdc\b|\brc\d*\b)/i;
+  // Fusibles (pueden ser de arranque MT o de protección de transformador/SSEE)
+  const FUSE_DEVICE_REGEX = /\b(desconectador\s+fusible|fusible|\bddff\b|\bdf\b)\b/i;
+  const OPENING_DEVICE_REGEX = /\b(desconectador|fusible|seccionador|seccional|reconectador|cuchill[ao]|interruptor|pole\s*top|\bddff\b|\bddcc\b|\bdf\b|\bdbc\b|\bdc\b|\brc\d*\b)/i;
+  const SSEE_CLASS_REGEX = /\b(subestaci[oó]n|ssee|transformador|\bsed\b)\b/i;
+  const SSEE_BRACKET_TAG = /\[\s*F?\d{4,}\s*\]/i;
   const POLE_CLASS_REGEX = /\b(poste|ensamblado|estructura|torre|c\.a\.)\b/i;
   const EXCLUDE_NON_POLE_REGEX = /\b(medidor|punto de consumo|cliente|acometida|luminaria)\b/i;
   const BT_AP_SPAN_REGEX = /\b(tramo a[eé]reo ap|alumbrado|\bbt\b|baja tensi[oó]n|preensamblado\s+1x)\b/i;
@@ -647,16 +655,22 @@
     return null;
   }
 
-  // Descubre tramos MT y aparatos en la coordenada de un poste (1 request calibrado)
+  // Descubre tramos MT, SSEE y aparatos de línea en la coordenada de un poste (sin frenar en DDFF de transformador)
   async function inspectPoleNeighborhoodInGnat(code, lonlat) {
     const wm = w.webMap_;
     const spans = [];
-    const devices = [];
+    const lineDevices = [];
+    const sseeList = [];
+    let detectedPoleCode = "";
+    const normCode = String(code || "").trim().toUpperCase();
+
+    // Primer barrido en radio medio (2.2) y si encuentra < 2 tramos MT amplía a 4.5 para no perder ángulos/anclajes (ej. F595049)
     const tunings = [
-      { scale: 250, units_per_pixel: 0.9 },
-      { scale: 250, units_per_pixel: 2.2 }
+      { scale: 250, units_per_pixel: 2.2 },
+      { scale: 250, units_per_pixel: 4.5 }
     ];
-    for (const t of tunings) {
+    for (let ti = 0; ti < tunings.length; ti++) {
+      const t = tunings[ti];
       let items = [];
       try {
         const params = w.Ext.apply({
@@ -669,31 +683,55 @@
         items = Array.isArray(res) ? res : [];
       } catch (_) { items = []; }
 
+      // 1a pasada: detectar si en este punto hay una SSEE/transformador y el código real del poste
+      let hasSseeHere = false;
       for (const it of items) {
-        const sp = parseSpanPair(it.display, it.type, it.description);
-        if (sp && sp.voltage === "mt" && (sp.from === code || sp.to === code)) {
-          if (!spans.some(x => x.display === sp.display)) {
+        const disp = String(it.display || "").trim();
+        const fullText = `${disp} ${it.type || ""} ${it.description || ""}`;
+        if (SSEE_CLASS_REGEX.test(fullText)) {
+          hasSseeHere = true;
+          const sm = CODE_AT_START.exec(disp);
+          const sseeCode = sm ? sm[1].toUpperCase() : disp;
+          if (sseeCode && !sseeList.includes(sseeCode)) sseeList.push(sseeCode);
+        }
+        if (!detectedPoleCode && POLE_CLASS_REGEX.test(fullText) && !EXCLUDE_NON_POLE_REGEX.test(fullText)) {
+          const pm = CODE_AT_START.exec(disp);
+          if (pm) detectedPoleCode = pm[1].toUpperCase();
+        }
+      }
+
+      // 2a pasada: recolectar tramos MT y equipos de apertura DE LÍNEA (ignorando DDFF de transformador [Fxxxxx])
+      for (const it of items) {
+        const disp = String(it.display || "").trim();
+        const fullText = `${disp} ${it.type || ""} ${it.description || ""}`;
+        const sp = parseSpanPair(disp, it.type, it.description);
+        if (sp && sp.voltage === "mt") {
+          const matchTarget = !normCode || sp.from === normCode || sp.to === normCode;
+          if (matchTarget && !spans.some(x => x.display === sp.display)) {
             spans.push({ ...sp, id: Number(it.id) });
           }
           continue;
         }
-        const fullText = `${it.display || ""} ${it.type || ""} ${it.description || ""}`;
-        if (OPENING_DEVICE_REGEX.test(fullText)) {
-          const m = CODE_AT_START.exec(String(it.display || "").trim());
-          const devCode = m ? m[1].toUpperCase() : code;
-          if (!devices.some(d => d.id === Number(it.id))) {
-            devices.push({
+        const isLineOp = LINE_OPENING_REGEX.test(fullText);
+        const isFuse = FUSE_DEVICE_REGEX.test(fullText);
+        const isTrafoFuse = isFuse && (SSEE_BRACKET_TAG.test(disp) || hasSseeHere);
+        if (isLineOp || (isFuse && !isTrafoFuse)) {
+          const m = CODE_AT_START.exec(disp);
+          const devCode = m ? m[1].toUpperCase() : (normCode || detectedPoleCode);
+          if (!lineDevices.some(d => d.id === Number(it.id))) {
+            lineDevices.push({
               id: Number(it.id),
               code: devCode,
-              type: String(it.type || "Equipo de apertura"),
-              display: String(it.display || devCode)
+              type: String(it.type || "Equipo de apertura MT"),
+              display: disp || devCode,
+              isLineSeries: isLineOp
             });
           }
         }
       }
-      if (spans.length > 0) break;
+      if (spans.length >= 2) break;
     }
-    return { spans, devices };
+    return { spans, devices: lineDevices, sseeList, detectedPoleCode };
   }
 
   // =========================================================================
@@ -766,34 +804,38 @@
     }
     .icon-btn { padding: 5px 7px; justify-content: center; }
 
-    /* TOPBAR */
+    /* TOPBAR (anclada dinámicamente al canvas del mapa GNAT, sin solapar paneles izquierdos) */
     .topbar {
       pointer-events: auto;
       position: fixed;
-      top: 10px;
-      left: 10px;
-      right: 10px;
-      height: 44px;
+      top: 8px;
+      left: 56px;
+      width: calc(100vw - 68px);
+      height: 38px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 8px;
-      padding: 0 10px;
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      box-shadow: var(--shadow);
+      gap: 6px;
+      padding: 0 8px;
+      background: rgba(255, 255, 255, 0.95);
+      border: 1px solid #CBD5E1;
+      border-radius: 9px;
+      box-shadow: 0 3px 12px rgba(15, 23, 42, 0.11);
       backdrop-filter: blur(8px);
+      overflow-x: auto;
+      scrollbar-width: none;
     }
-    .topbar-left, .topbar-right { display: flex; align-items: center; gap: 6px; min-width: 0; }
-    .divider { width: 1px; height: 22px; background: var(--border); margin: 0 2px; flex-shrink: 0; }
+    .topbar::-webkit-scrollbar { display: none; }
+    .topbar button { padding: 4px 8px; font-size: 12px; white-space: nowrap; flex-shrink: 0; }
+    .topbar-left, .topbar-right { display: flex; align-items: center; gap: 5px; min-width: 0; flex-shrink: 0; }
+    .divider { width: 1px; height: 20px; background: var(--border); margin: 0 2px; flex-shrink: 0; }
     .proj-name {
       font-weight: 600;
-      font-size: 13px;
+      font-size: 12px;
       border: 1px solid transparent;
       border-radius: 5px;
-      padding: 3px 6px;
-      max-width: 185px;
+      padding: 2px 5px;
+      max-width: 145px;
       background: transparent;
       text-overflow: ellipsis;
     }
@@ -834,10 +876,10 @@
     .drawer {
       pointer-events: auto;
       position: fixed;
-      top: 64px;
+      top: 54px;
       right: 10px;
-      bottom: 14px;
-      width: 376px;
+      bottom: 12px;
+      width: 348px;
       max-width: calc(100vw - 20px);
       background: var(--bg-surface);
       border: 1px solid var(--border);
@@ -946,8 +988,28 @@
       font-weight: 700;
       padding: 1px 5px;
       border-radius: 4px;
-      background: #E0E7FF;
-      color: #1E40AF;
+      background: #EDE9FE;
+      color: #6D28D9;
+      margin-left: 4px;
+    }
+    .inter-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: #F1F5F9;
+      color: #64748B;
+      margin-left: 4px;
+    }
+    .ssee-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: #FEF3C7;
+      color: #92400E;
       margin-left: 4px;
     }
     .link-badge {
@@ -1172,13 +1234,13 @@
   const saveBadge = el("span", "save-badge", "Sin datos", topLeft);
   el("div", "divider", null, topLeft);
 
-  const btnZonas = el("button", "btn-outline", "Zonas y Polígonos (D/T/F) ▾", topLeft);
+  const btnZonas = el("button", "btn-outline", "Zonas D/T/F ▾", topLeft);
   btnZonas.title = "Generar, editar o dibujar polígonos de Zona Desconectada (D), Zona de Trabajo (T) y Punto de Faenas (F)";
 
-  const btnAnalyzeMt = el("button", "btn-primary", "⚡ Analizar Red MT (Aperturas y Remates)", topLeft);
+  const btnAnalyzeMt = el("button", "btn-primary", "⚡ Analizar Red MT", topLeft);
   btnAnalyzeMt.title = "Recorre los tramos MT desde los postes seleccionados (o Zona T), dibuja vectores A→B y detecta aperturas cercanas y remates aguas abajo";
 
-  const btnVista = el("button", "btn-outline", "Vista mapa ▾", topLeft);
+  const btnVista = el("button", "btn-outline", "Vista ▾", topLeft);
   btnVista.title = "Mostrar/ocultar postes, polígonos, tramos MT, etiquetas y detalle WMTS";
 
   const btnHerramientas = el("button", "btn-outline", "Herramientas ▾", topLeft);
@@ -1279,6 +1341,43 @@
     }
   }
 
+  function syncLayoutToMapViewport() {
+    if (!viewportEl) return;
+    const rect = viewportEl.getBoundingClientRect();
+    if (!rect || rect.width < 120 || rect.height < 120) return;
+    const pad = 8;
+    const leftPx = Math.max(pad, Math.round(rect.left) + pad);
+    const rightGap = Math.max(pad, Math.round(w.innerWidth - rect.right) + pad);
+    const availW = Math.max(280, Math.round(rect.width) - pad * 2);
+    const topPx = Math.max(pad, Math.round(rect.top) + pad);
+
+    topbar.style.left = `${leftPx}px`;
+    topbar.style.width = `${availW}px`;
+    topbar.style.top = `${topPx}px`;
+
+    drawer.style.top = `${topPx + 46}px`;
+    drawer.style.right = `${rightGap}px`;
+    drawer.style.bottom = `${Math.max(12, Math.round(w.innerHeight - rect.bottom) + 12)}px`;
+
+    const drawerW = (state.drawerOpen && !state.collapsed) ? 358 : 0;
+    const freeLeft = rect.left + pad;
+    const freeRight = Math.max(freeLeft + 260, rect.right - drawerW - pad);
+    const centerX = Math.round((freeLeft + freeRight) / 2);
+    dock.style.left = `${centerX}px`;
+    dock.style.bottom = `${Math.max(14, Math.round(w.innerHeight - rect.bottom) + 14)}px`;
+    modeBanner.style.left = `${centerX}px`;
+    modeBanner.style.top = `${topPx + 46}px`;
+    toastEl.style.left = `${centerX}px`;
+  }
+
+  try {
+    const ro = new w.ResizeObserver(() => syncLayoutToMapViewport());
+    if (viewportEl) ro.observe(viewportEl);
+    ro.observe(doc.body);
+  } catch (_) {}
+  w.addEventListener("resize", syncLayoutToMapViewport);
+  w.setTimeout(syncLayoutToMapViewport, 80);
+
   // =========================================================================
   // 8. CAPAS OPENLAYERS: PUNTOS, VECTORES MT (A->B), POLÍGONOS EDITABLES D/T/F
   // =========================================================================
@@ -1312,14 +1411,17 @@
     const idx = state.points.indexOf(f);
     const isOpening = f.get("tipo") === "APERTURA";
     const isRemate = Boolean(f.get("esRemate"));
+    const isIntermedio = Boolean(f.get("esIntermedio")) && !isOpening && !isRemate && !f.get("rolPT");
     const isFocused = state.focused === idx;
     const isSelected = state.selected.has(idx);
     const isLinkedPeer = pointStyleFn._linkedSet?.has(f) || false;
-    const color = getPointColor(f);
+    const color = isRemate ? "#7C3AED" : isIntermedio ? "#64748B" : getPointColor(f);
     const rolPT = String(f.get("rolPT") || "").trim();
-    const showText = state.labelMode === "siempre" || isFocused || isLinkedPeer ||
-      (state.labelMode === "cerca" && resolution < UMBRAL_ETIQUETA);
-    const key = `${color}|${isOpening}|${isRemate}|${isFocused}|${isSelected}|${isLinkedPeer}|${showText}|${state.labelContent}|${rolPT}`;
+    const showText = isIntermedio
+      ? (isFocused || isSelected)
+      : (state.labelMode === "siempre" || isFocused || isLinkedPeer || isRemate ||
+         (state.labelMode === "cerca" && resolution < UMBRAL_ETIQUETA));
+    const key = `${color}|${isOpening}|${isRemate}|${isIntermedio}|${isFocused}|${isSelected}|${isLinkedPeer}|${showText}|${state.labelContent}|${rolPT}`;
 
     let cache = styleCache.get(f);
     if (!cache) {
@@ -1328,9 +1430,11 @@
     }
     if (cache.has(key)) return cache.get(key);
 
-    let labelStr = state.labelContent === "completo"
-      ? `${rolPT || f.get("numero")} · ${getPointCode(f)}`
-      : String(rolPT || f.get("numero"));
+    let labelStr = isRemate
+      ? `▲ ${getPointCode(f)}`
+      : state.labelContent === "completo"
+        ? `${rolPT || f.get("numero")} · ${getPointCode(f)}`
+        : String(rolPT || f.get("numero"));
 
     const style = new ol.style.Style({
       image: isOpening
@@ -1352,11 +1456,11 @@
               stroke: new ol.style.Stroke({ color: "#FFFFFF", width: 2.5 })
             })
           : new ol.style.Circle({
-              radius: isFocused ? 10.5 : (isSelected || isLinkedPeer) ? 9 : 7,
+              radius: isFocused ? 10.5 : (isSelected || isLinkedPeer) ? 9 : isIntermedio ? 4.5 : 7,
               fill: new ol.style.Fill({ color }),
               stroke: new ol.style.Stroke({
                 color: isSelected ? "#1D4ED8" : isFocused ? "#0F172A" : isLinkedPeer ? "#DC2626" : "#FFFFFF",
-                width: isSelected || isFocused || isLinkedPeer ? 3 : 2
+                width: isSelected || isFocused || isLinkedPeer ? 3 : isIntermedio ? 1.5 : 2
               })
             }),
       text: showText ? new ol.style.Text({
@@ -1558,15 +1662,20 @@
         if (!Array.isArray(sp.coords) || sp.coords.length < 2) continue;
         const mapCoords = sp.coords.map(c => ol.proj.fromLonLat([Number(c[0]), Number(c[1])], proj));
         const sf = new ol.Feature({ geometry: new ol.geom.LineString(mapCoords) });
-        sf.setStyle(new ol.style.Style({
-          stroke: new ol.style.Stroke({ color: "#DC2626", width: 3.5 }),
-          text: state.labelMode === "siempre" ? new ol.style.Text({
-            text: sp.display || `${sp.from}-${sp.to}`,
-            font: "600 10px Arial",
-            fill: new ol.style.Fill({ color: "#991B1B" }),
-            stroke: new ol.style.Stroke({ color: "#FFFFFF", width: 3 })
-          }) : undefined
-        }));
+        sf.setStyle([
+          new ol.style.Style({
+            stroke: new ol.style.Stroke({ color: "rgba(255,255,255,0.85)", width: 6.5, lineCap: "round", lineJoin: "round" })
+          }),
+          new ol.style.Style({
+            stroke: new ol.style.Stroke({ color: "#DC2626", width: 3.8, lineCap: "round", lineJoin: "round" }),
+            text: state.labelMode === "siempre" ? new ol.style.Text({
+              text: sp.display || `${sp.from}-${sp.to}`,
+              font: "600 10px Arial",
+              fill: new ol.style.Fill({ color: "#991B1B" }),
+              stroke: new ol.style.Stroke({ color: "#FFFFFF", width: 3 })
+            }) : undefined
+          })
+        ]);
         spanFeats.push(sf);
       }
       if (spanFeats.length) {
@@ -1664,14 +1773,15 @@
   // =========================================================================
   // 9. ALGORITMO INTERACTIVO DE RED MT: TRAMOS A->B, APERTURAS Y REMATES
   // =========================================================================
-  function upsertPointOnMap({ codigo, lonlat, tipo = "PUNTO", bloqueId = "D", bloques = ["D"], tipoEquipo = "", rolPT = "", accionPT = "", esRemate = false }) {
+  function upsertPointOnMap({ codigo, lonlat, tipo = "PUNTO", bloqueId = "D", bloques = ["D"], tipoEquipo = "", rolPT = "", accionPT = "", esRemate = false, esIntermedio = false, sseeCode = "" }) {
     const cleanCode = String(codigo || "").trim().toUpperCase();
     const proj = map.getView().getProjection();
     let existing = state.points.find(f => getPointCode(f).toUpperCase() === cleanCode && (f.get("tipo") || "PUNTO") === tipo);
     if (existing) {
       existing.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(lonlat, proj)));
       if (tipoEquipo && !existing.get("tipoEquipo")) existing.set("tipoEquipo", tipoEquipo);
-      if (esRemate) existing.set("esRemate", true);
+      if (esRemate) { existing.set("esRemate", true); existing.set("esIntermedio", false); }
+      if (sseeCode && !existing.get("sseeCode")) existing.set("sseeCode", sseeCode);
       if (bloqueId && !existing.get("bloqueId")) existing.set("bloqueId", bloqueId);
       const curBloques = Array.isArray(existing.get("bloques")) ? existing.get("bloques") : [];
       if (bloques.length) existing.set("bloques", [...new Set([...curBloques, ...bloques])]);
@@ -1691,7 +1801,9 @@
       tipoEquipo,
       rolPT,
       accionPT,
-      esRemate
+      esRemate,
+      esIntermedio,
+      sseeCode
     });
     state.points.push(feat);
     return feat;
@@ -1736,9 +1848,18 @@
     const discoveredOpenings = [];
     const discoveredRemates = [];
     const discoveredSpans = new Map(state.spans.map(s => [s.display, s]));
-    const MAX_HOPS = 18;
-    const MAX_NODES = 45;
+    const adjacency = new Map(); // code -> Set<neighborCode>
+    const boundaryCodes = new Set(knownOpenings);
+    const MAX_HOPS = 45;
+    const MAX_NODES = 120;
     let cancelled = false;
+
+    const addEdgeToGraph = (a, b) => {
+      if (!adjacency.has(a)) adjacency.set(a, new Set());
+      if (!adjacency.has(b)) adjacency.set(b, new Set());
+      adjacency.get(a).add(b);
+      adjacency.get(b).add(a);
+    };
 
     setCursorMode("nav", "⚡ Analizando red MT en GNAT... (Esc para detener)");
     modeBannerAction.onclick = () => { cancelled = true; setCursorMode("nav"); };
@@ -1746,25 +1867,36 @@
     try {
       while (queue.length > 0 && visitedPoles.size <= MAX_NODES && !cancelled) {
         const { code, hops } = queue.shift();
-        modeBannerText.textContent = `⚡ Analizando MT: poste ${code} (${visitedPoles.size} visitados · ${discoveredSpans.size} tramos)...`;
+        modeBannerText.textContent = `⚡ Analizando MT: poste ${code} (${visitedPoles.size} postes · ${discoveredSpans.size} tramos)...`;
 
         let gnatEntry = await resolveCodeInGnat(code, true);
         let lonlat = gnatEntry?.lonlat || coordByCode.get(code);
         if (!lonlat) continue;
         coordByCode.set(code, lonlat);
 
-        // Asegurar que el poste esté dibujado en el mapa dentro de la Zona Desconectada (D)
-        upsertPointOnMap({ codigo: code, lonlat, tipo: "PUNTO", bloqueId: "D", bloques: ["D"] });
-
-        // Si este poste ya es una apertura conocida o GNAT informa un equipo de maniobra aquí
-        const devicesHere = [...(gnatEntry?.devices || [])];
         const neighborhood = await inspectPoleNeighborhoodInGnat(code, lonlat);
-        for (const d of neighborhood.devices) {
-          if (!devicesHere.some(x => x.display === d.display)) devicesHere.push(d);
-        }
+        const sseeTag = neighborhood.sseeList[0] ? `SSEE ${neighborhood.sseeList[0]}` : "";
 
-        if (knownOpenings.has(code) || gnatEntry?.isOpeningDevice || devicesHere.length > 0) {
-          const eqName = devicesHere[0]?.type || devicesHere[0]?.display || "Equipo de apertura MT";
+        // Asegurar que el poste esté dibujado (gris discreto si es intermedio descubierto fuera del PT)
+        const alreadyInPt = state.points.some(f => getPointCode(f).toUpperCase() === code);
+        upsertPointOnMap({
+          codigo: code,
+          lonlat,
+          tipo: "PUNTO",
+          bloqueId: "D",
+          bloques: ["D"],
+          esIntermedio: !alreadyInPt,
+          sseeCode: sseeTag
+        });
+
+        // Solo equipos de LÍNEA MT (Reconectador, DDCC, Seccionador, Pole Top) o aperturas ya declaradas en PT cortan la rama.
+        // Los DDFF de transformador/SSEE NO cortan el recorrido MT.
+        const lineDevicesHere = neighborhood.devices.filter(d => d.isLineSeries || !sseeTag);
+        const isLineOpeningHere = knownOpenings.has(code) || (gnatEntry?.isOpeningDevice && LINE_OPENING_REGEX.test(gnatEntry.display || "")) || lineDevicesHere.some(d => d.isLineSeries);
+
+        if (isLineOpeningHere) {
+          const eqName = lineDevicesHere[0]?.type || lineDevicesHere[0]?.display || "Apertura MT";
+          boundaryCodes.add(code);
           upsertPointOnMap({
             codigo: code,
             lonlat,
@@ -1776,7 +1908,6 @@
           if (!discoveredOpenings.some(x => x.code === code)) {
             discoveredOpenings.push({ code, equipo: eqName, lonlat });
           }
-          // Si no es uno de los postes semilla de trabajo, la apertura corta esta rama aquí
           const isSeed = seedFeats.some(f => getPointCode(f).toUpperCase() === code);
           if (!isSeed) {
             ensureVectorLayer();
@@ -1785,7 +1916,7 @@
           }
         }
 
-        // Recolectar aristas MT (tanto de textual_search como de vecindad espacial)
+        // Recolectar aristas MT (combinando textual_search + vecindad espacial calibrada)
         const allSpansHere = [
           ...(gnatEntry?.spans || []).filter(s => s.voltage === "mt"),
           ...neighborhood.spans
@@ -1796,15 +1927,23 @@
           const other = sp.from === code ? sp.to : sp.to === code ? sp.from : null;
           if (!other) continue;
           neighbors.add(other);
+          addEdgeToGraph(code, other);
 
-          // Resolver coordenada del vecino para trazar el vector A->B de inmediato
           let otherCoord = coordByCode.get(other);
           if (!otherCoord) {
             const otherEntry = await resolveCodeInGnat(other, true);
             if (otherEntry?.lonlat) {
               otherCoord = otherEntry.lonlat;
               coordByCode.set(other, otherCoord);
-              upsertPointOnMap({ codigo: other, lonlat: otherCoord, tipo: "PUNTO", bloqueId: "D", bloques: ["D"] });
+              const otherExists = state.points.some(f => getPointCode(f).toUpperCase() === other);
+              upsertPointOnMap({
+                codigo: other,
+                lonlat: otherCoord,
+                tipo: knownOpenings.has(other) ? "APERTURA" : "PUNTO",
+                bloqueId: "D",
+                bloques: ["D"],
+                esIntermedio: !otherExists && !knownOpenings.has(other)
+              });
             }
           }
           if (otherCoord) {
@@ -1822,17 +1961,11 @@
 
         state.spans = [...discoveredSpans.values()];
 
-        // ¿Es un remate aguas abajo? (Solo 1 vecino MT conectado)
-        if (neighbors.size === 1 && hops > 0) {
-          const feat = state.points.find(f => getPointCode(f).toUpperCase() === code && f.get("tipo") !== "APERTURA");
-          if (feat) feat.set("esRemate", true);
-          if (!discoveredRemates.includes(code)) discoveredRemates.push(code);
-        }
-
         // Expandir hacia vecinos no visitados
         if (hops < MAX_HOPS) {
           for (const nb of neighbors) {
             if (knownOpenings.has(nb)) {
+              boundaryCodes.add(nb);
               const nbEntry = await resolveCodeInGnat(nb, true);
               const nbCoord = nbEntry?.lonlat || coordByCode.get(nb);
               if (nbCoord) {
@@ -1853,6 +1986,19 @@
         ensureVectorLayer();
         renderTable();
         rebuildOverlayLayers();
+      }
+
+      // Calcular remates MT reales al finalizar el grafo (grado === 1 real, no frontera de apertura ni pendiente en cola)
+      const pendingSet = new Set(queue.map(q => q.code));
+      for (const [nodeCode, nbSet] of adjacency.entries()) {
+        if (nbSet.size === 1 && !boundaryCodes.has(nodeCode) && !pendingSet.has(nodeCode)) {
+          const feat = state.points.find(f => getPointCode(f).toUpperCase() === nodeCode && f.get("tipo") !== "APERTURA");
+          if (feat) {
+            feat.set("esRemate", true);
+            feat.set("esIntermedio", false);
+          }
+          if (!discoveredRemates.includes(nodeCode)) discoveredRemates.push(nodeCode);
+        }
       }
     } finally {
       setCursorMode("nav");
@@ -2200,14 +2346,18 @@
         rb.className = "remate-badge";
         rb.textContent = "▲ Remate";
         tdCode.appendChild(rb);
+      } else if (f.get("esIntermedio") && !f.get("rolPT")) {
+        const ib = doc.createElement("span");
+        ib.className = "inter-badge";
+        ib.textContent = "Intermedio";
+        tdCode.appendChild(ib);
       }
-
-      const linkedCount = isAp ? getLinkedPostesForOpening(f).length : getLinkedOpeningsForPoste(f).length;
-      if (linkedCount > 0) {
-        const lb = doc.createElement("span");
-        lb.className = "link-badge";
-        lb.textContent = isAp ? `${linkedCount}p` : `${linkedCount}✕`;
-        tdCode.appendChild(lb);
+      const sseeTxt = String(f.get("sseeCode") || "").trim();
+      if (sseeTxt && !eqType.includes(sseeTxt)) {
+        const sb = doc.createElement("span");
+        sb.className = "ssee-badge";
+        sb.textContent = sseeTxt;
+        tdCode.appendChild(sb);
       }
       tdCode.title = `${getPointCode(f)} ${f.get("accionPT") ? "· " + f.get("accionPT") : ""}`;
       tr.appendChild(tdCode);
@@ -2897,7 +3047,10 @@
     el("strong", "", forceOpening ? "Nueva apertura vinculada" : "Nuevo elemento en mapa", form);
     const inpCode = el("input", "", null, form);
     inpCode.type = "text";
-    inpCode.placeholder = forceOpening ? "Código apertura (ej. FF4840)" : "Código poste (ej. FAG1672)";
+    inpCode.placeholder = forceOpening ? "Código apertura (ej. FF4840)" : "Detectando poste GNAT...";
+
+    const gnatHint = el("div", "", "Consultando poste en GNAT...", form);
+    gnatHint.style.cssText = "font-size:11px;color:#475569;min-height:14px;";
 
     const selType = el("select", "", null, form);
     [["PUNTO", "Poste / Punto"], ["APERTURA", "Apertura (✕ roja)"]].forEach(([v, t]) => {
@@ -2913,6 +3066,40 @@
     }
     selZone.value = forceOpening ? "D" : "T";
 
+    let userTyped = false;
+    let snappedLonLat = ol.proj.toLonLat(coordinate, map.getView().getProjection());
+    let detectedSsee = "";
+    inpCode.addEventListener("input", () => { userTyped = true; });
+
+    // Autocompletar código y coordenada exacta desde GNAT bajo el clic
+    (async () => {
+      try {
+        const info = await inspectPoleNeighborhoodInGnat("", snappedLonLat);
+        const foundCode = info.detectedPoleCode || info.devices[0]?.code || "";
+        if (info.sseeList[0]) detectedSsee = `SSEE ${info.sseeList[0]}`;
+        if (foundCode) {
+          if (!userTyped) inpCode.value = foundCode;
+          const exact = await resolveCodeInGnat(foundCode, true);
+          if (exact?.lonlat) snappedLonLat = exact.lonlat;
+          const extra = info.devices.find(d => d.isLineSeries)
+            ? ` · ${info.devices[0].type}`
+            : detectedSsee ? ` · ${detectedSsee}` : "";
+          gnatHint.textContent = `✓ GNAT: ${foundCode}${extra}`;
+          gnatHint.style.color = "#15803D";
+          if (!forceOpening && info.devices.some(d => d.isLineSeries)) {
+            selType.value = "APERTURA";
+            selZone.value = "D";
+          }
+        } else {
+          gnatHint.textContent = "Sin poste detectado en ese punto (ingresa el código manual).";
+          inpCode.placeholder = "Código poste (ej. FAG1672)";
+        }
+      } catch (_) {
+        gnatHint.textContent = "";
+        inpCode.placeholder = "Código poste (ej. FAG1672)";
+      }
+    })();
+
     const btnRow = el("div", "", null, form);
     btnRow.style.cssText = "display:flex;gap:6px;justify-content:flex-end;";
     const bCancel = el("button", "btn-outline", "Cancelar", btnRow);
@@ -2927,13 +3114,13 @@
 
     const submit = () => {
       const code = inpCode.value.trim() || "Sin código";
-      const [lon, lat] = ol.proj.toLonLat(coordinate, map.getView().getProjection());
       const feat = upsertPointOnMap({
         codigo: code,
-        lonlat: [lon, lat],
+        lonlat: snappedLonLat,
         tipo: selType.value,
         bloqueId: selZone.value,
-        bloques: [selZone.value]
+        bloques: [selZone.value],
+        sseeCode: detectedSsee
       });
       if (forceOpening && state.pendingLinkIndices.length) {
         const newId = String(feat.get("id"));
@@ -3081,6 +3268,8 @@
         rolPT: String(r.rolPT || r.rol || ""),
         accionPT: String(r.accionPT || ""),
         esRemate: Boolean(r.esRemate),
+        esIntermedio: Boolean(r.esIntermedio),
+        sseeCode: r.sseeCode || "",
         colorPersonalizado: String(r.colorPersonalizado || "")
       });
     });
@@ -3692,6 +3881,7 @@
     state.drawerOpen = !state.drawerOpen;
     drawer.classList.toggle("hidden", !state.drawerOpen);
     btnToggleDrawer.classList.toggle("active-pill", state.drawerOpen);
+    syncLayoutToMapViewport();
   };
 
   btnCollapse.onclick = () => {
