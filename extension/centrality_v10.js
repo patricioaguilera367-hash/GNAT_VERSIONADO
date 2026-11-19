@@ -118,6 +118,7 @@
     dirty: false,
     points: [],             // Array<ol.Feature> (postes y aperturas)
     spans: [],              // Array<{ id, from, to, coords: [[lon,lat],[lon,lat]], display, voltage }> (vectores MT A->B)
+    graphNodes: [],         // Array<{ code, lonlat, coci3f, sseeCode }> (postes intermedios solo visuales, sin ensuciar la tabla)
     zones: new Map([
       ["D", { id: "D", name: "Zona desconectada (D)", color: "#DC2626", customRing: null }],
       ["T", { id: "T", name: "Zona de trabajo (T)", color: "#00C853", customRing: null }],
@@ -454,6 +455,7 @@
         customRing: Array.isArray(z.customRing) ? z.customRing : null
       })),
       spans: state.spans,
+      graphNodes: state.graphNodes,
       registros
     };
   }
@@ -508,9 +510,11 @@
   // =========================================================================
   // 5. MOTOR GNAT DMS (svc_wmc.php + Caché + Grafo MT A->B + Aperturas/Remates)
   // =========================================================================
-  const CODE_AT_START = /^([A-Z]{0,3}\d{3,8})\b/i;
-  // Permite sufijos en textual_search como "FAG1674 - FAG1665 (Alambre Cu...)"
-  const SPAN_PAIR_REGEX = /^([A-Z]{0,3}\d{3,8})\s*[-–]\s*([A-Z]{0,3}\d{3,8})\b/i;
+  const CODE_AT_START = /^([A-Z]{0,3}\d{3,12})\b/i;
+  // Permite nodos de hasta 12 dígitos (ej. 467251498) y sufijos descriptivos
+  const SPAN_PAIR_REGEX = /^([A-Z]{0,3}\d{3,12})\s*[-–]\s*([A-Z]{0,3}\d{3,12})\b/i;
+  const COCI_3F_REGEX = /<td>\s*(\d+(?:\.\d+)?)\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>/i;
+  const REAL_STATE_REGEX = /<b>\s*Real:\s*<\/b>\s*([^<]+)/i;
   // Equipos de maniobra EN SERIE con línea MT (siempre cortan el grafo)
   const LINE_OPENING_REGEX = /\b(reconectador|seccionador|seccional|cuchill[ao]|interruptor|pole\s*top|\bddcc\b|\bdbc\b|\bdc\b|\brc\d*\b)/i;
   // Fusibles (pueden ser de arranque MT o de protección de transformador/SSEE)
@@ -635,9 +639,32 @@
             const feat = Array.isArray(geo?.features) ? geo.features[0] : (geo?.geometry ? geo : null);
             const coords = feat?.geometry?.coordinates;
             if (feat?.geometry?.type === "Point" && Array.isArray(coords) && coords.length >= 2) {
+              const extraCoords = [];
+              // Si hay un equipo de maniobra/DF con el mismo código (ej. F595041 DF desplazado del poste), pedir su punto en el mismo lote
+              const extraIds = exactMatches
+                .filter(m => m !== cand)
+                .map(m => Number(m.surrogate_in_map_id || m.object_id))
+                .filter(n => Number.isFinite(n) && n > 0 && n !== id)
+                .slice(0, 3);
+              if (extraIds.length) {
+                try {
+                  const eGeo = await gnatRequest("svc_wmc.php", w.Ext.apply({
+                    action: "get_objects_geojson",
+                    object_ids: w.Ext.encode(extraIds)
+                  }, wm.getViewportParams()));
+                  const eFeats = Array.isArray(eGeo?.features) ? eGeo.features : (eGeo?.geometry ? [eGeo] : []);
+                  for (const ef of eFeats) {
+                    const ec = ef?.geometry?.coordinates;
+                    if (ef?.geometry?.type === "Point" && Array.isArray(ec) && ec.length >= 2) {
+                      extraCoords.push([Number(ec[0]), Number(ec[1])]);
+                    }
+                  }
+                } catch (_) {}
+              }
               const entry = {
                 code: q,
                 lonlat: [Number(coords[0]), Number(coords[1])],
+                extraCoords,
                 display: String(cand.display || q),
                 objectId: Number(cand.object_id),
                 surrogateId: Number(cand.surrogate_in_map_id || id),
@@ -655,39 +682,95 @@
     return null;
   }
 
-  // Descubre tramos MT, SSEE y aparatos de línea en la coordenada de un poste (sin frenar en DDFF de transformador)
-  async function inspectPoleNeighborhoodInGnat(code, lonlat) {
+  async function fetchSpanGeometriesBatch(spanIds) {
+    const out = new Map();
+    const ids = [...new Set(spanIds.map(Number).filter(n => Number.isFinite(n) && n > 0))];
+    if (!ids.length) return out;
+    const wm = w.webMap_;
+    // Consultar en lotes de hasta 60 IDs por request (~0.6s por lote)
+    for (let i = 0; i < ids.length; i += 60) {
+      const chunk = ids.slice(i, i + 60);
+      try {
+        const geo = await gnatRequest("svc_wmc.php", w.Ext.apply({
+          action: "get_objects_geojson",
+          object_ids: w.Ext.encode(chunk)
+        }, wm.getViewportParams()), 12000);
+        const feats = Array.isArray(geo?.features) ? geo.features : (geo?.geometry ? [geo] : []);
+        for (let fi = 0; fi < feats.length; fi++) {
+          const ft = feats[fi];
+          const g = ft?.geometry;
+          let line = null;
+          if (g?.type === "LineString" && Array.isArray(g.coordinates) && g.coordinates.length >= 2) {
+            line = g.coordinates.map(c => [Number(c[0]), Number(c[1])]);
+          } else if (g?.type === "MultiLineString" && Array.isArray(g.coordinates) && g.coordinates[0]?.length >= 2) {
+            line = g.coordinates[0].map(c => [Number(c[0]), Number(c[1])]);
+          }
+          if (!line) continue;
+          const fid = Number(ft.id || ft.properties?.object_id || ft.properties?.surrogate_in_map_id || chunk[fi] || 0);
+          if (fid > 0) {
+            out.set(fid, { coords: line, start: line[0], end: line[line.length - 1] });
+          }
+        }
+      } catch (_) {}
+    }
+    return out;
+  }
+
+  function haversineMeters(a, b) {
+    const R = 6371000;
+    const dLat = (b[1] - a[1]) * Math.PI / 180;
+    const dLon = (b[0] - a[0]) * Math.PI / 180;
+    const la1 = a[1] * Math.PI / 180, la2 = b[1] * Math.PI / 180;
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+
+  // Descubre tramos MT, SSEE, COCI_3F y aparatos de línea en una punta de cable (1 request + caché IndexedDB v5)
+  async function inspectPoleNeighborhoodInGnat(code, lonlat, extraCoords = [], useCache = true) {
+    const cacheKey = `v5:${Number(lonlat[0]).toFixed(5)},${Number(lonlat[1]).toFixed(5)}`;
+    if (useCache) {
+      const cached = await dbGetGnatCache(cacheKey);
+      if (cached && Array.isArray(cached.spans)) return cached;
+    }
+
     const wm = w.webMap_;
     const spans = [];
     const lineDevices = [];
     const sseeList = [];
     let detectedPoleCode = "";
+    let coci3f = null;
     const normCode = String(code || "").trim().toUpperCase();
 
-    // Primer barrido en radio medio (2.2) y si encuentra < 2 tramos MT amplía a 4.5 para no perder ángulos/anclajes (ej. F595049)
-    const tunings = [
-      { scale: 250, units_per_pixel: 2.2 },
-      { scale: 250, units_per_pixel: 4.5 }
-    ];
-    for (let ti = 0; ti < tunings.length; ti++) {
-      const t = tunings[ti];
-      let items = [];
+    const probePoints = [lonlat, ...(Array.isArray(extraCoords) ? extraCoords.slice(0, 1) : [])];
+    const queryPoint = async (pt, upp) => {
       try {
         const params = w.Ext.apply({
           action: "get_objects_info_for_point",
-          lonlat: w.Ext.encode({ lon: Number(lonlat[0]), lat: Number(lonlat[1]) })
+          lonlat: w.Ext.encode({ lon: Number(pt[0]), lat: Number(pt[1]) })
         }, wm.getViewportParams());
-        params.scale = t.scale;
-        params.units_per_pixel = t.units_per_pixel;
+        params.scale = 250;
+        params.units_per_pixel = upp;
         const res = await gnatRequest("svc_wmc.php", params);
-        items = Array.isArray(res) ? res : [];
-      } catch (_) { items = []; }
+        return Array.isArray(res) ? res : [];
+      } catch (_) { return []; }
+    };
 
-      // 1a pasada: detectar si en este punto hay una SSEE/transformador y el código real del poste
-      let hasSseeHere = false;
+    let allItems = [];
+    for (const pt of probePoints) {
+      const res = await queryPoint(pt, 3.0);
+      allItems.push(...res);
+    }
+
+    const parseItems = (items) => {
+      let hasSseeHere = sseeList.length > 0;
       for (const it of items) {
         const disp = String(it.display || "").trim();
-        const fullText = `${disp} ${it.type || ""} ${it.description || ""}`;
+        const desc = String(it.description || "");
+        const fullText = `${disp} ${it.type || ""} ${desc}`;
+        if (coci3f === null) {
+          const cm = COCI_3F_REGEX.exec(desc);
+          if (cm) coci3f = Number(cm[1]);
+        }
         if (SSEE_CLASS_REGEX.test(fullText)) {
           hasSseeHere = true;
           const sm = CODE_AT_START.exec(disp);
@@ -700,14 +783,13 @@
         }
       }
 
-      // 2a pasada: recolectar tramos MT y equipos de apertura DE LÍNEA (ignorando DDFF de transformador [Fxxxxx])
       for (const it of items) {
         const disp = String(it.display || "").trim();
-        const fullText = `${disp} ${it.type || ""} ${it.description || ""}`;
-        const sp = parseSpanPair(disp, it.type, it.description);
+        const desc = String(it.description || "");
+        const fullText = `${disp} ${it.type || ""} ${desc}`;
+        const sp = parseSpanPair(disp, it.type, desc);
         if (sp && sp.voltage === "mt") {
-          const matchTarget = !normCode || sp.from === normCode || sp.to === normCode;
-          if (matchTarget && !spans.some(x => x.display === sp.display)) {
+          if (!spans.some(x => x.display === sp.display)) {
             spans.push({ ...sp, id: Number(it.id) });
           }
           continue;
@@ -718,20 +800,31 @@
         if (isLineOp || (isFuse && !isTrafoFuse)) {
           const m = CODE_AT_START.exec(disp);
           const devCode = m ? m[1].toUpperCase() : (normCode || detectedPoleCode);
+          const realM = REAL_STATE_REGEX.exec(desc);
           if (!lineDevices.some(d => d.id === Number(it.id))) {
             lineDevices.push({
               id: Number(it.id),
               code: devCode,
               type: String(it.type || "Equipo de apertura MT"),
               display: disp || devCode,
-              isLineSeries: isLineOp
+              isLineSeries: isLineOp,
+              realState: realM ? realM[1].trim() : ""
             });
           }
         }
       }
-      if (spans.length >= 2) break;
+    };
+
+    parseItems(allItems);
+    if (spans.length === 0) {
+      const wider = await queryPoint(lonlat, 6.0);
+      parseItems(wider);
     }
-    return { spans, devices: lineDevices, sseeList, detectedPoleCode };
+    const result = { code: cacheKey, spans, devices: lineDevices, sseeList, detectedPoleCode, coci3f };
+    if (useCache && (spans.length > 0 || detectedPoleCode || lineDevices.length > 0)) {
+      await dbPutGnatCache(result);
+    }
+    return result;
   }
 
   // =========================================================================
@@ -1528,6 +1621,11 @@
     const zPts = state.points
       .filter(f => getPointZoneIds(f).includes(zoneId))
       .map(f => ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj));
+    if (zoneId === "D" && Array.isArray(state.graphNodes)) {
+      for (const gn of state.graphNodes) {
+        if (Array.isArray(gn.lonlat) && gn.lonlat.length === 2) zPts.push(gn.lonlat);
+      }
+    }
     if (zPts.length < 3) {
       showToast(`La zona "${z.name}" necesita al menos 3 puntos para autogenerar polígono (o dibújalo a mano).`, true);
       return false;
@@ -1678,6 +1776,21 @@
         ]);
         spanFeats.push(sf);
       }
+      if (!state.hidePoles && Array.isArray(state.graphNodes)) {
+        const ptCodes = new Set(state.points.map(p => getPointCode(p).toUpperCase()));
+        for (const gn of state.graphNodes) {
+          if (!Array.isArray(gn.lonlat) || ptCodes.has(gn.code)) continue;
+          const nf = new ol.Feature({ geometry: new ol.geom.Point(ol.proj.fromLonLat(gn.lonlat, proj)) });
+          nf.setStyle(new ol.style.Style({
+            image: new ol.style.Circle({
+              radius: 3.8,
+              fill: new ol.style.Fill({ color: "#64748B" }),
+              stroke: new ol.style.Stroke({ color: "#FFFFFF", width: 1.4 })
+            })
+          }));
+          spanFeats.push(nf);
+        }
+      }
       if (spanFeats.length) {
         spanLayer = new ol.layer.Vector({
           source: new ol.source.Vector({ features: spanFeats }),
@@ -1824,187 +1937,188 @@
       return;
     }
 
-    // Aperturas ya declaradas en el proyecto (ej. FBE9179, FF4840) actúan como frontera inmediata
     const knownOpenings = new Set(
       state.points.filter(f => f.get("tipo") === "APERTURA").map(f => getPointCode(f).toUpperCase())
     );
+    const seedCodes = new Set(seedFeats.map(f => getPointCode(f).toUpperCase()));
 
-    const visitedPoles = new Set();
-    const coordByCode = new Map();
+    const visitedNodes = []; // Array<{ id, lonlat, code }>
+    const findNearNode = (lonlat, maxM = 6) => visitedNodes.find(n => haversineMeters(n.lonlat, lonlat) <= maxM) || null;
+
     const queue = [];
-
-    for (const f of state.points) {
-      const c = getPointCode(f).toUpperCase();
-      coordByCode.set(c, ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj));
-    }
     for (const f of seedFeats) {
       const c = getPointCode(f).toUpperCase();
-      if (!visitedPoles.has(c)) {
-        visitedPoles.add(c);
-        queue.push({ code: c, hops: 0 });
+      let ll = ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj);
+      if (!findNearNode(ll, 4)) {
+        const nodeId = `N_${ll[0].toFixed(5)}_${ll[1].toFixed(5)}`;
+        visitedNodes.push({ id: nodeId, lonlat: ll, code: c });
+        queue.push({ id: nodeId, lonlat: ll, hintCode: c, hops: 0, isSeed: true });
       }
     }
 
     const discoveredOpenings = [];
     const discoveredRemates = [];
     const discoveredSpans = new Map(state.spans.map(s => [s.display, s]));
-    const adjacency = new Map(); // code -> Set<neighborCode>
-    const boundaryCodes = new Set(knownOpenings);
-    const MAX_HOPS = 45;
-    const MAX_NODES = 120;
+    const spanGeoCache = new Map();
+    const graphNodeMap = new Map(state.graphNodes.map(n => [n.code, n]));
+    const adjacency = new Map(); // nodeId -> Set<nodeId>
+    const nodeMeta = new Map();  // nodeId -> { code, lonlat, sseeCode, coci3f, isOpening, isSeed }
+    const boundaryNodeIds = new Set();
+    const MAX_HOPS = 60;
+    const MAX_NODES = 160;
     let cancelled = false;
 
-    const addEdgeToGraph = (a, b) => {
-      if (!adjacency.has(a)) adjacency.set(a, new Set());
-      if (!adjacency.has(b)) adjacency.set(b, new Set());
-      adjacency.get(a).add(b);
-      adjacency.get(b).add(a);
+    const addEdge = (idA, idB) => {
+      if (!idA || !idB || idA === idB) return;
+      if (!adjacency.has(idA)) adjacency.set(idA, new Set());
+      if (!adjacency.has(idB)) adjacency.set(idB, new Set());
+      adjacency.get(idA).add(idB);
+      adjacency.get(idB).add(idA);
     };
 
-    setCursorMode("nav", "⚡ Analizando red MT en GNAT... (Esc para detener)");
+    const getOrCreateNodeAt = (lonlat, hintCode = "") => {
+      const near = findNearNode(lonlat, 6);
+      if (near) {
+        if (hintCode && !near.code) near.code = hintCode;
+        return near;
+      }
+      const id = `N_${lonlat[0].toFixed(5)}_${lonlat[1].toFixed(5)}`;
+      const node = { id, lonlat, code: hintCode };
+      visitedNodes.push(node);
+      return node;
+    };
+
+    setCursorMode("nav", "⚡ Analizando red MT por puntas de cable... (Esc para detener)");
     modeBannerAction.onclick = () => { cancelled = true; setCursorMode("nav"); };
 
     try {
-      while (queue.length > 0 && visitedPoles.size <= MAX_NODES && !cancelled) {
-        const { code, hops } = queue.shift();
-        modeBannerText.textContent = `⚡ Analizando MT: poste ${code} (${visitedPoles.size} postes · ${discoveredSpans.size} tramos)...`;
+      while (queue.length > 0 && visitedNodes.length <= MAX_NODES && !cancelled) {
+        const cur = queue.shift();
+        const labelNow = cur.hintCode || cur.id;
+        modeBannerText.textContent = `⚡ Red MT: ${labelNow} (${nodeMeta.size} nodos · ${discoveredSpans.size} tramos · ${discoveredOpenings.length} aperturas)...`;
 
-        let gnatEntry = await resolveCodeInGnat(code, true);
-        let lonlat = gnatEntry?.lonlat || coordByCode.get(code);
-        if (!lonlat) continue;
-        coordByCode.set(code, lonlat);
-
-        const neighborhood = await inspectPoleNeighborhoodInGnat(code, lonlat);
+        const neighborhood = await inspectPoleNeighborhoodInGnat(cur.hintCode, cur.lonlat, [], true);
+        const nodeCode = (neighborhood.detectedPoleCode || cur.hintCode || cur.id).toUpperCase();
         const sseeTag = neighborhood.sseeList[0] ? `SSEE ${neighborhood.sseeList[0]}` : "";
 
-        // Asegurar que el poste esté dibujado (gris discreto si es intermedio descubierto fuera del PT)
-        const alreadyInPt = state.points.some(f => getPointCode(f).toUpperCase() === code);
-        upsertPointOnMap({
-          codigo: code,
-          lonlat,
-          tipo: "PUNTO",
-          bloqueId: "D",
-          bloques: ["D"],
-          esIntermedio: !alreadyInPt,
-          sseeCode: sseeTag
+        const lineDevicesHere = neighborhood.devices.filter(d => d.isLineSeries);
+        const isOpening = knownOpenings.has(nodeCode) || lineDevicesHere.length > 0;
+
+        nodeMeta.set(cur.id, {
+          code: nodeCode,
+          lonlat: cur.lonlat,
+          sseeCode: sseeTag,
+          coci3f: neighborhood.coci3f,
+          isOpening,
+          isSeed: cur.isSeed || seedCodes.has(nodeCode)
         });
+        graphNodeMap.set(nodeCode, { code: nodeCode, lonlat: cur.lonlat, coci3f: neighborhood.coci3f, sseeCode: sseeTag });
 
-        // Solo equipos de LÍNEA MT (Reconectador, DDCC, Seccionador, Pole Top) o aperturas ya declaradas en PT cortan la rama.
-        // Los DDFF de transformador/SSEE NO cortan el recorrido MT.
-        const lineDevicesHere = neighborhood.devices.filter(d => d.isLineSeries || !sseeTag);
-        const isLineOpeningHere = knownOpenings.has(code) || (gnatEntry?.isOpeningDevice && LINE_OPENING_REGEX.test(gnatEntry.display || "")) || lineDevicesHere.some(d => d.isLineSeries);
+        const existingPt = state.points.find(f => getPointCode(f).toUpperCase() === nodeCode);
+        if (existingPt && sseeTag && !existingPt.get("sseeCode")) existingPt.set("sseeCode", sseeTag);
 
-        if (isLineOpeningHere) {
+        if (isOpening) {
+          boundaryNodeIds.add(cur.id);
           const eqName = lineDevicesHere[0]?.type || lineDevicesHere[0]?.display || "Apertura MT";
-          boundaryCodes.add(code);
+          const realSt = lineDevicesHere[0]?.realState ? ` (${lineDevicesHere[0].realState})` : "";
           upsertPointOnMap({
-            codigo: code,
-            lonlat,
+            codigo: nodeCode,
+            lonlat: cur.lonlat,
             tipo: "APERTURA",
             bloqueId: "D",
             bloques: ["D"],
             tipoEquipo: eqName
           });
-          if (!discoveredOpenings.some(x => x.code === code)) {
-            discoveredOpenings.push({ code, equipo: eqName, lonlat });
+          if (!discoveredOpenings.some(x => x.code === nodeCode)) {
+            discoveredOpenings.push({ code: nodeCode, equipo: `${eqName}${realSt}`, lonlat: cur.lonlat });
           }
-          const isSeed = seedFeats.some(f => getPointCode(f).toUpperCase() === code);
-          if (!isSeed) {
-            ensureVectorLayer();
+          if (!cur.isSeed) {
             rebuildOverlayLayers();
             continue;
           }
         }
 
-        // Recolectar aristas MT (combinando textual_search + vecindad espacial calibrada)
-        const allSpansHere = [
-          ...(gnatEntry?.spans || []).filter(s => s.voltage === "mt"),
-          ...neighborhood.spans
-        ];
+        // Pedir en 1 solo lote las geometrías LineString reales de los tramos que tocan este punto
+        const missingIds = neighborhood.spans.map(s => s.id).filter(id => id > 0 && !spanGeoCache.has(id));
+        if (missingIds.length) {
+          const fetched = await fetchSpanGeometriesBatch(missingIds);
+          for (const [fid, gdata] of fetched.entries()) spanGeoCache.set(fid, gdata);
+        }
 
-        const neighbors = new Set();
-        for (const sp of allSpansHere) {
-          const other = sp.from === code ? sp.to : sp.to === code ? sp.from : null;
-          if (!other) continue;
-          neighbors.add(other);
-          addEdgeToGraph(code, other);
+        for (const sp of neighborhood.spans) {
+          const geo = spanGeoCache.get(sp.id);
+          if (!geo) continue;
 
-          let otherCoord = coordByCode.get(other);
-          if (!otherCoord) {
-            const otherEntry = await resolveCodeInGnat(other, true);
-            if (otherEntry?.lonlat) {
-              otherCoord = otherEntry.lonlat;
-              coordByCode.set(other, otherCoord);
-              const otherExists = state.points.some(f => getPointCode(f).toUpperCase() === other);
-              upsertPointOnMap({
-                codigo: other,
-                lonlat: otherCoord,
-                tipo: knownOpenings.has(other) ? "APERTURA" : "PUNTO",
-                bloqueId: "D",
-                bloques: ["D"],
-                esIntermedio: !otherExists && !knownOpenings.has(other)
-              });
-            }
+          // Guardar polilínea completa del tramo MT (sigue la curva real de GNAT)
+          const key = [sp.from, sp.to].sort().join(" - ");
+          discoveredSpans.set(key, {
+            id: sp.id,
+            from: sp.from,
+            to: sp.to,
+            display: `${sp.from} - ${sp.to}`,
+            voltage: "mt",
+            coords: geo.coords
+          });
+
+          // Determinar hacia qué punta(s) del cable saltar
+          const dStart = haversineMeters(cur.lonlat, geo.start);
+          const dEnd = haversineMeters(cur.lonlat, geo.end);
+          const nextEndpoints = [];
+          if (dStart > 6 && dEnd > 6) {
+            // Semilla ligeramente desplazada del cable: explorar ambas puntas del tramo
+            nextEndpoints.push(geo.start, geo.end);
+          } else {
+            nextEndpoints.push(dStart >= dEnd ? geo.start : geo.end);
           }
-          if (otherCoord) {
-            const key = [code, other].sort().join(" - ");
-            discoveredSpans.set(key, {
-              id: sp.id || 0,
-              from: code,
-              to: other,
-              display: `${code} - ${other}`,
-              voltage: "mt",
-              coords: [lonlat, otherCoord]
-            });
+
+          for (const nextLL of nextEndpoints) {
+            const otherHint = sp.from === nodeCode ? sp.to : sp.to === nodeCode ? sp.from : "";
+            const existed = Boolean(findNearNode(nextLL, 6));
+            const nbNode = getOrCreateNodeAt(nextLL, otherHint);
+            addEdge(cur.id, nbNode.id);
+
+            if (!existed && cur.hops < MAX_HOPS && visitedNodes.length <= MAX_NODES) {
+              if (otherHint && knownOpenings.has(otherHint)) {
+                boundaryNodeIds.add(nbNode.id);
+                nodeMeta.set(nbNode.id, { code: otherHint, lonlat: nextLL, sseeCode: "", coci3f: null, isOpening: true, isSeed: false });
+                upsertPointOnMap({ codigo: otherHint, lonlat: nextLL, tipo: "APERTURA", bloqueId: "D", bloques: ["D"], tipoEquipo: "Apertura MT (PT)" });
+                if (!discoveredOpenings.some(x => x.code === otherHint)) {
+                  discoveredOpenings.push({ code: otherHint, equipo: "Apertura MT (PT)", lonlat: nextLL });
+                }
+              } else {
+                queue.push({ id: nbNode.id, lonlat: nextLL, hintCode: otherHint, hops: cur.hops + 1, isSeed: false });
+              }
+            }
           }
         }
 
         state.spans = [...discoveredSpans.values()];
-
-        // Expandir hacia vecinos no visitados
-        if (hops < MAX_HOPS) {
-          for (const nb of neighbors) {
-            if (knownOpenings.has(nb)) {
-              boundaryCodes.add(nb);
-              const nbEntry = await resolveCodeInGnat(nb, true);
-              const nbCoord = nbEntry?.lonlat || coordByCode.get(nb);
-              if (nbCoord) {
-                upsertPointOnMap({ codigo: nb, lonlat: nbCoord, tipo: "APERTURA", bloqueId: "D", bloques: ["D"], tipoEquipo: nbEntry?.display || "Apertura MT" });
-                if (!discoveredOpenings.some(x => x.code === nb)) {
-                  discoveredOpenings.push({ code: nb, equipo: nbEntry?.display || "Apertura MT", lonlat: nbCoord });
-                }
-              }
-              continue;
-            }
-            if (!visitedPoles.has(nb)) {
-              visitedPoles.add(nb);
-              queue.push({ code: nb, hops: hops + 1 });
-            }
-          }
-        }
-
-        ensureVectorLayer();
-        renderTable();
+        state.graphNodes = [...graphNodeMap.values()];
         rebuildOverlayLayers();
       }
 
-      // Calcular remates MT reales al finalizar el grafo (grado === 1 real, no frontera de apertura ni pendiente en cola)
-      const pendingSet = new Set(queue.map(q => q.code));
-      for (const [nodeCode, nbSet] of adjacency.entries()) {
-        if (nbSet.size === 1 && !boundaryCodes.has(nodeCode) && !pendingSet.has(nodeCode)) {
-          const feat = state.points.find(f => getPointCode(f).toUpperCase() === nodeCode && f.get("tipo") !== "APERTURA");
-          if (feat) {
-            feat.set("esRemate", true);
-            feat.set("esIntermedio", false);
-          }
-          if (!discoveredRemates.includes(nodeCode)) discoveredRemates.push(nodeCode);
+      // Detectar remates MT reales sobre el grafo de puntas (grado === 1 real, sin ser apertura ni semilla ni pendiente)
+      const pendingIds = new Set(queue.map(q => q.id));
+      for (const [nid, nbSet] of adjacency.entries()) {
+        if (nbSet.size === 1 && !boundaryNodeIds.has(nid) && !pendingIds.has(nid)) {
+          const meta = nodeMeta.get(nid);
+          if (!meta || meta.isOpening || meta.isSeed) continue;
+          upsertPointOnMap({
+            codigo: meta.code,
+            lonlat: meta.lonlat,
+            tipo: "PUNTO",
+            bloqueId: "D",
+            bloques: ["D"],
+            esRemate: true,
+            sseeCode: meta.sseeCode || ""
+          });
+          if (!discoveredRemates.includes(meta.code)) discoveredRemates.push(meta.code);
         }
       }
     } finally {
       setCursorMode("nav");
     }
 
-    // Autogenerar el polígono de Zona Desconectada (D) con todos los postes alcanzados si aún no tenía edición manual
     const zoneD = state.zones.get("D");
     if (zoneD && (!Array.isArray(zoneD.customRing) || zoneD.customRing.length < 3)) {
       generateZonePolygonFromPoints("D");
@@ -2018,11 +2132,11 @@
     markDirty();
     refreshAll();
     openMtDiscoverySummaryModal({
-      visitedCount: visitedPoles.size,
+      visitedCount: nodeMeta.size,
       spanCount: state.spans.length,
       openings: discoveredOpenings,
       remates: discoveredRemates,
-      openQueue: queue.map(q => q.code)
+      openQueue: queue.map(q => q.hintCode || q.id)
     });
   }
 
@@ -2829,6 +2943,7 @@
       bClearSpans.onclick = () => {
         closePopover();
         state.spans = [];
+        state.graphNodes = [];
         markDirty();
         rebuildOverlayLayers();
       };
@@ -3250,6 +3365,7 @@
     }
     state.multiSupervisorEnabled = Boolean(data.multiSupervisorEnabled);
     state.spans = Array.isArray(data.spans) ? data.spans : [];
+    state.graphNodes = Array.isArray(data.graphNodes) ? data.graphNodes : [];
 
     const feats = (data.registros || []).map(r => {
       const sid = r.supervisorId || LEGACY_COLOR_TO_SUP[r.supervisorColor] || "default";
@@ -3297,6 +3413,7 @@
     projNameInput.value = state.projectName;
     state.points = [];
     state.spans = [];
+        state.graphNodes = [];
     state.selected.clear();
     state.zones.get("D").customRing = null;
     state.zones.get("T").customRing = null;
