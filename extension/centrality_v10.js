@@ -141,6 +141,7 @@
     filterType: "all",      // "all" | "PUNTO" | "APERTURA"
     filterZones: new Set(), // empty = all; "__NONE__" = sin zona
     filterSups: new Set(),  // empty = all
+    showIntermediosInTable: false,
     // Opciones de visualización en mapa
     colorBy: "zone",        // "zone" | "supervisor"
     hidePoles: false,       // Ocultar pines de postes para editar polígonos cómodamente
@@ -727,7 +728,7 @@
 
   // Descubre tramos MT, SSEE, COCI_3F y aparatos de línea en una punta de cable (1 request + caché IndexedDB v5)
   async function inspectPoleNeighborhoodInGnat(code, lonlat, extraCoords = [], useCache = true) {
-    const cacheKey = `v6:${Number(lonlat[0]).toFixed(5)},${Number(lonlat[1]).toFixed(5)}`;
+    const cacheKey = `v7:${Number(lonlat[0]).toFixed(5)},${Number(lonlat[1]).toFixed(5)}`;
     if (useCache) {
       const cached = await dbGetGnatCache(cacheKey);
       if (cached && Array.isArray(cached.spans)) return cached;
@@ -757,7 +758,7 @@
 
     let allItems = [];
     for (const pt of probePoints) {
-      const res = await queryPoint(pt, 8.0);
+      const res = await queryPoint(pt, 3.2);
       allItems.push(...res);
     }
 
@@ -816,8 +817,9 @@
     };
 
     parseItems(allItems);
-    if (spans.length === 0) {
-      const wider = await queryPoint(lonlat, 14.0);
+    const hasFuseOrSseeHere = sseeList.length > 0 || allItems.some(it => FUSE_DEVICE_REGEX.test(`${it.display || ""} ${it.type || ""}`));
+    if (spans.length === 0 || (hasFuseOrSseeHere && spans.length < 3)) {
+      const wider = await queryPoint(lonlat, 8.0);
       parseItems(wider);
     }
     const result = { code: cacheKey, spans, devices: lineDevices, sseeList, detectedPoleCode, coci3f };
@@ -1964,8 +1966,8 @@
     const adjacency = new Map(); // nodeId -> Set<nodeId>
     const nodeMeta = new Map();  // nodeId -> { code, lonlat, sseeCode, coci3f, isOpening, isSeed }
     const boundaryNodeIds = new Set();
-    const MAX_HOPS = 100;
-    const MAX_NODES = 250;
+    const MAX_HOPS = 300;
+    const MAX_NODES = 400;
     let cancelled = false;
 
     const addEdge = (idA, idB) => {
@@ -2372,6 +2374,17 @@
       refreshAll();
     });
 
+    if (Array.isArray(state.graphNodes) && state.graphNodes.length > 0) {
+      const ptSet = new Set(state.points.map(p => getPointCode(p).toUpperCase()));
+      const interCount = state.graphNodes.filter(g => !ptSet.has(g.code)).length;
+      if (interCount > 0) {
+        makeChip(`Intermedios (${interCount})`, state.showIntermediosInTable, () => {
+          state.showIntermediosInTable = !state.showIntermediosInTable;
+          refreshAll();
+        }, "#64748B", "Mostrar u ocultar los postes grises intermedios descubiertos en la tabla");
+      }
+    }
+
     if (isMultiSupActive()) {
       for (const s of state.supervisors.values()) {
         if (s.id === "default") continue;
@@ -2541,6 +2554,61 @@
         openContextMenu(ev.clientX, ev.clientY, idx);
       };
       frag.appendChild(tr);
+    }
+    if (state.showIntermediosInTable && Array.isArray(state.graphNodes) && state.graphNodes.length > 0) {
+      const ptSet = new Set(state.points.map(p => getPointCode(p).toUpperCase()));
+      const q = state.search.trim().toLocaleLowerCase("es");
+      const interNodes = state.graphNodes.filter(gn => !ptSet.has(gn.code) && (!q || gn.code.toLocaleLowerCase("es").includes(q) || (gn.sseeCode || "").toLocaleLowerCase("es").includes(q)));
+      for (let gi = 0; gi < interNodes.length; gi++) {
+        const gn = interNodes[gi];
+        const tr = doc.createElement("tr");
+        tr.style.background = "#F8FAFC";
+        const tdCb = doc.createElement("td");
+        tdCb.textContent = "•";
+        tdCb.style.color = "#94A3B8";
+        tdCb.style.textAlign = "center";
+        tr.appendChild(tdCb);
+
+        const tdN = doc.createElement("td");
+        tdN.className = "num-cell";
+        tdN.textContent = `G${gi + 1}`;
+        tr.appendChild(tdN);
+
+        const tdCode = doc.createElement("td");
+        const sp = doc.createElement("span");
+        sp.textContent = gn.code;
+        sp.style.fontWeight = "600";
+        sp.style.color = "#475569";
+        tdCode.appendChild(sp);
+        const ib = doc.createElement("span");
+        ib.className = "inter-badge";
+        ib.textContent = "Intermedio";
+        tdCode.appendChild(ib);
+        if (gn.sseeCode) {
+          const sb = doc.createElement("span");
+          sb.className = "ssee-badge";
+          sb.textContent = gn.sseeCode;
+          tdCode.appendChild(sb);
+        }
+        tr.appendChild(tdCode);
+
+        const tdZ = doc.createElement("td");
+        tdZ.textContent = gn.coci3f ? `${gn.coci3f} kA` : "MT";
+        tdZ.style.fontSize = "11px";
+        tdZ.style.color = "#64748B";
+        tr.appendChild(tdZ);
+
+        if (multiSup) {
+          const tdS = doc.createElement("td");
+          tr.appendChild(tdS);
+        }
+        tr.onclick = () => {
+          const view = map.getView();
+          const xy = ol.proj.fromLonLat(gn.lonlat, view.getProjection());
+          view.animate({ center: xy, zoom: Math.max(view.getZoom() || 0, 18), duration: 220 });
+        };
+        frag.appendChild(tr);
+      }
     }
     tbody.replaceChildren(frag);
 
@@ -2803,6 +2871,10 @@
       el("div", "pop-sep", null, pop);
       const bSaveCopy = el("button", "pop-item", "💾 Guardar como (.json en PC)", pop);
       bSaveCopy.onclick = () => { closePopover(); downloadJSON(); };
+
+      const bExpKmz = el("button", "pop-item", "🌍 Exportar mapa completo (.kmz)", pop);
+      bExpKmz.disabled = state.points.length === 0 && state.spans.length === 0;
+      bExpKmz.onclick = () => { closePopover(); downloadKMZ(); };
 
       const bExpCsv = el("button", "pop-item", "📊 Exportar tabla (.csv)", pop);
       bExpCsv.disabled = state.points.length === 0;
@@ -3590,6 +3662,122 @@
     a.click();
     a.remove();
     w.setTimeout(() => w.URL.revokeObjectURL(url), 2000);
+  }
+
+  function crc32Bytes(u8) {
+    let c = 0xffffffff;
+    for (let i = 0; i < u8.length; i++) {
+      c ^= u8[i];
+      for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
+  function buildSingleFileZipBlob(filename, contentBytes) {
+    const nameBytes = new TextEncoder().encode(filename);
+    const crc = crc32Bytes(contentBytes);
+    const size = contentBytes.length;
+    const lfh = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(lfh.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true);
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, size, true);
+    lv.setUint32(22, size, true);
+    lv.setUint16(26, nameBytes.length, true);
+    lfh.set(nameBytes, 30);
+
+    const cdh = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(cdh.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, 20, true);
+    cv.setUint16(6, 20, true);
+    cv.setUint32(16, crc, true);
+    cv.setUint32(20, size, true);
+    cv.setUint32(24, size, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cdh.set(nameBytes, 46);
+
+    const eocd = new Uint8Array(22);
+    const ev = new DataView(eocd.buffer);
+    ev.setUint32(0, 0x06054b50, true);
+    ev.setUint16(8, 1, true);
+    ev.setUint16(10, 1, true);
+    ev.setUint32(12, cdh.length, true);
+    ev.setUint32(16, lfh.length + size, true);
+
+    return new Blob([lfh, contentBytes, cdh, eocd], { type: "application/vnd.google-earth.kmz" });
+  }
+
+  function downloadKMZ() {
+    const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const kmlColor = (hex, alpha = "ff") => {
+      const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(String(hex || "#1D4ED8"));
+      return m ? `${alpha}${m[3]}${m[2]}${m[1]}`.toLowerCase() : `${alpha}d84e1d`;
+    };
+    const proj = map.getView().getProjection();
+
+    let zonePlacemarks = "";
+    for (const z of state.zones.values()) {
+      let ring = Array.isArray(z.customRing) && z.customRing.length >= 3 ? z.customRing : null;
+      if (!ring) {
+        const zPts = state.points.filter(f => getPointZoneIds(f).includes(z.id)).map(f => ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj));
+        if (z.id === "D" && Array.isArray(state.graphNodes)) {
+          for (const gn of state.graphNodes) if (Array.isArray(gn.lonlat)) zPts.push(gn.lonlat);
+        }
+        if (zPts.length >= 3) ring = convexHullLonLat(zPts);
+      }
+      if (!ring || ring.length < 3) continue;
+      const closed = [...ring, ring[0]].map(c => `${c[0]},${c[1]},0`).join(" ");
+      zonePlacemarks += `<Placemark><name>${esc(z.name)}</name><Style><LineStyle><color>${kmlColor(z.color, "ff")}</color><width>2.5</width></LineStyle><PolyStyle><color>${kmlColor(z.color, "33")}</color></PolyStyle></Style><Polygon><outerBoundaryIs><LinearRing><coordinates>${closed}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>`;
+    }
+
+    let ptPlacemarks = "";
+    let rematePlacemarks = "";
+    for (const f of state.points) {
+      const [lon, lat] = ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj);
+      const code = getPointCode(f);
+      const rol = f.get("rolPT") ? `${f.get("rolPT")} · ` : "";
+      const desc = `${f.get("tipoEquipo") || ""} ${f.get("sseeCode") || ""} ${f.get("accionPT") || ""}`.trim();
+      const pm = `<Placemark><name>${esc(rol + code)}</name><description>${esc(desc)}</description><Point><coordinates>${lon},${lat},0</coordinates></Point></Placemark>`;
+      if (f.get("esRemate")) rematePlacemarks += pm;
+      else ptPlacemarks += pm;
+    }
+
+    let spanPlacemarks = "";
+    for (const sp of state.spans) {
+      if (!Array.isArray(sp.coords) || sp.coords.length < 2) continue;
+      const cStr = sp.coords.map(c => `${c[0]},${c[1]},0`).join(" ");
+      spanPlacemarks += `<Placemark><name>${esc(sp.display || `${sp.from}-${sp.to}`)}</name><Style><LineStyle><color>ff2626dc</color><width>3</width></LineStyle></Style><LineString><coordinates>${cStr}</coordinates></LineString></Placemark>`;
+    }
+
+    let interPlacemarks = "";
+    const ptCodes = new Set(state.points.map(p => getPointCode(p).toUpperCase()));
+    for (const gn of state.graphNodes) {
+      if (!Array.isArray(gn.lonlat) || ptCodes.has(gn.code)) continue;
+      const d = [gn.sseeCode, gn.coci3f ? `COCI 3F: ${gn.coci3f} kA` : ""].filter(Boolean).join(" · ");
+      interPlacemarks += `<Placemark><name>${esc(gn.code)}</name><description>${esc(d)}</description><Point><coordinates>${gn.lonlat[0]},${gn.lonlat[1]},0</coordinates></Point></Placemark>`;
+    }
+
+    const kml = `<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${esc(state.projectName)}</name>` +
+      `<Folder><name>Zonas D / T / F</name>${zonePlacemarks}</Folder>` +
+      `<Folder><name>Puntos PT y Aperturas</name>${ptPlacemarks}</Folder>` +
+      `<Folder><name>Remates MT</name>${rematePlacemarks}</Folder>` +
+      `<Folder><name>Red MT Desconectada</name>${spanPlacemarks}</Folder>` +
+      `<Folder><name>Postes Intermedios</name>${interPlacemarks}</Folder>` +
+      `</Document></kml>`;
+
+    const blob = buildSingleFileZipBlob("doc.kml", new TextEncoder().encode(kml));
+    const safe = state.projectName.replace(/[^a-zA-Z0-9._-]+/g, "_") || "centrality-red-mt";
+    const url = w.URL.createObjectURL(blob);
+    const a = doc.createElement("a");
+    a.href = url;
+    a.download = safe + ".kmz";
+    doc.body.appendChild(a);
+    a.click();
+    a.remove();
+    w.setTimeout(() => w.URL.revokeObjectURL(url), 2000);
+    showToast("Mapa completo exportado (.kmz).");
   }
 
   function downloadJSON() {
