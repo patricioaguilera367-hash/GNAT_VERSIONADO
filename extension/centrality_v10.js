@@ -727,7 +727,7 @@
 
   // Descubre tramos MT, SSEE, COCI_3F y aparatos de línea en una punta de cable (1 request + caché IndexedDB v5)
   async function inspectPoleNeighborhoodInGnat(code, lonlat, extraCoords = [], useCache = true) {
-    const cacheKey = `v5:${Number(lonlat[0]).toFixed(5)},${Number(lonlat[1]).toFixed(5)}`;
+    const cacheKey = `v6:${Number(lonlat[0]).toFixed(5)},${Number(lonlat[1]).toFixed(5)}`;
     if (useCache) {
       const cached = await dbGetGnatCache(cacheKey);
       if (cached && Array.isArray(cached.spans)) return cached;
@@ -757,7 +757,7 @@
 
     let allItems = [];
     for (const pt of probePoints) {
-      const res = await queryPoint(pt, 3.0);
+      const res = await queryPoint(pt, 8.0);
       allItems.push(...res);
     }
 
@@ -817,7 +817,7 @@
 
     parseItems(allItems);
     if (spans.length === 0) {
-      const wider = await queryPoint(lonlat, 6.0);
+      const wider = await queryPoint(lonlat, 14.0);
       parseItems(wider);
     }
     const result = { code: cacheKey, spans, devices: lineDevices, sseeList, detectedPoleCode, coci3f };
@@ -1783,9 +1783,9 @@
           const nf = new ol.Feature({ geometry: new ol.geom.Point(ol.proj.fromLonLat(gn.lonlat, proj)) });
           nf.setStyle(new ol.style.Style({
             image: new ol.style.Circle({
-              radius: 3.8,
-              fill: new ol.style.Fill({ color: "#64748B" }),
-              stroke: new ol.style.Stroke({ color: "#FFFFFF", width: 1.4 })
+              radius: 2.6,
+              fill: new ol.style.Fill({ color: "#475569" }),
+              stroke: new ol.style.Stroke({ color: "#FFFFFF", width: 1 })
             })
           }));
           spanFeats.push(nf);
@@ -1964,8 +1964,8 @@
     const adjacency = new Map(); // nodeId -> Set<nodeId>
     const nodeMeta = new Map();  // nodeId -> { code, lonlat, sseeCode, coci3f, isOpening, isSeed }
     const boundaryNodeIds = new Set();
-    const MAX_HOPS = 60;
-    const MAX_NODES = 160;
+    const MAX_HOPS = 100;
+    const MAX_NODES = 250;
     let cancelled = false;
 
     const addEdge = (idA, idB) => {
@@ -1998,11 +1998,25 @@
         modeBannerText.textContent = `⚡ Red MT: ${labelNow} (${nodeMeta.size} nodos · ${discoveredSpans.size} tramos · ${discoveredOpenings.length} aperturas)...`;
 
         const neighborhood = await inspectPoleNeighborhoodInGnat(cur.hintCode, cur.lonlat, [], true);
-        const nodeCode = (neighborhood.detectedPoleCode || cur.hintCode || cur.id).toUpperCase();
+        const lineDevicesHere = neighborhood.devices.filter(d => d.isLineSeries);
+        const rawDevCode = (lineDevicesHere[0]?.code || "").toUpperCase();
+        // Priorizar código real del poste o del equipo de apertura (ej. FF4840) antes que el ID de coordenada N_...
+        let nodeCode = (neighborhood.detectedPoleCode || rawDevCode || cur.hintCode || cur.id).toUpperCase();
         const sseeTag = neighborhood.sseeList[0] ? `SSEE ${neighborhood.sseeList[0]}` : "";
 
-        const lineDevicesHere = neighborhood.devices.filter(d => d.isLineSeries);
-        const isOpening = knownOpenings.has(nodeCode) || lineDevicesHere.length > 0;
+        // Verificar si coincide con una apertura ya declarada en el PT (por código o por cercanía <= 45m, ej. cuchilla FF4840 desplazada del poste D2)
+        const nearExistingOpening = state.points.find(f => {
+          if (f.get("tipo") !== "APERTURA") return false;
+          const fc = getPointCode(f).toUpperCase();
+          if (fc === nodeCode || (rawDevCode && fc === rawDevCode)) return true;
+          const fll = ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj);
+          return haversineMeters(fll, cur.lonlat) <= 45;
+        });
+        if (nearExistingOpening) {
+          nodeCode = getPointCode(nearExistingOpening).toUpperCase();
+        }
+
+        const isOpening = knownOpenings.has(nodeCode) || Boolean(nearExistingOpening) || lineDevicesHere.length > 0;
 
         nodeMeta.set(cur.id, {
           code: nodeCode,
@@ -2021,14 +2035,18 @@
           boundaryNodeIds.add(cur.id);
           const eqName = lineDevicesHere[0]?.type || lineDevicesHere[0]?.display || "Apertura MT";
           const realSt = lineDevicesHere[0]?.realState ? ` (${lineDevicesHere[0].realState})` : "";
-          upsertPointOnMap({
-            codigo: nodeCode,
-            lonlat: cur.lonlat,
-            tipo: "APERTURA",
-            bloqueId: "D",
-            bloques: ["D"],
-            tipoEquipo: eqName
-          });
+          if (nearExistingOpening) {
+            if (eqName && !nearExistingOpening.get("tipoEquipo")) nearExistingOpening.set("tipoEquipo", eqName);
+          } else {
+            upsertPointOnMap({
+              codigo: nodeCode,
+              lonlat: cur.lonlat,
+              tipo: "APERTURA",
+              bloqueId: "D",
+              bloques: ["D"],
+              tipoEquipo: eqName
+            });
+          }
           if (!discoveredOpenings.some(x => x.code === nodeCode)) {
             discoveredOpenings.push({ code: nodeCode, equipo: `${eqName}${realSt}`, lonlat: cur.lonlat });
           }
