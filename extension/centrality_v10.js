@@ -179,6 +179,8 @@
     syncQueue: { running: false, paused: false, cancelled: false, total: 0, done: 0, items: [] },
     showIntermediosInTable: false,
     selectedIntermedios: new Set(),
+    sortBy: "numero",
+    sortDir: "asc",
     // Opciones de visualización en mapa
     colorBy: "zone",        // "zone" | "supervisor"
     hidePoles: false,       // Ocultar pines de postes para editar polígonos cómodamente
@@ -2724,21 +2726,48 @@
       rebuildOverlayLayers();
     };
 
-    const thN = el("th", "", "Rol/N°", trh);
-    thN.style.width = "48px";
-    const thCode = el("th", "", "Código", trh);
+    const makeSortableTh = (key, label, width = "") => {
+      const arrow = state.sortBy === key ? (state.sortDir === "asc" ? " ▴" : " ▾") : "";
+      const th = el("th", "", label + arrow, trh);
+      if (width) th.style.width = width;
+      th.style.cursor = "pointer";
+      th.style.userSelect = "none";
+      th.title = "Clic para ordenar ascendente / descendente";
+      th.onclick = () => {
+        if (state.sortBy === key) state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+        else { state.sortBy = key; state.sortDir = "asc"; }
+        renderTable();
+      };
+      return th;
+    };
+    makeSortableTh("numero", "Rol/N°", "54px");
+    const thCode = makeSortableTh("codigo", "Código");
     if (state.selected.size > 0) {
       el("span", "sel-mini-pill", `${state.selected.size} sel.`, thCode);
     }
-    const thZ = el("th", "", "D / T / F", trh);
-    thZ.style.width = "88px";
+    makeSortableTh("zona", "D / T / F", "88px");
     if (multiSup) {
       const thS = el("th", "", "Sup.", trh);
       thS.style.width = "40px";
     }
 
+    const sortedVisible = [...visible].sort((a, b) => {
+      const mul = state.sortDir === "asc" ? 1 : -1;
+      if (state.sortBy === "codigo") {
+        return getPointCode(a).localeCompare(getPointCode(b), "es", { numeric: true, sensitivity: "base" }) * mul;
+      }
+      if (state.sortBy === "zona") {
+        const za = getPointZoneIds(a).join(",") || "zzz";
+        const zb = getPointZoneIds(b).join(",") || "zzz";
+        return za.localeCompare(zb, "es", { numeric: true, sensitivity: "base" }) * mul;
+      }
+      const na = Number(a.get("numero")) || 0;
+      const nb = Number(b.get("numero")) || 0;
+      if (na !== nb) return (na - nb) * mul;
+      return String(a.get("rolPT") || "").localeCompare(String(b.get("rolPT") || ""), "es", { numeric: true }) * mul;
+    });
     const frag = doc.createDocumentFragment();
-    for (const f of visible) {
+    for (const f of sortedVisible) {
       const idx = state.points.indexOf(f);
       const isSel = state.selected.has(idx);
       const isFoc = state.focused === idx;
@@ -2826,20 +2855,18 @@
         pb.title = protObj.label;
         tdCode.appendChild(pb);
       }
+      const eqType = String(f.get("tipoEquipo") || "").trim();
       const eptTxt = String(f.get("eptTipo") || "").trim();
       if (eptTxt) {
         const eq = doc.createElement("span");
         eq.className = "eq-badge";
         eq.textContent = eptTxt;
         tdCode.appendChild(eq);
-      } else {
-        const eqType = String(f.get("tipoEquipo") || "").trim();
-        if (eqType && !protObj) {
-          const eq = doc.createElement("span");
-          eq.className = "eq-badge";
-          eq.textContent = eqType;
-          tdCode.appendChild(eq);
-        }
+      } else if (eqType && !protObj) {
+        const eq = doc.createElement("span");
+        eq.className = "eq-badge";
+        eq.textContent = eqType;
+        tdCode.appendChild(eq);
       }
       if (f.get("esRemate")) {
         const rb = doc.createElement("span");
@@ -4996,13 +5023,23 @@
         renderSyncQueueBar();
         continue;
       }
-      const moved = await syncSinglePointWithGnat(f, false);
-      if (moved) getPointZoneIds(f).forEach(z => touchedZones.add(z));
+      try {
+        const moved = await syncSinglePointWithGnat(f, false);
+        if (moved) {
+          getPointZoneIds(f).forEach(z => touchedZones.add(z));
+          ensureVectorLayer();
+        }
+      } catch (err) {
+        console.warn("GNAT sync item error:", err);
+      }
       q.done++;
-      ensureVectorLayer();
-      renderSyncQueueBar();
-      renderTable();
-      rebuildOverlayLayers();
+      try {
+        renderSyncQueueBar();
+        renderTable();
+        rebuildOverlayLayers();
+      } catch (err) {
+        console.warn("UI render error during sync:", err);
+      }
     }
 
     // Reajustar automáticamente los polígonos de las zonas cuyos puntos se movieron a su poste exacto en GNAT
