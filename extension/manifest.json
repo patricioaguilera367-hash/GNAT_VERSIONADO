@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "Centrality Local V11.4.1.1 — Planificador PT DMS",
-  "version": "11.4.1",
+  "name": "Centrality Local V11.5.0.1 — Planificador PT DMS",
+  "version": "11.5.0",
   "description": "Planificador nativo de Permisos de Trabajo (D / T / F), descubrimiento topológico MT (svc_wmc.php) y edición directa de polígonos sobre GNAT DMS (SAESA / Frontel).",
   "permissions": [
     "scripting",

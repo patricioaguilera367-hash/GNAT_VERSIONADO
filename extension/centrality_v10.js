@@ -621,6 +621,25 @@
     return { from: a, to: b, voltage: isBtOrAp ? "bt" : "mt", display: `${a} - ${b}`, rawDisplay: text };
   }
 
+  function extractPointFromGeoJsonFeature(feat) {
+    const g = feat?.geometry;
+    const c = g?.coordinates;
+    if (!g || !Array.isArray(c) || !c.length) return null;
+    if (g.type === "Point" && c.length >= 2) return [Number(c[0]), Number(c[1])];
+    if (g.type === "MultiPoint" && Array.isArray(c[0]) && c[0].length >= 2) return [Number(c[0][0]), Number(c[0][1])];
+    if (g.type === "LineString" && c.length >= 2) {
+      const mid = c[Math.floor(c.length / 2)];
+      if (Array.isArray(mid) && mid.length >= 2) return [Number(mid[0]), Number(mid[1])];
+    }
+    if (g.type === "Polygon" && Array.isArray(c[0]) && c[0].length) {
+      const ring = c[0];
+      const lon = ring.reduce((s, p) => s + Number(p[0]), 0) / ring.length;
+      const lat = ring.reduce((s, p) => s + Number(p[1]), 0) / ring.length;
+      if (Number.isFinite(lon) && Number.isFinite(lat)) return [lon, lat];
+    }
+    return null;
+  }
+
   async function resolveCodeInGnat(rawCode, useCache = true) {
     const queries = buildCandidateSearchQueries(rawCode);
     for (const q of queries) {
@@ -633,7 +652,10 @@
     }
 
     const wm = w.webMap_;
+    const tried = new Set();
     for (const q of queries) {
+      if (!q || tried.has(q)) continue;
+      tried.add(q);
       let rows = [];
       try {
         const res = await gnatRequest("svc_wmc.php", w.Ext.apply({
@@ -643,13 +665,16 @@
           start: 0,
           limit: 50
         }, wm.getViewportParams()));
-        rows = Array.isArray(res) ? res : [];
+        rows = Array.isArray(res) ? res : (Array.isArray(res?.rows) ? res.rows : []);
       } catch (_) { rows = []; }
       if (!rows.length) continue;
 
       const spansFromSearch = [];
       const exactMatches = [];
+      const fallbackMatches = [];
       const devicesOnCode = [];
+      const qEsc = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const wordRe = new RegExp(`(^|[^A-Z0-9])${qEsc}([^A-Z0-9]|$)`, "i");
 
       for (const r of rows) {
         const disp = String(r?.display || "").trim();
@@ -658,10 +683,13 @@
           spansFromSearch.push({ ...span, id: Number(r.surrogate_in_map_id || r.object_id) });
           continue;
         }
+        if (EXCLUDE_NON_POLE_REGEX.test(disp)) continue;
         const m = CODE_AT_START.exec(disp);
         const token = m ? m[1].toUpperCase() : "";
-        if (token !== q) continue;
-        if (EXCLUDE_NON_POLE_REGEX.test(disp)) continue;
+        const isExactStart = token === q;
+        const isWordHit = !isExactStart && wordRe.test(disp);
+        if (!isExactStart && !isWordHit) continue;
+
         if (OPENING_DEVICE_REGEX.test(disp)) {
           devicesOnCode.push({
             objectId: Number(r.object_id),
@@ -669,15 +697,21 @@
             display: disp
           });
         }
-        exactMatches.push(r);
+        if (isExactStart) exactMatches.push(r);
+        else fallbackMatches.push(r);
       }
 
-      if (!exactMatches.length) continue;
-      // Priorizar el candidato que sea Poste/Estructura; si solo es un equipo (ej. FBE9179 Reconectador), usarlo
-      exactMatches.sort((a, b) => Number(POLE_CLASS_REGEX.test(b.display)) - Number(POLE_CLASS_REGEX.test(a.display)));
+      const candidates = exactMatches.length ? exactMatches : fallbackMatches;
+      if (!candidates.length) continue;
 
-      for (const cand of exactMatches) {
-        const idsToTry = [Number(cand.surrogate_in_map_id), Number(cand.object_id)].filter(n => Number.isFinite(n) && n > 0);
+      // Priorizar Poste/Soporte/Estructura; luego SSEE; luego Equipos
+      candidates.sort((a, b) => {
+        const score = (d) => (POLE_CLASS_REGEX.test(d) ? 3 : SSEE_CLASS_REGEX.test(d) ? 2 : OPENING_DEVICE_REGEX.test(d) ? 1 : 0);
+        return score(b.display || "") - score(a.display || "");
+      });
+
+      for (const cand of candidates) {
+        const idsToTry = [...new Set([Number(cand.surrogate_in_map_id), Number(cand.object_id)].filter(n => Number.isFinite(n) && n > 0))];
         for (const id of idsToTry) {
           try {
             const geo = await gnatRequest("svc_wmc.php", w.Ext.apply({
@@ -685,34 +719,12 @@
               object_ids: w.Ext.encode([id])
             }, wm.getViewportParams()));
             const feat = Array.isArray(geo?.features) ? geo.features[0] : (geo?.geometry ? geo : null);
-            const coords = feat?.geometry?.coordinates;
-            if (feat?.geometry?.type === "Point" && Array.isArray(coords) && coords.length >= 2) {
-              const extraCoords = [];
-              // Si hay un equipo de maniobra/DF con el mismo código (ej. F595041 DF desplazado del poste), pedir su punto en el mismo lote
-              const extraIds = exactMatches
-                .filter(m => m !== cand)
-                .map(m => Number(m.surrogate_in_map_id || m.object_id))
-                .filter(n => Number.isFinite(n) && n > 0 && n !== id)
-                .slice(0, 3);
-              if (extraIds.length) {
-                try {
-                  const eGeo = await gnatRequest("svc_wmc.php", w.Ext.apply({
-                    action: "get_objects_geojson",
-                    object_ids: w.Ext.encode(extraIds)
-                  }, wm.getViewportParams()));
-                  const eFeats = Array.isArray(eGeo?.features) ? eGeo.features : (eGeo?.geometry ? [eGeo] : []);
-                  for (const ef of eFeats) {
-                    const ec = ef?.geometry?.coordinates;
-                    if (ef?.geometry?.type === "Point" && Array.isArray(ec) && ec.length >= 2) {
-                      extraCoords.push([Number(ec[0]), Number(ec[1])]);
-                    }
-                  }
-                } catch (_) {}
-              }
+            const pt = extractPointFromGeoJsonFeature(feat);
+            if (pt && Number.isFinite(pt[0]) && Number.isFinite(pt[1])) {
               const entry = {
                 code: q,
-                lonlat: [Number(coords[0]), Number(coords[1])],
-                extraCoords,
+                lonlat: pt,
+                extraCoords: [],
                 display: String(cand.display || q),
                 objectId: Number(cand.object_id),
                 surrogateId: Number(cand.surrogate_in_map_id || id),
@@ -4863,8 +4875,8 @@
   }
 
   async function syncSinglePointWithGnat(f, force = false) {
-    if (!f) return;
-    if (!force && f.get("syncStatus") === "cancelled") return;
+    if (!f) return false;
+    if (!force && f.get("syncStatus") === "cancelled") return false;
     const prevStatus = f.get("syncStatus");
     f.set("syncStatus", "loading");
 
@@ -4874,121 +4886,89 @@
     const hasExistingGeom = Boolean(f.getGeometry());
     const existingLL = hasExistingGeom ? ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj) : null;
     const notes = [];
+    let snappedToGnat = false;
 
     try {
-      // RUTA RÁPIDA (1 solo request ~0.5s): si el punto YA tiene coordenadas, consultar directo ese punto en GNAT
-      if (existingLL) {
-        const nb = await inspectPoleNeighborhoodInGnat(code, existingLL, [], true);
-        if (f.get("syncStatus") === "cancelled") return;
-
-        const nearPole = (nb.detectedPoleCode || "").toUpperCase();
-        const nearSsee = (nb.sseeList[0] || "").toUpperCase();
-        const foundDev = nb.devices[0] || null;
-        const codeMatchesHere = Boolean(
-          (nearPole && code && (nearPole === code || nearPole === "F" + code || code === "F" + nearPole)) ||
-          (nearSsee && (nearSsee === code || nearSsee === sseeRaw)) ||
-          (foundDev && foundDev.code && foundDev.code.toUpperCase() === code)
-        );
-
-        let gnatLonLat = existingLL;
-        let distMeters = 0;
-
-        let snappedToGnat = false;
-        let finalNb = nb;
-        // Si en esa coordenada NO coincidió exacto el código (ej. Excel con 3-4 decimales / GPS corrido), buscar el poste exacto en GNAT
-        if (!codeMatchesHere && code && code !== "SIN CÓDIGO") {
-          const hit = await resolveCodeInGnat(code, true);
-          if (f.get("syncStatus") === "cancelled") return;
-          if (hit?.lonlat) {
-            gnatLonLat = hit.lonlat;
-            distMeters = haversineMeters(existingLL, hit.lonlat);
-            if (distMeters <= 150) {
-              // Dentro de radio razonable (<= 150m): ajustar pin a la coordenada exacta de GNAT (precisión completa)
-              f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(hit.lonlat, proj)));
-              snappedToGnat = true;
-              finalNb = await inspectPoleNeighborhoodInGnat(hit.code, hit.lonlat, hit.extraCoords || [], true);
-            } else {
-              // Lejos (> 150m, otro sector): NO mover el pin y marcar inconsistencia
-              notes.push(`GNAT ubica ${hit.code} a ${Math.round(distMeters)} m de tu coord.${nearPole ? ` (aquí figura ${nearPole})` : ""} — verificar.`);
-            }
-          } else if (nearPole) {
-            notes.push(`En esta coord. GNAT muestra ${nearPole} (tu tabla dice ${code}) — verificar.`);
-          } else {
-            notes.push(`Código ${code} no encontrado en GNAT.`);
-          }
-        } else if (codeMatchesHere && code && code !== "SIN CÓDIGO") {
-          // Si ya coincidió cerca, intentar precisión exacta del poste sin redondear si está en caché o disponible
-          const cached = await dbGetGnatCache(code);
-          if (cached?.lonlat && haversineMeters(existingLL, cached.lonlat) <= 150) {
-            f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(cached.lonlat, proj)));
-            gnatLonLat = cached.lonlat;
-            snappedToGnat = true;
-          }
-        }
-        const effNearPole = (finalNb.detectedPoleCode || "").toUpperCase();
-        const effNearSsee = (finalNb.sseeList[0] || "").toUpperCase();
-        const effFoundDev = finalNb.devices[0] || null;
-
-        const effSsee = effNearSsee || sseeRaw || "";
-        if (effSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${effSsee}`);
-        const detectedProt = effFoundDev
-          ? mapProtectionFromText(`${effFoundDev.type || ""} ${effFoundDev.display || ""}`)
-          : (effSsee ? "DF_XS" : "");
-
-        const userProt = String(f.get("proteccionTipo") || "");
-        if (!userProt && detectedProt) {
-          f.set("proteccionTipo", detectedProt);
-          if (["RC", "DBC", "DC", "DDFF", "SECC", "INT_MT"].includes(detectedProt) && !effSsee) {
-            f.set("tipo", "APERTURA");
-          }
-        } else if (userProt && !detectedProt && userProt !== "DF_XS" && !userProt.endsWith("_BT")) {
-          notes.push(`Declaraste ${PROTECTION_TYPES.find(p => p.id === userProt)?.short || userProt}, pero GNAT no reporta equipo de apertura en este punto — verificar.`);
-        }
-
-        f.set("gnatMeta", {
-          poleCode: effNearPole || code,
-          sseeCode: effSsee ? `SSEE ${effSsee}` : "",
-          coci3f: finalNb.coci3f,
-          deviceDisplay: effFoundDev ? `${effFoundDev.type || effFoundDev.display}${effFoundDev.realState ? " · " + effFoundDev.realState : ""}` : (effSsee ? "Desconectador Fusible XS (S/E)" : ""),
-          gnatLonLat,
-          distMeters: snappedToGnat ? 0 : distMeters,
-          syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
-        });
-        f.set("syncNote", notes.join(" "));
-        f.set("syncStatus", notes.length ? "mismatch" : "ok");
-        return snappedToGnat;
-      }
-
-      // RUTA SIN COORDENADAS: buscar código (o S/E) en GNAT para ubicar el pin
+      // 1. Búsqueda DIRECTA por código (el buscador nativo de GNAT: ~0.6s exacto)
       const hitPole = (code && code !== "SIN CÓDIGO") ? await resolveCodeInGnat(code, true) : null;
+      if (f.get("syncStatus") === "cancelled") return false;
       const hitSsee = (sseeRaw && sseeRaw !== code) ? await resolveCodeInGnat(sseeRaw, true) : null;
-      if (f.get("syncStatus") === "cancelled") return;
+      if (f.get("syncStatus") === "cancelled") return false;
 
       const primaryHit = hitPole || hitSsee;
+
       if (!primaryHit?.lonlat) {
-        f.set("syncNote", `Código ${code || sseeRaw} no encontrado en GNAT.`);
-        f.set("syncStatus", "not_found");
-        return;
+        // Fallback: si no apareció por código pero tiene coordenada Excel, mirar qué hay en esa coordenada
+        if (existingLL) {
+          const nb = await inspectPoleNeighborhoodInGnat(code, existingLL, [], true);
+          const nearPole = (nb.detectedPoleCode || "").toUpperCase();
+          const nearSsee = (nb.sseeList[0] || "").toUpperCase();
+          const nearDev = nb.devices[0] || null;
+          notes.push(nearPole
+            ? `Código ${code} no encontrado en GNAT (en esta coord. figura ${nearPole}) — verificar.`
+            : `Código ${code || sseeRaw} no encontrado en GNAT.`);
+          if (nearSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${nearSsee}`);
+          if (nearSsee && !f.get("proteccionTipo")) f.set("proteccionTipo", "DF_XS");
+          f.set("gnatMeta", {
+            poleCode: nearPole,
+            sseeCode: nearSsee ? `SSEE ${nearSsee}` : "",
+            coci3f: nb.coci3f,
+            deviceDisplay: nearDev ? `${nearDev.type}${nearDev.realState ? " · " + nearDev.realState : ""}` : "",
+            syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
+          });
+          f.set("syncNote", notes.join(" "));
+          f.set("syncStatus", "mismatch");
+        } else {
+          f.set("syncNote", `Código ${code || sseeRaw} no encontrado en GNAT.`);
+          f.set("syncStatus", "not_found");
+        }
+        return false;
       }
 
+      // Validar consistencia Poste <-> S/E cuando ambos vienen declarados
       if (hitPole?.lonlat && hitSsee?.lonlat) {
         const dBoth = haversineMeters(hitPole.lonlat, hitSsee.lonlat);
-        if (dBoth > 40) notes.push(`Poste ${code} y S/E ${sseeRaw} están a ${Math.round(dBoth)} m en GNAT — verificar.`);
+        if (dBoth > 40) {
+          notes.push(`Poste ${code} y S/E ${sseeRaw} están a ${Math.round(dBoth)} m en GNAT — verificar.`);
+        }
       }
 
-      f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(primaryHit.lonlat, proj)));
-      const nb = await inspectPoleNeighborhoodInGnat(primaryHit.code, primaryHit.lonlat, primaryHit.extraCoords || [], true);
-      if (f.get("syncStatus") === "cancelled") return;
+      // Validar contra coordenada Excel: <= 150 m -> auto-snap exacto a GNAT; > 150 m -> inconsistencia sin mover el pin
+      let distMeters = 0;
+      if (existingLL) {
+        distMeters = haversineMeters(existingLL, primaryHit.lonlat);
+        if (distMeters <= 150) {
+          f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(primaryHit.lonlat, proj)));
+          snappedToGnat = true;
+        } else {
+          notes.push(`GNAT ubica ${primaryHit.code} a ${Math.round(distMeters)} m de tu coord. Excel — verificar.`);
+        }
+      } else {
+        f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(primaryHit.lonlat, proj)));
+        snappedToGnat = true;
+      }
 
-      const foundSsee = nb.sseeList[0] || sseeRaw || "";
+      // 2. Rescatar metadata técnica (S/E, COCI_3F kA, protecciones reales) en la coordenada exacta del poste en GNAT
+      const probeLL = (snappedToGnat || !existingLL) ? primaryHit.lonlat : existingLL;
+      const nb = await inspectPoleNeighborhoodInGnat(primaryHit.code, probeLL, [], true);
+      if (f.get("syncStatus") === "cancelled") return snappedToGnat;
+
+      const foundSsee = (nb.sseeList[0] || sseeRaw || "").toUpperCase();
       const foundDev = nb.devices[0] || primaryHit.devices?.[0] || null;
       if (foundSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${foundSsee}`);
+
       const detectedProt = foundDev
         ? mapProtectionFromText(`${foundDev.type || ""} ${foundDev.display || ""}`)
         : (foundSsee ? "DF_XS" : "");
-      if (!f.get("proteccionTipo") && detectedProt) {
+
+      const userProt = String(f.get("proteccionTipo") || "");
+      if (!userProt && detectedProt) {
         f.set("proteccionTipo", detectedProt);
-        if (["RC", "DBC", "DC", "DDFF", "SECC", "INT_MT"].includes(detectedProt) && !foundSsee) f.set("tipo", "APERTURA");
+        if (["RC", "DBC", "DC", "DDFF", "SECC", "INT_MT"].includes(detectedProt) && !foundSsee) {
+          f.set("tipo", "APERTURA");
+        }
+      } else if (userProt && !detectedProt && userProt !== "DF_XS" && !userProt.endsWith("_BT")) {
+        notes.push(`Declaraste ${PROTECTION_TYPES.find(p => p.id === userProt)?.short || userProt}, pero GNAT no reporta equipo de apertura aquí — verificar.`);
       }
 
       f.set("gnatMeta", {
@@ -4998,13 +4978,15 @@
         coci3f: nb.coci3f,
         deviceDisplay: foundDev ? `${foundDev.type || foundDev.display}${foundDev.realState ? " · " + foundDev.realState : ""}` : (foundSsee ? "Desconectador Fusible XS (S/E)" : ""),
         gnatLonLat: primaryHit.lonlat,
-        distMeters: 0,
+        distMeters: snappedToGnat ? 0 : distMeters,
         syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
       });
       f.set("syncNote", notes.join(" "));
       f.set("syncStatus", notes.length ? "mismatch" : "ok");
+      return snappedToGnat;
     } catch (_) {
       if (f.get("syncStatus") === "loading") f.set("syncStatus", prevStatus === "ok" ? "ok" : "not_found");
+      return snappedToGnat;
     }
   }
 
