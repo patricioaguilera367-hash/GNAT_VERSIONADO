@@ -139,8 +139,17 @@
     // Filtros dinámicos combinables
     search: "",
     filterType: "all",      // "all" | "PUNTO" | "APERTURA"
-    filterZones: new Set(), // empty = all; "__NONE__" = sin zona
+    filterZones: new Set(), // legacy
+    hiddenZones: new Set(), // visibilidad por exclusión (vacío = todas visibles; "__NONE__" = sin zona)
+    hiddenStatuses: new Set(),
+    statuses: new Map([
+      ["pendiente", { id: "pendiente", name: "Pendiente", color: "#64748B" }],
+      ["en_ejecucion", { id: "en_ejecucion", name: "En ejecución", color: "#2563EB" }],
+      ["ejecutado", { id: "ejecutado", name: "Ejecutado", color: "#16A34A" }],
+      ["no_aplica", { id: "no_aplica", name: "No aplica ejecutar", color: "#D97706" }]
+    ]),
     filterSups: new Set(),  // empty = all
+    lastSearchMissing: [],  // códigos pegados en el buscador que no están en la tabla
     showIntermediosInTable: false,
     selectedIntermedios: new Set(),
     // Opciones de visualización en mapa
@@ -418,7 +427,7 @@
 
   function serializeProjectPayload() {
     const registros = state.points.map(f => {
-      const [longitud, latitud] = ol.proj.toLonLat(f.getGeometry().getCoordinates(), map.getView().getProjection());
+      const [longitud, latitud] = f.getGeometry() ? ol.proj.toLonLat(f.getGeometry().getCoordinates(), map.getView().getProjection()) : [0, 0];
       const sid = getSupId(f);
       const legacySup = sid === "CC" ? "Naranjo" : sid === "TL" ? "Azul" : sid === "RD" ? "Verde" : "Sin asignar";
       return {
@@ -439,6 +448,9 @@
         esRemate: Boolean(f.get("esRemate")),
         esIntermedio: Boolean(f.get("esIntermedio")),
         sseeCode: f.get("sseeCode") || "",
+        codigoTerreno: String(f.get("codigoTerreno") || ""),
+        estadoEjec: String(f.get("estadoEjec") || "pendiente"),
+        observaciones: Array.isArray(f.get("observaciones")) ? f.get("observaciones") : [],
         colorPersonalizado: String(f.get("colorPersonalizado") || "")
       };
     });
@@ -450,6 +462,7 @@
       updatedAt: Date.now(),
       multiSupervisorEnabled: state.multiSupervisorEnabled,
       supervisors: [...state.supervisors.values()],
+      statuses: [...state.statuses.values()],
       bloques: [...state.zones.values()].map(z => ({
         id: z.id,
         nombre: z.name,
@@ -915,7 +928,8 @@
       position: fixed;
       top: 8px;
       left: 56px;
-      width: calc(100vw - 68px);
+      width: auto;
+      max-width: calc(100vw - 360px);
       height: 38px;
       display: flex;
       align-items: center;
@@ -1097,6 +1111,49 @@
       color: #6D28D9;
       margin-left: 4px;
     }
+    @keyframes gnatSpin { to { transform: rotate(360deg); } }
+    .sync-spin {
+      display: inline-block; width: 11px; height: 11px; border: 2px solid #CBD5E1;
+      border-top-color: #2563EB; border-radius: 50%; animation: gnatSpin 0.7s linear infinite;
+      margin-right: 4px; vertical-align: -2px; flex-shrink: 0;
+    }
+    .sync-cancel {
+      border: none; background: transparent; color: #94A3B8; cursor: pointer;
+      font-size: 12px; padding: 0 3px; line-height: 1; margin-left: 3px;
+    }
+    .sync-cancel:hover { color: #DC2626; }
+    .status-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      margin-right: 5px; vertical-align: middle; flex-shrink: 0;
+    }
+    .search-missing-note {
+      font-size: 11px; color: #DC2626; background: #FEF2F2; border: 1px solid #FECACA;
+      border-radius: 6px; padding: 4px 7px; display: flex; align-items: center;
+      justify-content: space-between; gap: 6px; line-height: 1.3;
+    }
+    .preview-wrap {
+      max-height: 170px; overflow: auto; border: 1px solid var(--border);
+      border-radius: 8px; background: #F8FAFC;
+    }
+    .preview-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    .preview-table th, .preview-table td {
+      padding: 4px 6px; border-bottom: 1px solid #E2E8F0; border-right: 1px solid #E2E8F0;
+      text-align: left; white-space: nowrap; max-width: 140px; overflow: hidden; text-overflow: ellipsis;
+    }
+    .preview-table th { background: #EEF2FF; position: sticky; top: 0; }
+    .preview-table select {
+      font-size: 11px; padding: 2px 4px; border: 1px solid #94A3B8; border-radius: 4px;
+      background: #fff; font-weight: 600; width: 100%;
+    }
+    .obs-list {
+      max-height: 130px; overflow-y: auto; border: 1px solid var(--border);
+      border-radius: 7px; padding: 6px; background: #F8FAFC; display: flex;
+      flex-direction: column; gap: 5px;
+    }
+    .obs-item {
+      background: #fff; border: 1px solid #E2E8F0; border-radius: 5px; padding: 5px 7px; font-size: 11px;
+    }
+    .obs-date { font-size: 10px; color: #64748B; font-weight: 600; margin-bottom: 2px; }
     .inter-badge {
       display: inline-block;
       font-size: 10px;
@@ -1388,8 +1445,18 @@
   el("span", "", "🔍", searchBox);
   const searchInput = el("input", "", null, searchBox);
   searchInput.type = "search";
-  searchInput.placeholder = "Filtrar o Enter para buscar en GNAT...";
-  searchInput.title = "Filtra la tabla o presiona Enter para buscar el código directamente en GNAT";
+  searchInput.placeholder = "Filtrar, pegar columna Excel o Enter (GNAT)...";
+  searchInput.title = "Filtra por código GNAT o terreno, pega varios códigos desde Excel, o presiona Enter para buscar en GNAT";
+  searchInput.addEventListener("paste", (ev) => {
+    const txt = ev.clipboardData?.getData("text") || "";
+    if (/[\r\n\t]/.test(txt)) {
+      ev.preventDefault();
+      const cleaned = txt.split(/[\r\n\t]+/).map(s => s.trim()).filter(Boolean).join(" ");
+      searchInput.value = cleaned;
+      state.search = cleaned;
+      refreshAll();
+    }
+  });
 
   const btnPinF = el("button", "pin-f on", "F", searchRow);
   btnPinF.title = "Autocompletar prefijo 'F' (Frontel) en búsquedas de postes (activo)";
@@ -1404,6 +1471,7 @@
   const stepLabel = el("span", "", "0/0", stepper);
   const btnNext = el("button", "", "▶", stepper);
 
+  const searchMissingNote = el("div", "search-missing-note hidden", null, drawerHead);
   const filterChips = el("div", "filter-chips", null, drawerHead);
   const tableWrap = el("div", "table-wrap", null, drawer);
   tableWrap.tabIndex = 0;
@@ -1453,11 +1521,26 @@
     const pad = 8;
     const leftPx = Math.max(pad, Math.round(rect.left) + pad);
     const rightGap = Math.max(pad, Math.round(w.innerWidth - rect.right) + pad);
-    const availW = Math.max(280, Math.round(rect.width) - pad * 2);
     const topPx = Math.max(pad, Math.round(rect.top) + pad);
+    // Detectar el buscador nativo de GNAT arriba a la derecha para no superponerlo nunca
+    let gnatSearchLeft = rect.right - 295;
+    try {
+      const searchInputs = w.document.querySelectorAll('input[placeholder*="Buscar" i], input[placeholder*="Search" i]');
+      for (const inp of searchInputs) {
+        const sr = inp.getBoundingClientRect();
+        if (sr && sr.width > 80 && sr.top >= rect.top - 10 && sr.top <= rect.top + 80 && sr.left > rect.left + 200) {
+          // Subir al contenedor redondeado del buscador si existe
+          const box = inp.closest('.x-form-trigger-wrap, .x-field, .x-box-inner') || inp;
+          const br = box.getBoundingClientRect();
+          gnatSearchLeft = Math.min(gnatSearchLeft, Math.round((br?.left || sr.left) - 14));
+        }
+      }
+    } catch (_) {}
+    const maxBarW = Math.max(280, Math.round(gnatSearchLeft - leftPx));
 
     topbar.style.left = `${leftPx}px`;
-    topbar.style.width = `${availW}px`;
+    topbar.style.width = "auto";
+    topbar.style.maxWidth = `${maxBarW}px`;
     topbar.style.top = `${topPx}px`;
 
     drawer.style.top = `${topPx + 46}px`;
@@ -1487,29 +1570,66 @@
   // 8. CAPAS OPENLAYERS: PUNTOS, VECTORES MT (A->B), POLÍGONOS EDITABLES D/T/F
   // =========================================================================
   function getFilteredPoints() {
-    const q = state.search.trim().toLocaleLowerCase("es");
-    return state.points.filter(f => {
+    const rawQ = state.search.trim();
+    const tokens = rawQ ? rawQ.split(/[\s,;|\t\r\n]+/).map(s => s.trim()).filter(Boolean) : [];
+    const isMultiToken = tokens.length >= 2;
+    const matchedTokens = new Set();
+
+    const matchesToken = (f, tok) => {
+      const t = tok.toLocaleLowerCase("es");
+      const tF = state.autoPrefixF && /^\d+$/.test(t) ? "f" + t : t;
+      const code = getPointCode(f).toLocaleLowerCase("es");
+      const ter = String(f.get("codigoTerreno") || "").toLocaleLowerCase("es");
+      const num = String(f.get("numero") || "").toLocaleLowerCase("es");
+      const rol = String(f.get("rolPT") || "").toLocaleLowerCase("es");
+      const zids = getPointZoneIds(f).join(" ").toLocaleLowerCase("es");
+      const eq = String(f.get("tipoEquipo") || "").toLocaleLowerCase("es");
+      const st = (state.statuses.get(f.get("estadoEjec") || "pendiente")?.name || "").toLocaleLowerCase("es");
+      if (isMultiToken) {
+        return code === t || code === tF || code.includes(t) || (ter && (ter === t || ter.includes(t))) || num === t || rol === t;
+      }
+      const haystack = `${num} ${code} ${ter} ${zids} ${eq} ${rol} ${st}`;
+      return haystack.includes(t) || (tF !== t && haystack.includes(tF));
+    };
+
+    const out = state.points.filter(f => {
       if (state.filterType === "REMATE") {
         if (!f.get("esRemate")) return false;
       } else if (state.filterType !== "all" && (f.get("tipo") || "PUNTO") !== state.filterType) {
         return false;
       }
-      if (state.filterZones.size > 0) {
+      // Visibilidad de Zonas (por exclusión: todas visibles salvo las que están en hiddenZones)
+      if (state.hiddenZones.size > 0) {
         const zids = getPointZoneIds(f);
-        const matchNone = state.filterZones.has("__NONE__") && zids.length === 0;
-        const matchSome = zids.some(z => state.filterZones.has(z));
-        if (!matchNone && !matchSome) return false;
+        if (zids.length === 0) {
+          if (state.hiddenZones.has("__NONE__")) return false;
+        } else {
+          if (zids.every(z => state.hiddenZones.has(z))) return false;
+        }
+      }
+      // Visibilidad de Estados
+      if (state.hiddenStatuses.size > 0) {
+        const stId = String(f.get("estadoEjec") || "pendiente");
+        if (state.hiddenStatuses.has(stId)) return false;
       }
       if (state.filterSups.size > 0 && !state.filterSups.has(getSupId(f))) return false;
-      if (q) {
-        const zids = getPointZoneIds(f).join(" ");
-        const eq = String(f.get("tipoEquipo") || "");
-        const rol = String(f.get("rolPT") || "");
-        const haystack = `${f.get("numero")} ${getPointCode(f)} ${zids} ${eq} ${rol}`.toLocaleLowerCase("es");
-        if (!haystack.includes(q)) return false;
+      if (tokens.length > 0) {
+        let anyHit = false;
+        for (const tok of tokens) {
+          if (matchesToken(f, tok)) {
+            matchedTokens.add(tok.toUpperCase());
+            anyHit = true;
+          }
+        }
+        if (!anyHit) return false;
       }
       return true;
     });
+
+    state.lastSearchMissing = tokens.length > 0
+      ? [...new Set(tokens.map(t => t.toUpperCase()).filter(t => !matchedTokens.has(t)))]
+      : [];
+    return out;
   }
 
   function pointStyleFn(f, resolution) {
@@ -1902,29 +2022,59 @@
   // =========================================================================
   // 9. ALGORITMO INTERACTIVO DE RED MT: TRAMOS A->B, APERTURAS Y REMATES
   // =========================================================================
-  function upsertPointOnMap({ codigo, lonlat, tipo = "PUNTO", bloqueId = "D", bloques = ["D"], tipoEquipo = "", rolPT = "", accionPT = "", esRemate = false, esIntermedio = false, sseeCode = "" }) {
+  function upsertPointOnMap({ codigo, codigoTerreno = "", numero = null, lonlat = null, tipo = "PUNTO", bloqueId = "D", bloques = ["D"], tipoEquipo = "", rolPT = "", accionPT = "", esRemate = false, esIntermedio = false, sseeCode = "", estadoEjec = "pendiente", observaciones = null, syncStatus = "ok" }) {
     const cleanCode = String(codigo || "").trim().toUpperCase();
+    const cleanTer = String(codigoTerreno || "").trim().toUpperCase();
     const proj = map.getView().getProjection();
-    let existing = state.points.find(f => getPointCode(f).toUpperCase() === cleanCode && (f.get("tipo") || "PUNTO") === tipo);
+    const hasCoords = Array.isArray(lonlat) && lonlat.length === 2 && Number.isFinite(lonlat[0]) && Number.isFinite(lonlat[1]);
+
+    // Antiduplicados: asociar por código GNAT, código en terreno, o cercanía <= 5 m del mismo tipo
+    let existing = state.points.find(f => {
+      const fc = getPointCode(f).toUpperCase();
+      const ft = String(f.get("codigoTerreno") || "").toUpperCase();
+      if (cleanCode && cleanCode !== "SIN CÓDIGO" && (fc === cleanCode || (ft && ft === cleanCode)) && (f.get("tipo") || "PUNTO") === tipo) return true;
+      if (cleanTer && (fc === cleanTer || (ft && ft === cleanTer)) && (f.get("tipo") || "PUNTO") === tipo) return true;
+      if (hasCoords && (f.get("tipo") || "PUNTO") === tipo && f.getGeometry()) {
+        const fll = ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj);
+        if (Number.isFinite(fll[0]) && Number.isFinite(fll[1]) && haversineMeters(fll, lonlat) <= 5) return true;
+      }
+      return false;
+    });
+
     if (existing) {
-      existing.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(lonlat, proj)));
+      if (hasCoords) existing.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(lonlat, proj)));
+      if (cleanCode && cleanCode !== "SIN CÓDIGO" && getPointCode(existing) === "Sin código") existing.set("codigo", cleanCode);
+      if (cleanTer && !existing.get("codigoTerreno")) existing.set("codigoTerreno", cleanTer);
+      if (Number.isFinite(Number(numero)) && Number(numero) > 0) existing.set("numero", Number(numero));
       if (tipoEquipo && !existing.get("tipoEquipo")) existing.set("tipoEquipo", tipoEquipo);
       if (esRemate) { existing.set("esRemate", true); existing.set("esIntermedio", false); }
       if (sseeCode && !existing.get("sseeCode")) existing.set("sseeCode", sseeCode);
+      if (estadoEjec && estadoEjec !== "pendiente") existing.set("estadoEjec", estadoEjec);
+      if (Array.isArray(observaciones) && observaciones.length) {
+        const curObs = Array.isArray(existing.get("observaciones")) ? existing.get("observaciones") : [];
+        existing.set("observaciones", [...curObs, ...observaciones]);
+      }
+      if (syncStatus) existing.set("syncStatus", syncStatus);
       if (bloqueId && !existing.get("bloqueId")) existing.set("bloqueId", bloqueId);
       const curBloques = Array.isArray(existing.get("bloques")) ? existing.get("bloques") : [];
-      if (bloques.length) existing.set("bloques", [...new Set([...curBloques, ...bloques])]);
+      const cleanBloques = (bloques || []).filter(Boolean);
+      if (cleanBloques.length) existing.set("bloques", [...new Set([...curBloques, ...cleanBloques])]);
       return existing;
     }
-    const nextNum = 1 + Math.max(0, ...state.points.map(p => Number(p.get("numero")) || 0));
+
+    const nextNum = Number.isFinite(Number(numero)) && Number(numero) > 0
+      ? Number(numero)
+      : 1 + Math.max(0, ...state.points.map(p => Number(p.get("numero")) || 0));
+    const initGeom = hasCoords ? new ol.geom.Point(ol.proj.fromLonLat(lonlat, proj)) : null;
     const feat = new ol.Feature({
-      geometry: new ol.geom.Point(ol.proj.fromLonLat(lonlat, proj)),
-      id: `${tipo === "APERTURA" ? "ap" : "p"}-${cleanCode}-${Date.now()}`,
+      geometry: initGeom,
+      id: `${tipo === "APERTURA" ? "ap" : "p"}-${cleanCode || nextNum}-${Date.now()}-${Math.floor(Math.random()*999)}`,
       numero: nextNum,
       tipo,
-      codigo: cleanCode,
-      bloqueId,
-      bloques,
+      codigo: cleanCode || "Sin código",
+      codigoTerreno: cleanTer,
+      bloqueId: bloqueId || "",
+      bloques: (bloques || []).filter(Boolean),
       aperturasIds: [],
       supervisorId: "default",
       tipoEquipo,
@@ -1932,7 +2082,10 @@
       accionPT,
       esRemate,
       esIntermedio,
-      sseeCode
+      sseeCode,
+      estadoEjec: estadoEjec || "pendiente",
+      observaciones: Array.isArray(observaciones) ? observaciones : [],
+      syncStatus: hasCoords ? "ok" : syncStatus
     });
     state.points.push(feat);
     return feat;
@@ -1941,11 +2094,15 @@
   async function runMtNetworkDiscovery() {
     // 1. Determinar postes semilla (Seleccionados > Zona T > Zona F > Todos los postes)
     const proj = map.getView().getProjection();
-    let seedFeats = [...state.selected].map(i => state.points[i]).filter(Boolean);
+    let seedFeats = [...state.selected].map(i => state.points[i]).filter(f => f && f.getGeometry());
     const nonApSel = seedFeats.filter(f => f.get("tipo") !== "APERTURA");
     if (nonApSel.length) seedFeats = nonApSel;
+    const hasFilter = state.filterType !== "all" || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || Boolean(state.search.trim());
+    if (!seedFeats.length && hasFilter) {
+      seedFeats = getFilteredPoints().filter(f => f.getGeometry() && f.get("tipo") !== "APERTURA");
+    }
     if (!seedFeats.length) {
-      seedFeats = state.points.filter(f => f.get("tipo") !== "APERTURA" && (getPointZoneIds(f).includes("T") || getPointZoneIds(f).includes("F")));
+      seedFeats = state.points.filter(f => f.getGeometry() && f.get("tipo") !== "APERTURA" && (getPointZoneIds(f).includes("T") || getPointZoneIds(f).includes("F")));
     }
     if (!seedFeats.length) {
       seedFeats = state.points.filter(f => f.get("tipo") !== "APERTURA");
@@ -1973,7 +2130,7 @@
       if (!findNearNode(ll, 4)) {
         const nodeId = `N_${ll[0].toFixed(5)}_${ll[1].toFixed(5)}`;
         visitedNodes.push({ id: nodeId, lonlat: ll, code: c });
-        queue.push({ id: nodeId, lonlat: ll, hintCode: c, hops: 0, isSeed: true });
+        queue.push({ id: nodeId, lonlat: ll, hintCode: c, hops: 0, isSeed: true, prevCoci: null });
       }
     }
 
@@ -2050,7 +2207,13 @@
           nodeCode = getPointCode(nearExistingOpening).toUpperCase();
         }
 
-        const isOpening = knownOpenings.has(nodeCode) || Boolean(nearExistingOpening) || lineDevicesHere.length > 0;
+        const isDeclaredOpening = knownOpenings.has(nodeCode) || Boolean(nearExistingOpening);
+        const isPhysicallyOpen = lineDevicesHere.some(d => /abiert/i.test(d.realState || ""));
+        const curCoci = neighborhood.coci3f;
+        const goingDownstream = cur.prevCoci !== null && curCoci !== null && (curCoci < cur.prevCoci - 0.0005);
+        // Si vamos aguas abajo (COCI_3F baja) y el equipo está cerrado y no fue fijado manualmente como apertura del PT,
+        // queda sin energía al abrir aguas arriba -> continuar hasta encontrar los remates finales.
+        const isOpening = isDeclaredOpening || isPhysicallyOpen || (lineDevicesHere.length > 0 && !goingDownstream);
 
         nodeMeta.set(cur.id, {
           code: nodeCode,
@@ -2138,7 +2301,7 @@
                   discoveredOpenings.push({ code: otherHint, equipo: "Apertura MT (PT)", lonlat: nextLL });
                 }
               } else {
-                queue.push({ id: nbNode.id, lonlat: nextLL, hintCode: otherHint, hops: cur.hops + 1, isSeed: false });
+                queue.push({ id: nbNode.id, lonlat: nextLL, hintCode: otherHint, hops: cur.hops + 1, isSeed: false, prevCoci: curCoci !== null ? curCoci : cur.prevCoci });
               }
             }
           }
@@ -2374,10 +2537,11 @@
       return c;
     };
 
-    const hasAnyFilter = state.filterType !== "all" || state.filterZones.size > 0 || state.filterSups.size > 0;
+    const hasAnyFilter = state.filterType !== "all" || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || state.filterSups.size > 0;
     makeChip("Todos", !hasAnyFilter, () => {
       state.filterType = "all";
-      state.filterZones.clear();
+      state.hiddenZones.clear();
+      state.hiddenStatuses.clear();
       state.filterSups.clear();
       refreshAll();
     });
@@ -2400,45 +2564,59 @@
       }, "#7C3AED", "Filtrar solo remates aguas abajo detectados");
     }
 
-    for (const z of state.zones.values()) {
-      makeChip(z.id, state.filterZones.has(z.id), () => {
-        if (state.filterZones.has(z.id)) state.filterZones.delete(z.id);
-        else state.filterZones.add(z.id);
-        refreshAll();
-      }, z.color, z.name);
-    }
-
-    makeChip("Sin zona", state.filterZones.has("__NONE__"), () => {
-      if (state.filterZones.has("__NONE__")) state.filterZones.delete("__NONE__");
-      else state.filterZones.add("__NONE__");
-      refreshAll();
-    });
-
     if (Array.isArray(state.graphNodes) && state.graphNodes.length > 0) {
       const ptSet = new Set(state.points.map(p => getPointCode(p).toUpperCase()));
       const interCount = state.graphNodes.filter(g => !ptSet.has(g.code)).length;
       if (interCount > 0) {
-        makeChip(`Intermedios (${interCount})`, state.showIntermediosInTable, () => {
+        makeChip(`Interm. (${interCount})`, state.showIntermediosInTable, () => {
           state.showIntermediosInTable = !state.showIntermediosInTable;
           refreshAll();
-        }, "#64748B", "Mostrar u ocultar los postes grises intermedios descubiertos en la tabla");
+        }, "#64748B", "Mostrar u ocultar los postes grises intermedios en la tabla");
       }
     }
 
-    if (isMultiSupActive()) {
-      for (const s of state.supervisors.values()) {
-        if (s.id === "default") continue;
-        makeChip(s.initials, state.filterSups.has(s.id), () => {
-          if (state.filterSups.has(s.id)) state.filterSups.delete(s.id);
-          else state.filterSups.add(s.id);
-          refreshAll();
-        }, s.color, s.name);
-      }
-    }
+    // Desplegable compacto de visibilidad de Zonas (desmarcas 1 para ocultarla)
+    const totalZones = state.zones.size + 1; // + Sin zona
+    const visibleZones = Math.max(0, totalZones - state.hiddenZones.size);
+    const zChipLabel = state.hiddenZones.size > 0 ? `Zonas (${visibleZones}/${totalZones}) ▾` : "Zonas ▾";
+    const cZones = makeChip(zChipLabel, state.hiddenZones.size > 0, (ev) => {
+      openZonesVisibilityPopover(ev.currentTarget);
+    }, null, "Mostrar u ocultar zonas individuales");
+    cZones.style.fontWeight = "600";
+
+    // Desplegable compacto de visibilidad de Estados
+    const totalSt = state.statuses.size;
+    const visSt = Math.max(0, totalSt - state.hiddenStatuses.size);
+    const stChipLabel = state.hiddenStatuses.size > 0 ? `Estados (${visSt}/${totalSt}) ▾` : "Estados ▾";
+    const cSt = makeChip(stChipLabel, state.hiddenStatuses.size > 0, (ev) => {
+      openStatusesVisibilityPopover(ev.currentTarget);
+    }, null, "Filtrar por estado de ejecución o crear nuevos estados");
+    cSt.style.fontWeight = "600";
   }
 
   function renderTable() {
     const visible = getFilteredPoints();
+    // Mostrar notita roja compacta si hubo códigos pegados en el buscador que no existen en la tabla
+    if (state.lastSearchMissing.length > 0 && state.search.trim()) {
+      searchMissingNote.classList.remove("hidden");
+      searchMissingNote.replaceChildren();
+      const shown = state.lastSearchMissing.slice(0, 6).join(", ") + (state.lastSearchMissing.length > 6 ? ` (+${state.lastSearchMissing.length - 6})` : "");
+      el("span", "", `No encontrados (${state.lastSearchMissing.length}): ${shown}`, searchMissingNote);
+      const bClr = el("button", "sync-cancel", "×", searchMissingNote);
+      bClr.title = "Limpiar búsqueda";
+      bClr.onclick = () => { searchInput.value = ""; state.search = ""; refreshAll(); };
+    } else {
+      searchMissingNote.classList.add("hidden");
+    }
+    // Actualizar etiqueta dinámica de Analizar Red MT para dejar claro su alcance
+    const hasFilter = state.filterType !== "all" || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || Boolean(state.search.trim());
+    if (state.selected.size > 0) {
+      btnAnalyzeMt.textContent = `⚡ Analizar MT (${state.selected.size} sel.)`;
+    } else if (hasFilter && visible.length > 0) {
+      btnAnalyzeMt.textContent = `⚡ Analizar MT (${visible.length} vis.)`;
+    } else {
+      btnAnalyzeMt.textContent = "⚡ Analizar Red MT";
+    }
     const multiSup = isMultiSupActive();
     const focusedFeat = state.points[state.focused];
     const linkedPeerSet = new Set(
@@ -2513,11 +2691,50 @@
 
       const tdCode = doc.createElement("td");
       const isAp = f.get("tipo") === "APERTURA";
+      const syncSt = f.get("syncStatus") || "ok";
+      const stObj = state.statuses.get(f.get("estadoEjec") || "pendiente");
+      if (syncSt === "loading") {
+        const sp = doc.createElement("span");
+        sp.className = "sync-spin";
+        sp.title = "Buscando en GNAT...";
+        tdCode.appendChild(sp);
+      } else if (syncSt === "not_found") {
+        const nf = doc.createElement("span");
+        nf.textContent = "⚠️ ";
+        nf.title = "No encontrado en GNAT (doble clic o clic derecho para ubicar)";
+        tdCode.appendChild(nf);
+      } else if (stObj) {
+        const sd = doc.createElement("span");
+        sd.className = "status-dot";
+        sd.style.background = stObj.color;
+        sd.title = `Estado: ${stObj.name}`;
+        tdCode.appendChild(sd);
+      }
       const codeSpan = doc.createElement("span");
       codeSpan.textContent = (isAp ? "✕ " : "") + getPointCode(f);
       if (isAp) codeSpan.style.color = OPENING_COLOR;
       codeSpan.style.fontWeight = "600";
       tdCode.appendChild(codeSpan);
+      if (syncSt === "loading") {
+        const bStop = doc.createElement("button");
+        bStop.className = "sync-cancel";
+        bStop.textContent = "×";
+        bStop.title = "Cancelar búsqueda de este código";
+        bStop.onclick = (ev) => {
+          ev.stopPropagation();
+          f.set("syncStatus", "cancelled");
+          renderTable();
+        };
+        tdCode.appendChild(bStop);
+      }
+      const obsArr = Array.isArray(f.get("observaciones")) ? f.get("observaciones") : [];
+      if (obsArr.length > 0) {
+        const ob = doc.createElement("span");
+        ob.className = "inter-badge";
+        ob.textContent = `📝${obsArr.length}`;
+        ob.title = obsArr[obsArr.length - 1].text;
+        tdCode.appendChild(ob);
+      }
 
       const eqType = String(f.get("tipoEquipo") || "").trim();
       if (eqType) {
@@ -2604,10 +2821,12 @@
         trBar.style.background = "#EEF2FF";
         const tdBar = doc.createElement("td");
         tdBar.colSpan = multiSup ? 5 : 4;
-        tdBar.style.cssText = "padding:4px 8px;font-size:11px;display:flex;align-items:center;justify-content:space-between;gap:6px;";
+        tdBar.style.cssText = "padding:4px 8px;font-size:11px;";
+        const barWrap = el("div", "", null, tdBar);
+        barWrap.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;";
         const allInterSel = interNodes.every(gn => state.selectedIntermedios.has(gn.code));
-        const bSelAllInter = el("button", "btn-outline", allInterSel ? "Desmarcar intermedios" : `Marcar ${interNodes.length} intermedios`, tdBar);
-        bSelAllInter.style.cssText = "padding:2px 6px;font-size:10px;";
+        const bSelAllInter = el("button", "btn-outline", allInterSel ? "Desmarcar intermedios" : `Marcar ${interNodes.length} intermedios`, barWrap);
+        bSelAllInter.style.cssText = "padding:2px 6px;font-size:10px;white-space:nowrap;";
         bSelAllInter.onclick = (ev) => {
           ev.stopPropagation();
           if (allInterSel) interNodes.forEach(gn => state.selectedIntermedios.delete(gn.code));
@@ -2616,7 +2835,7 @@
         };
         const selInterCount = interNodes.filter(gn => state.selectedIntermedios.has(gn.code)).length;
         if (selInterCount > 0) {
-          const bProm = el("button", "btn-primary", `+ Agregar ${selInterCount} al PT`, tdBar);
+          const bProm = el("button", "btn-primary", `+ Agregar ${selInterCount} al PT`, barWrap);
           bProm.style.cssText = "padding:2px 8px;font-size:10px;";
           bProm.onclick = (ev) => {
             ev.stopPropagation();
@@ -2723,6 +2942,9 @@
     const btnZone = el("button", "ctx-accent", "Zonas ▾", ctxBar);
     btnZone.onclick = (ev) => openAssignZonePopover(ev.currentTarget);
 
+    const btnSt = el("button", "", "Estado ▾", ctxBar);
+    btnSt.onclick = (ev) => openAssignStatusPopover(ev.currentTarget);
+
     const btnLink = el("button", "", "Vincular ✕", ctxBar);
     btnLink.onclick = () => startLinkOpeningMode([...state.selected]);
 
@@ -2799,15 +3021,183 @@
   }
 
   function createZone(name, color) {
-    let n = state.zones.size + 1;
-    while (state.zones.has("Z" + n)) n++;
-    const id = "Z" + n;
+    const raw = String(name || "").trim();
+    const shortClean = raw.toUpperCase().replace(/[^A-Z0-9_-]/g, "");
+    let id = "";
+    if (shortClean && shortClean.length <= 6 && !state.zones.has(shortClean)) {
+      id = shortClean;
+    } else {
+      let n = state.zones.size + 1;
+      while (state.zones.has("Z" + n)) n++;
+      id = "Z" + n;
+    }
     const used = new Set([...state.zones.values()].map(z => z.color.toUpperCase()));
     const chosenColor = isHex(color) ? color : nextHighContrastColor(used);
-    state.zones.set(id, { id, name: name || `Zona ${n}`, color: chosenColor, customRing: null });
+    state.zones.set(id, { id, name: raw || id, color: chosenColor, customRing: null });
     markDirty();
     refreshAll();
     return id;
+  }
+
+  function deleteZone(zoneId) {
+    if (["D", "T", "F"].includes(zoneId)) {
+      showToast("Las zonas base D, T y F no se eliminan.", true);
+      return;
+    }
+    state.zones.delete(zoneId);
+    state.hiddenZones.delete(zoneId);
+    for (const f of state.points) {
+      const cur = Array.isArray(f.get("bloques")) ? f.get("bloques").filter(z => z !== zoneId) : [];
+      f.set("bloques", cur);
+      if (f.get("bloqueId") === zoneId) f.set("bloqueId", cur[0] || "");
+    }
+    styleCache = new WeakMap();
+    markDirty();
+    refreshAll();
+    showToast(`Zona "${zoneId}" eliminada.`);
+  }
+
+  function createStatus(name, color) {
+    const raw = String(name || "").trim();
+    if (!raw) return null;
+    const baseId = raw.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || ("st_" + Date.now());
+    let id = baseId;
+    let k = 2;
+    while (state.statuses.has(id)) id = `${baseId}_${k++}`;
+    const used = new Set([...state.statuses.values()].map(s => s.color.toUpperCase()));
+    const chosenColor = isHex(color) ? color : nextHighContrastColor(used);
+    state.statuses.set(id, { id, name: raw, color: chosenColor });
+    markDirty();
+    refreshAll();
+    return id;
+  }
+
+  function assignStatusToIndices(indices, statusId) {
+    if (!indices.length || !state.statuses.has(statusId)) return;
+    for (const idx of indices) {
+      const f = state.points[idx];
+      if (f) f.set("estadoEjec", statusId);
+    }
+    markDirty();
+    refreshAll();
+    showToast(`Estado "${state.statuses.get(statusId).name}" asignado a ${indices.length} elemento(s).`);
+  }
+
+  function openZonesVisibilityPopover(anchorEl) {
+    const r = anchorEl.getBoundingClientRect();
+    showPopoverAt(r.left, r.bottom + 6, (pop) => {
+      pop.style.minWidth = "250px";
+      const topRow = el("div", "", null, pop);
+      topRow.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:2px 6px 6px;";
+      el("span", "pop-title", "Visibilidad de Zonas", topRow).style.padding = "0";
+      const bAll = el("button", "btn-outline", "Todas", topRow);
+      bAll.style.cssText = "padding:2px 6px;font-size:10px;";
+      bAll.onclick = () => { state.hiddenZones.clear(); refreshAll(); openZonesVisibilityPopover(anchorEl); };
+
+      const listWrap = el("div", "", null, pop);
+      listWrap.style.cssText = "max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;";
+
+      const addRow = (id, label, color) => {
+        const row = el("div", "", null, listWrap);
+        row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:6px;padding:3px 6px;border-radius:6px;";
+        const lbl = el("label", "", null, row);
+        lbl.style.cssText = "display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;flex:1;min-width:0;";
+        const cb = el("input", "", null, lbl);
+        cb.type = "checkbox";
+        cb.checked = !state.hiddenZones.has(id);
+        cb.onchange = () => {
+          if (cb.checked) state.hiddenZones.delete(id);
+          else state.hiddenZones.add(id);
+          refreshAll();
+        };
+        if (color) {
+          const d = el("span", "dot", null, lbl);
+          d.style.background = color;
+        }
+        const sp = el("span", "", label, lbl);
+        sp.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+        const bSolo = el("button", "btn-outline", "Solo", row);
+        bSolo.style.cssText = "padding:1px 6px;font-size:10px;";
+        bSolo.onclick = () => {
+          state.hiddenZones.clear();
+          for (const oz of state.zones.keys()) if (oz !== id) state.hiddenZones.add(oz);
+          if (id !== "__NONE__") state.hiddenZones.add("__NONE__");
+          refreshAll();
+          openZonesVisibilityPopover(anchorEl);
+        };
+      };
+
+      for (const z of state.zones.values()) {
+        const lbl = z.name && z.name !== z.id ? `${z.id} · ${z.name}` : z.id;
+        addRow(z.id, lbl, z.color);
+      }
+      addRow("__NONE__", "Sin zona", "#94A3B8");
+    });
+  }
+
+  function openStatusesVisibilityPopover(anchorEl) {
+    const r = anchorEl.getBoundingClientRect();
+    showPopoverAt(r.left, r.bottom + 6, (pop) => {
+      pop.style.minWidth = "240px";
+      const topRow = el("div", "", null, pop);
+      topRow.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:2px 6px 6px;";
+      el("span", "pop-title", "Estados de ejecución", topRow).style.padding = "0";
+      const bAll = el("button", "btn-outline", "Todos", topRow);
+      bAll.style.cssText = "padding:2px 6px;font-size:10px;";
+      bAll.onclick = () => { state.hiddenStatuses.clear(); refreshAll(); openStatusesVisibilityPopover(anchorEl); };
+
+      for (const st of state.statuses.values()) {
+        const row = el("label", "pop-item", null, pop);
+        row.style.cursor = "pointer";
+        const cb = el("input", "", null, row);
+        cb.type = "checkbox";
+        cb.checked = !state.hiddenStatuses.has(st.id);
+        cb.onchange = () => {
+          if (cb.checked) state.hiddenStatuses.delete(st.id);
+          else state.hiddenStatuses.add(st.id);
+          refreshAll();
+        };
+        const d = el("span", "dot", null, row);
+        d.style.background = st.color;
+        el("span", "", st.name, row);
+      }
+
+      el("div", "pop-sep", null, pop);
+      const newRow = el("div", "inline-input-row", null, pop);
+      const inpSt = el("input", "", null, newRow);
+      inpSt.placeholder = "Nuevo estado...";
+      const bAdd = el("button", "btn-primary", "+ Crear", newRow);
+      bAdd.onclick = () => {
+        if (!inpSt.value.trim()) return;
+        createStatus(inpSt.value.trim());
+        openStatusesVisibilityPopover(anchorEl);
+      };
+    });
+  }
+
+  function openAssignStatusPopover(anchorEl) {
+    const r = anchorEl.getBoundingClientRect();
+    showPopoverAt(r.left, r.top - 6, (pop) => {
+      el("div", "pop-title", "Asignar estado a seleccionados", pop);
+      for (const st of state.statuses.values()) {
+        const b = el("button", "pop-item", null, pop);
+        const d = el("span", "dot", null, b);
+        d.style.background = st.color;
+        el("span", "", st.name, b);
+        b.onclick = () => { closePopover(); assignStatusToIndices([...state.selected], st.id); };
+      }
+      el("div", "pop-sep", null, pop);
+      const newRow = el("div", "inline-input-row", null, pop);
+      const inp = el("input", "", null, newRow);
+      inp.placeholder = "Nuevo estado...";
+      const bAdd = el("button", "btn-primary", "Crear", newRow);
+      bAdd.onclick = () => {
+        const sid = createStatus(inp.value.trim());
+        if (!sid) return;
+        closePopover();
+        assignStatusToIndices([...state.selected], sid);
+      };
+    }, true);
   }
 
   function showPopoverAt(x, y, buildFn, anchorBottom = false) {
@@ -2891,8 +3281,11 @@
       const bCenter = el("button", "pop-item", "🎯 Centrar en mapa", pop);
       bCenter.onclick = () => { closePopover(); navigateTo(idx); };
 
-      const bEdit = el("button", "pop-item", "✏️ Editar propiedades...", pop);
+      const bEdit = el("button", "pop-item", "📋 Detalles / Propiedades y observaciones...", pop);
       bEdit.onclick = () => { closePopover(); openEditPointModal(idx); };
+
+      const bSt = el("button", "pop-item", "🚦 Cambiar estado ▾", pop);
+      bSt.onclick = () => openAssignStatusPopover(bSt);
 
       const bToggleType = el("button", "pop-item", f.get("tipo") === "APERTURA" ? "🔄 Convertir en Poste normal" : "✕ Marcar como Apertura (✕)", pop);
       bToggleType.onclick = () => {
@@ -3029,6 +3422,13 @@
         const bDrawPoly = el("button", "btn-outline icon-btn", "🖊", row);
         bDrawPoly.title = `Dibujar polígono nuevo a mano para "${z.name}"`;
         bDrawPoly.onclick = () => { closePopover(); startPolygonDrawMode(z.id); };
+
+        if (!["D", "T", "F"].includes(z.id)) {
+          const bDelZ = el("button", "btn-outline icon-btn", "🗑", row);
+          bDelZ.title = `Eliminar zona "${z.id}"`;
+          bDelZ.style.color = "var(--danger)";
+          bDelZ.onclick = () => { deleteZone(z.id); btnZonas.click(); };
+        }
       }
 
       el("div", "pop-sep", null, pop);
@@ -3331,6 +3731,10 @@
     form.style.top = Math.min(mapRect.top + pixel[1] + 10, w.innerHeight - 260) + "px";
 
     el("strong", "", forceOpening ? "Nueva apertura vinculada" : "Nuevo elemento en mapa", form);
+    if (forceOpening && state.pendingLinkIndices.length) {
+      const sub = el("div", "", `Se vinculará a ${state.pendingLinkIndices.length} poste(s) seleccionado(s).`, form);
+      sub.style.cssText = "font-size:11px;color:#2563EB;font-weight:600;";
+    }
     const inpCode = el("input", "", null, form);
     inpCode.type = "text";
     inpCode.placeholder = forceOpening ? "Código apertura (ej. FF4840)" : "Detectando poste GNAT...";
@@ -3345,7 +3749,11 @@
     selType.value = forceOpening ? "APERTURA" : "PUNTO";
     selType.disabled = forceOpening;
 
+    const lblZ = el("label", "", forceOpening ? "Zona de la apertura (opcional · por defecto D):" : "Zona del punto (opcional):", form);
+    lblZ.style.cssText = "font-size:11px;color:#475569;font-weight:600;margin-top:2px;";
     const selZone = el("select", "", null, form);
+    const optNone = el("option", "", "— Sin zona (solo vinculada)", selZone);
+    optNone.value = "";
     for (const z of state.zones.values()) {
       const o = el("option", "", `${z.id} · ${z.name}`, selZone);
       o.value = z.id;
@@ -3535,6 +3943,12 @@
       state.supervisors = new Map(DEFAULT_SUPERVISORS.map(s => [s.id, { ...s }]));
     }
     state.multiSupervisorEnabled = Boolean(data.multiSupervisorEnabled);
+    if (Array.isArray(data.statuses) && data.statuses.length) {
+      state.statuses.clear();
+      for (const st of data.statuses) {
+        if (st?.id) state.statuses.set(st.id, { ...st });
+      }
+    }
     state.spans = Array.isArray(data.spans) ? data.spans : [];
     state.graphNodes = Array.isArray(data.graphNodes) ? data.graphNodes : [];
 
@@ -3557,6 +3971,10 @@
         esRemate: Boolean(r.esRemate),
         esIntermedio: Boolean(r.esIntermedio),
         sseeCode: r.sseeCode || "",
+        codigoTerreno: String(r.codigoTerreno || ""),
+        estadoEjec: String(r.estadoEjec || "pendiente"),
+        observaciones: Array.isArray(r.observaciones) ? r.observaciones : [],
+        syncStatus: "ok",
         colorPersonalizado: String(r.colorPersonalizado || "")
       });
     });
@@ -3874,28 +4292,33 @@
       return /[;"\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     const cociByCode = new Map((state.graphNodes || []).map(gn => [String(gn.code || "").toUpperCase(), gn]));
-    const rows = [["Categoria", "Rol", "Tipo", "Numero", "Codigo", "TipoEquipo", "SSEE", "COCI_3F_kA", "Longitud", "Latitud", "Zonas_DTF", "Accion"]];
+    const rows = [["Categoria", "Rol", "Tipo", "Numero", "Codigo", "CodigoTerreno", "Estado", "TipoEquipo", "SSEE", "COCI_3F_kA", "Longitud", "Latitud", "Zonas_DTF", "Accion", "Observaciones"]];
     const seenCodes = new Set();
     for (const f of state.points) {
-      const [lon, lat] = ol.proj.toLonLat(f.getGeometry().getCoordinates(), map.getView().getProjection());
+      const [lon, lat] = f.getGeometry() ? ol.proj.toLonLat(f.getGeometry().getCoordinates(), map.getView().getProjection()) : ["", ""];
       const code = getPointCode(f);
       const uCode = code.toUpperCase();
       seenCodes.add(uCode);
       const gn = cociByCode.get(uCode);
       const cat = f.get("tipo") === "APERTURA" ? "Apertura" : f.get("esRemate") ? "Remate" : f.get("esIntermedio") ? "Intermedio" : "Poste PT";
+      const stName = state.statuses.get(f.get("estadoEjec") || "pendiente")?.name || "Pendiente";
+      const obsStr = (Array.isArray(f.get("observaciones")) ? f.get("observaciones") : []).map(o => `[${o.at}] ${o.text}`).join(" | ");
       rows.push([
         cat,
         f.get("rolPT") || "",
         f.get("tipo") || "PUNTO",
         f.get("numero"),
         code,
+        f.get("codigoTerreno") || "",
+        stName,
         f.get("tipoEquipo") || "",
         f.get("sseeCode") || gn?.sseeCode || "",
         gn?.coci3f ?? "",
         lon,
         lat,
         getPointZoneIds(f).join("|"),
-        f.get("accionPT") || ""
+        f.get("accionPT") || "",
+        obsStr
       ]);
     }
     let gi = 1;
@@ -3910,11 +4333,14 @@
         "",
         gn.code,
         "",
+        "",
+        "",
         gn.sseeCode || "",
         gn.coci3f ?? "",
         gn.lonlat?.[0] ?? "",
         gn.lonlat?.[1] ?? "",
         "D",
+        "",
         ""
       ]);
     }
@@ -3991,21 +4417,43 @@
     modalBackdrop.replaceChildren();
     modalBackdrop.classList.remove("hidden");
     const card = el("div", "modal-card", null, modalBackdrop);
+    card.style.width = "min(520px, 94vw)";
     const head = el("div", "modal-head", null, card);
-    el("h2", "", `Editar ${getPointCode(f)}`, head);
+    el("h2", "", `Detalles · ${getPointCode(f)}`, head);
     const bClose = el("button", "btn-outline", "×", head);
     bClose.onclick = closeModal;
 
     const body = el("div", "modal-body", null, card);
     const grid = el("div", "form-grid", null, body);
 
-    el("label", "", "Rol PT (ej. T1, F1):", grid);
-    const inpRol = el("input", "", null, grid);
+    el("label", "", "N° / Rol PT:", grid);
+    const numRow = el("div", "", null, grid);
+    numRow.style.cssText = "display:flex;gap:6px;";
+    const inpNum = el("input", "", null, numRow);
+    inpNum.type = "number";
+    inpNum.style.width = "76px";
+    inpNum.value = String(f.get("numero") || "");
+    const inpRol = el("input", "", null, numRow);
+    inpRol.style.flex = "1";
+    inpRol.placeholder = "Rol opcional (ej. T1, F1)";
     inpRol.value = String(f.get("rolPT") || "");
 
-    el("label", "", "Código de placa:", grid);
+    el("label", "", "Código GNAT:", grid);
     const inpCode = el("input", "", null, grid);
     inpCode.value = getPointCode(f);
+
+    el("label", "", "Código en terreno:", grid);
+    const inpTer = el("input", "", null, grid);
+    inpTer.placeholder = "Opcional (buscable desde el filtro principal)";
+    inpTer.value = String(f.get("codigoTerreno") || "");
+
+    el("label", "", "Estado:", grid);
+    const selSt = el("select", "", null, grid);
+    for (const st of state.statuses.values()) {
+      const o = el("option", "", st.name, selSt);
+      o.value = st.id;
+    }
+    selSt.value = String(f.get("estadoEjec") || "pendiente");
 
     el("label", "", "Categoría:", grid);
     const selKind = el("select", "", null, grid);
@@ -4025,17 +4473,56 @@
     const inpAccion = el("input", "", null, grid);
     inpAccion.value = String(f.get("accionPT") || "");
 
+    // Bitácora de observaciones con fecha y hora automática
+    const obsTitle = el("div", "", "Observaciones (registro automático de fecha y hora):", body);
+    obsTitle.style.cssText = "font-size:12px;font-weight:700;color:#334155;margin-top:4px;";
+    const obsList = el("div", "obs-list", null, body);
+    const localObs = Array.isArray(f.get("observaciones")) ? f.get("observaciones").map(x => ({ ...x })) : [];
+    const renderObs = () => {
+      obsList.replaceChildren();
+      if (!localObs.length) {
+        el("div", "", "Sin observaciones registradas.", obsList).style.cssText = "font-size:11px;color:#94A3B8;padding:4px;";
+        return;
+      }
+      for (const o of [...localObs].reverse()) {
+        const it = el("div", "obs-item", null, obsList);
+        el("div", "obs-date", o.at || "", it);
+        el("div", "", o.text || "", it);
+      }
+    };
+    renderObs();
+
+    const addObsRow = el("div", "inline-input-row", null, body);
+    const inpObs = el("input", "", null, addObsRow);
+    inpObs.placeholder = "Escribir observación y presionar Enter...";
+    const bAddObs = el("button", "btn-outline", "+ Agregar", addObsRow);
+    const pushObs = () => {
+      const txt = inpObs.value.trim();
+      if (!txt) return;
+      const stamp = new Date().toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" });
+      localObs.push({ text: txt, at: stamp });
+      inpObs.value = "";
+      renderObs();
+    };
+    bAddObs.onclick = pushObs;
+    inpObs.onkeydown = (ev) => { if (ev.key === "Enter") { ev.preventDefault(); pushObs(); } };
+
     const footer = el("div", "", null, body);
     footer.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:6px;";
     const bCancel = el("button", "btn-outline", "Cancelar", footer);
     bCancel.onclick = closeModal;
     const bSave = el("button", "btn-primary", "Guardar", footer);
     bSave.onclick = () => {
+      pushObs();
+      if (Number(inpNum.value) > 0) f.set("numero", Number(inpNum.value));
       f.set("rolPT", inpRol.value.trim());
       f.set("codigo", inpCode.value.trim() || "Sin código");
+      f.set("codigoTerreno", inpTer.value.trim().toUpperCase());
+      f.set("estadoEjec", selSt.value);
       f.set("tipo", selKind.value);
       f.set("tipoEquipo", selEq.value);
       f.set("accionPT", inpAccion.value.trim());
+      f.set("observaciones", localObs);
       styleCache = new WeakMap();
       markDirty();
       refreshAll();
@@ -4051,7 +4538,7 @@
       const lon = Number(gmap[2] || gmap[4] || gmap[6]);
       if (Math.abs(lat) <= 90 && Math.abs(lon) <= 180) return [lon, lat];
     }
-    const nums = [...line.matchAll(/(-?\d{2}[.,]\d{4,9})/g)].map(m => Number(m[1].replace(",", ".")));
+    const nums = [...line.matchAll(/(-?\d{2}[.,]\d{3,9})/g)].map(m => Number(m[1].replace(",", ".")));
     if (nums.length >= 2) {
       const [a, b] = nums;
       if (Math.abs(a) <= 90 && Math.abs(b) <= 180 && Math.abs(b) > Math.abs(a)) return [b, a];
@@ -4060,114 +4547,286 @@
     return null;
   }
 
+  function parseSmartTableText(rawText) {
+    const lines = String(rawText || "").split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (!lines.length) return { rows: [], hasHeader: false, colRoles: [] };
+    const hasTabs = lines.some(l => l.includes("\t"));
+    const hasSemi = !hasTabs && lines.some(l => l.includes(";"));
+    const splitLine = (l) => {
+      if (hasTabs) return l.split("\t").map(s => s.trim());
+      if (hasSemi) return l.split(";").map(s => s.trim());
+      return l.split(/\s{2,}|,/).map(s => s.trim()).filter(Boolean);
+    };
+    const matrix = lines.map(splitLine);
+    const maxCols = Math.max(1, ...matrix.map(r => r.length));
+    const normRows = matrix.map(r => {
+      const copy = [...r];
+      while (copy.length < maxCols) copy.push("");
+      return copy;
+    });
+
+    const first = normRows[0];
+    const headerRegex = /^(n[°ºo]?|num|numero|c[oó]d|codigo|poste|lat|lon|long|estado|obs|zona|terreno|ct)/i;
+    const hasHeader = normRows.length >= 2 && first.some(c => headerRegex.test(c)) && !first.some(c => /^-?\d{2}[.,]\d{3,9}$/.test(c));
+    const dataRows = hasHeader ? normRows.slice(1) : normRows;
+
+    const parseCoordNum = (v) => {
+      const s = String(v || "").trim().replace(",", ".");
+      if (!/^-?\d{1,3}\.\d{3,9}$/.test(s)) return null;
+      return Number(s);
+    };
+
+    const colRoles = [];
+    for (let c = 0; c < maxCols; c++) {
+      const h = (hasHeader ? first[c] : "").toLowerCase();
+      const sample = dataRows.slice(0, 12).map(r => r[c]).filter(Boolean);
+      if (/^n[°ºo]?$|num/i.test(h)) { colRoles.push("numero"); continue; }
+      if (/lat/i.test(h)) { colRoles.push("lat"); continue; }
+      if (/lon/i.test(h)) { colRoles.push("lon"); continue; }
+      if (/terreno|\bct\b/i.test(h)) { colRoles.push("codigoTerreno"); continue; }
+      if (/estado/i.test(h)) { colRoles.push("estado"); continue; }
+      if (/obs|nota/i.test(h)) { colRoles.push("obs"); continue; }
+      if (/cod|poste|equipo/i.test(h)) { colRoles.push("codigo"); continue; }
+
+      // Heurística por contenido
+      const coordNums = sample.map(parseCoordNum).filter(n => n !== null);
+      if (coordNums.length >= Math.max(1, Math.ceil(sample.length * 0.6))) {
+        const avgAbs = coordNums.reduce((a, b) => a + Math.abs(b), 0) / coordNums.length;
+        colRoles.push(avgAbs > 60 ? "lon" : "lat");
+        continue;
+      }
+      if (maxCols >= 2 && sample.length && sample.every(v => /^\d{1,4}$/.test(v))) {
+        colRoles.push("numero");
+        continue;
+      }
+      if (!colRoles.includes("codigo")) {
+        colRoles.push("codigo");
+      } else {
+        colRoles.push("obs");
+      }
+    }
+    return { rows: normRows, hasHeader, colRoles };
+  }
+
+  async function resolvePendingPointsInBackground(feats) {
+    const resolvedIndices = [];
+    for (const f of feats) {
+      if (f.get("syncStatus") !== "loading") continue;
+      const code = getPointCode(f);
+      try {
+        const hit = await resolveCodeInGnat(code, true);
+        if (f.get("syncStatus") === "cancelled") continue;
+        if (hit?.lonlat) {
+          const proj = map.getView().getProjection();
+          f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(hit.lonlat, proj)));
+          f.set("codigo", hit.code);
+          if (hit.isOpeningDevice) f.set("tipo", "APERTURA");
+          f.set("syncStatus", "ok");
+          const idx = state.points.indexOf(f);
+          if (idx >= 0) resolvedIndices.push(idx);
+        } else {
+          f.set("syncStatus", "not_found");
+        }
+      } catch (_) {
+        if (f.get("syncStatus") === "loading") f.set("syncStatus", "not_found");
+      }
+      ensureVectorLayer();
+      renderTable();
+      rebuildOverlayLayers();
+    }
+    markDirty();
+    if (resolvedIndices.length) fitPoints(resolvedIndices);
+    const stillMissing = feats.filter(f => f.get("syncStatus") === "not_found").length;
+    showToast(stillMissing
+      ? `Carga finalizada: ${resolvedIndices.length} ubicados · ${stillMissing} no encontrados en GNAT.`
+      : `✓ ${resolvedIndices.length} código(s) ubicados en GNAT.`);
+  }
+
   function openPasteCodesModal() {
     modalBackdrop.replaceChildren();
     modalBackdrop.classList.remove("hidden");
     const card = el("div", "modal-card", null, modalBackdrop);
+    card.style.width = "min(640px, 95vw)";
     const head = el("div", "modal-head", null, card);
-    el("h2", "", "Buscar o importar códigos / tabla en GNAT", head);
+    el("h2", "", "Importar códigos o tabla desde Excel", head);
     const bClose = el("button", "btn-outline", "×", head);
     bClose.onclick = closeModal;
 
     const body = el("div", "modal-body", null, card);
-    el("div", "", "Pega códigos de postes/aperturas (con o sin 'F') o filas desde Excel con coordenadas / links de Google Maps:", body).style.fontSize = "12px";
+    el("div", "", "Pega una lista de códigos o copia/pega filas directo desde Excel (con o sin coordenadas):", body).style.fontSize = "12px";
     const ta = el("textarea", "", null, body);
-    ta.style.cssText = "width:100%;height:150px;border:1px solid var(--border);border-radius:8px;padding:10px;font:12px monospace;";
-    ta.placeholder = "FAG1674\nFAG1665\nFAG1666\nFAG1671\nFAG1667";
+    ta.style.cssText = "width:100%;height:110px;border:1px solid var(--border);border-radius:8px;padding:8px;font:12px monospace;";
+    ta.placeholder = "N°\tCOD POSTE\tLatitud\tLongitud\n55\tFBP0407\t-37,9159\t-72,9496";
 
-    const zoneRow = el("div", "inline-input-row", null, body);
-    el("span", "", "Asignar a:", zoneRow).style.fontWeight = "600";
-    const selTargetZone = el("select", "", null, zoneRow);
-    selTargetZone.style.cssText = "flex:1;padding:6px;border:1px solid var(--border);border-radius:6px;";
+    const optRow = el("div", "inline-input-row", null, body);
+    optRow.style.justifyContent = "space-between";
+    const hdrLbl = el("label", "", null, optRow);
+    hdrLbl.style.cssText = "display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;";
+    const chkHeader = el("input", "", null, hdrLbl);
+    chkHeader.type = "checkbox";
+    el("span", "", "Primera fila es encabezado", hdrLbl);
+
+    const zoneWrap = el("div", "", null, optRow);
+    zoneWrap.style.cssText = "display:flex;align-items:center;gap:6px;";
+    el("span", "", "Zona:", zoneWrap).style.cssText = "font-size:12px;font-weight:600;";
+    const selTargetZone = el("select", "", null, zoneWrap);
+    selTargetZone.style.cssText = "padding:4px 6px;border:1px solid var(--border);border-radius:6px;font-size:12px;";
+    const optNoZ = el("option", "", "— Sin zona —", selTargetZone);
+    optNoZ.value = "";
     for (const z of state.zones.values()) {
       const o = el("option", "", `${z.id} · ${z.name}`, selTargetZone);
       o.value = z.id;
     }
     selTargetZone.value = "T";
 
-    const resultArea = el("div", "", null, body);
+    const previewTitle = el("div", "", "Vista previa de columnas (puedes cambiar cualquier etiqueta):", body);
+    previewTitle.style.cssText = "font-size:11px;font-weight:700;color:#475569;display:none;";
+    const previewWrap = el("div", "preview-wrap hidden", null, body);
+
+    let parsedState = { rows: [], hasHeader: false, colRoles: [] };
+    let headerTouchedByUser = false;
+
+    const ROLE_OPTIONS = [
+      ["codigo", "Código GNAT"],
+      ["numero", "N°"],
+      ["lat", "Latitud"],
+      ["lon", "Longitud"],
+      ["codigoTerreno", "Cód. terreno"],
+      ["obs", "Observación"],
+      ["estado", "Estado"],
+      ["ignorar", "Ignorar"]
+    ];
+
+    const renderPreview = () => {
+      const parsed = parseSmartTableText(ta.value);
+      if (!parsed.rows.length) {
+        previewTitle.style.display = "none";
+        previewWrap.classList.add("hidden");
+        parsedState = parsed;
+        return;
+      }
+      if (!headerTouchedByUser) chkHeader.checked = parsed.hasHeader;
+      parsed.hasHeader = chkHeader.checked;
+      parsedState = parsed;
+
+      previewTitle.style.display = "";
+      previewWrap.classList.remove("hidden");
+      previewWrap.replaceChildren();
+
+      const tbl = el("table", "preview-table", null, previewWrap);
+      const th = el("thead", "", null, tbl);
+      const trh = el("tr", "", null, th);
+      parsed.colRoles.forEach((role, ci) => {
+        const cell = el("th", "", null, trh);
+        const sel = el("select", "", null, cell);
+        for (const [val, txt] of ROLE_OPTIONS) {
+          const o = el("option", "", txt, sel);
+          o.value = val;
+        }
+        sel.value = role;
+        sel.onchange = () => { parsedState.colRoles[ci] = sel.value; };
+      });
+      const tb = el("tbody", "", null, tbl);
+      const sampleRows = (parsed.hasHeader ? parsed.rows.slice(1) : parsed.rows).slice(0, 4);
+      for (const r of sampleRows) {
+        const tr = el("tr", "", null, tb);
+        for (const val of r) el("td", "", val, tr);
+      }
+    };
+
+    ta.addEventListener("input", () => { headerTouchedByUser = false; renderPreview(); });
+    chkHeader.addEventListener("change", () => { headerTouchedByUser = true; renderPreview(); });
 
     const footer = el("div", "", null, body);
     footer.style.cssText = "display:flex;justify-content:flex-end;gap:8px;";
-    const bCancel = el("button", "btn-outline", "Cerrar", footer);
+    const bCancel = el("button", "btn-outline", "Cancelar", footer);
     bCancel.onclick = closeModal;
-    const bRun = el("button", "btn-primary", "🔍 Resolver en GNAT y agregar al mapa", footer);
-    bRun.onclick = async () => {
-      const rawLines = ta.value.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-      if (!rawLines.length) return;
-      bRun.disabled = true;
-      state.selected.clear();
+    const bRun = el("button", "btn-primary", "⚡ Agregar a tabla y ubicar", footer);
+    bRun.onclick = () => {
+      if (!parsedState.rows.length) return;
+      const dataRows = parsedState.hasHeader ? parsedState.rows.slice(1) : parsedState.rows;
+      const roles = parsedState.colRoles;
       const targetZ = selTargetZone.value;
-      const missing = [];
-      const addedIndices = [];
+      const toResolveBg = [];
+      const placedIndices = [];
 
-      for (const line of rawLines) {
-        const inlineLonLat = extractLatLonFromLine(line);
-        const tokens = line.split(/[\t,;| ]+/).map(s => s.trim()).filter(Boolean);
-        const firstToken = tokens[0] || "";
+      for (const row of dataRows) {
+        let numero = null, codigo = "", codigoTerreno = "", lat = null, lon = null, obsText = "", stName = "";
+        row.forEach((cell, ci) => {
+          const role = roles[ci];
+          const val = String(cell || "").trim();
+          if (!val || role === "ignorar") return;
+          if (role === "numero") {
+            const n = Number(val.replace(/[^\d]/g, ""));
+            if (n > 0) numero = n;
+          } else if (role === "codigo") {
+            // Separar paréntesis tipo "F696214 (CT 696517)" -> codigo=F696214, codigoTerreno=CT 696517
+            const pm = /^([^()]+?)\s*\(([^()]+)\)\s*$/.exec(val);
+            if (pm) {
+              codigo = pm[1].trim();
+              if (!codigoTerreno) codigoTerreno = pm[2].trim();
+            } else {
+              codigo = val;
+            }
+          } else if (role === "codigoTerreno") {
+            codigoTerreno = val;
+          } else if (role === "lat") {
+            const n = Number(val.replace(",", "."));
+            if (Number.isFinite(n)) lat = n;
+          } else if (role === "lon") {
+            const n = Number(val.replace(",", "."));
+            if (Number.isFinite(n)) lon = n;
+          } else if (role === "obs") {
+            obsText = obsText ? `${obsText} · ${val}` : val;
+          } else if (role === "estado") {
+            stName = val;
+          }
+        });
 
-        if (inlineLonLat) {
-          const feat = upsertPointOnMap({
-            codigo: firstToken,
-            lonlat: inlineLonLat,
-            tipo: "PUNTO",
-            bloqueId: targetZ,
-            bloques: [targetZ]
-          });
-          const idx = state.points.indexOf(feat);
-          state.selected.add(idx);
-          addedIndices.push(idx);
-          continue;
+        if (!codigo && !codigoTerreno) continue;
+        // Normalizar si lat/lon vinieran invertidos para Chile
+        let lonlat = null;
+        if (lat !== null && lon !== null) {
+          if (Math.abs(lat) > 60 && Math.abs(lon) <= 60) lonlat = [lat, lon];
+          else lonlat = [lon, lat];
+        } else {
+          lonlat = extractLatLonFromLine(row.join(" "));
         }
 
-        // Si son códigos separados en la línea
-        for (const tok of tokens) {
-          const existingIdx = state.points.findIndex(f => getPointCode(f).toUpperCase() === tok.toUpperCase() || getPointCode(f).toUpperCase() === "F" + tok.toUpperCase());
-          if (existingIdx >= 0) {
-            assignZoneToIndices([existingIdx], targetZ, true);
-            state.selected.add(existingIdx);
-            addedIndices.push(existingIdx);
-            continue;
-          }
-          bRun.textContent = `⏳ Buscando ${tok} en GNAT...`;
-          const hit = await resolveCodeInGnat(tok, true);
-          if (hit?.lonlat) {
-            const feat = upsertPointOnMap({
-              codigo: hit.code,
-              lonlat: hit.lonlat,
-              tipo: hit.isOpeningDevice ? "APERTURA" : "PUNTO",
-              bloqueId: targetZ,
-              bloques: [targetZ]
-            });
-            const idx = state.points.indexOf(feat);
-            state.selected.add(idx);
-            addedIndices.push(idx);
-          } else {
-            missing.push(tok);
-          }
+        let estadoEjec = "pendiente";
+        if (stName) {
+          const matchSt = [...state.statuses.values()].find(s => s.name.toLowerCase() === stName.toLowerCase());
+          if (matchSt) estadoEjec = matchSt.id;
         }
+        const obsArr = obsText ? [{ text: obsText, at: new Date().toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" }) }] : [];
+
+        const feat = upsertPointOnMap({
+          codigo: codigo || codigoTerreno,
+          codigoTerreno,
+          numero,
+          lonlat,
+          tipo: "PUNTO",
+          bloqueId: targetZ,
+          bloques: targetZ ? [targetZ] : [],
+          estadoEjec,
+          observaciones: obsArr,
+          syncStatus: lonlat ? "ok" : "loading"
+        });
+        const idx = state.points.indexOf(feat);
+        if (lonlat && idx >= 0) placedIndices.push(idx);
+        else if (!lonlat) toResolveBg.push(feat);
       }
 
-      bRun.disabled = false;
-      bRun.textContent = "🔍 Resolver en GNAT y agregar al mapa";
+      closeModal();
       ensureVectorLayer();
       markDirty();
       refreshAll();
-      if (addedIndices.length) fitPoints(addedIndices);
-
-      if (!missing.length) {
-        closeModal();
-        showToast(`${addedIndices.length} código(s) resueltos y seleccionados en el mapa.`);
+      if (placedIndices.length) fitPoints(placedIndices);
+      if (toResolveBg.length) {
+        showToast(`${placedIndices.length + toResolveBg.length} filas agregadas · ubicando ${toResolveBg.length} en GNAT en segundo plano...`);
+        resolvePendingPointsInBackground(toResolveBg);
       } else {
-        resultArea.replaceChildren();
-        const box = el("div", "", null, resultArea);
-        box.style.cssText = "background:#FEF3C7;border:1px solid #F59E0B;border-radius:8px;padding:10px;font-size:12px;display:flex;flex-direction:column;gap:8px;";
-        el("div", "", `✓ ${addedIndices.length} resueltos en GNAT · ⚠️ ${missing.length} no encontrados: ${missing.join(", ")}`, box);
-        const bPlace = el("button", "btn-primary", `📍 Ubicar los ${missing.length} faltantes haciendo clic en el mapa`, box);
-        bPlace.onclick = () => {
-          closeModal();
-          startPlaceMissingCodesQueue(missing);
-        };
+        showToast(`✓ ${placedIndices.length} punto(s) agregados directo al mapa.`);
       }
     };
   }
