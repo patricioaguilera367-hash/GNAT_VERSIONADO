@@ -176,7 +176,7 @@
     ]),
     filterSups: new Set(),  // empty = all
     lastSearchMissing: [],  // códigos pegados en el buscador que no están en la tabla
-    syncQueue: { running: false, paused: false, cancelled: false, total: 0, done: 0, items: [] }
+    syncQueue: { running: false, paused: false, cancelled: false, total: 0, done: 0, items: [] },
     showIntermediosInTable: false,
     selectedIntermedios: new Set(),
     // Opciones de visualización en mapa
