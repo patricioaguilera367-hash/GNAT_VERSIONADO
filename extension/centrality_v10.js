@@ -104,7 +104,33 @@
     "Sin asignar": "default"
   };
 
+  const PROTECTION_TYPES = [
+    { id: "", label: "— Ninguna —", short: "", level: "" },
+    { id: "DF_XS", label: "Desconectador Fusible XS (S/E MT)", short: "DF XS", level: "MT" },
+    { id: "DDFF", label: "Desconectador Fusible Línea (DDFF)", short: "DDFF", level: "MT" },
+    { id: "DBC", label: "Desconectador Bajo Carga (DBC)", short: "DBC", level: "MT" },
+    { id: "DC", label: "Desconectador Cuchilla (DC / DDCC)", short: "DC", level: "MT" },
+    { id: "RC", label: "Reconectador (RC)", short: "RC", level: "MT" },
+    { id: "SECC", label: "Seccionador / Pole Top (MT)", short: "Secc", level: "MT" },
+    { id: "INT_MT", label: "Interruptor MT", short: "Int MT", level: "MT" },
+    { id: "FUS_BT", label: "Fusible / Apertura BT", short: "Ap BT", level: "BT" },
+    { id: "SECC_BT", label: "Seccionador BT", short: "Secc BT", level: "BT" }
+  ];
+  const EPT_TYPES = ["", "EPT MT", "EPT BT", "EPT BT y MT"];
   const EQUIPMENT_TYPES = ["", "DF", "DBC", "DC", "Pole Top", "Reconectador", "Seccionador", "EPT BT y MT", "EPT MT", "EPT BT"];
+  function mapProtectionFromText(txt) {
+    const s = String(txt || "").toLowerCase();
+    if (!s) return "";
+    if (/reconectador|\brc\b/.test(s)) return "RC";
+    if (/bajo carga|\bdbc\b/.test(s)) return "DBC";
+    if (/cuchill|\bddcc\b|\bdc\b/.test(s)) return "DC";
+    if (/pole\s*top|seccionador/.test(s)) return /bt|baja/.test(s) ? "SECC_BT" : "SECC";
+    if (/interruptor/.test(s)) return "INT_MT";
+    if (/bt|baja tensi/.test(s)) return "FUS_BT";
+    if (/xs|subestaci|ssee|trafo/.test(s)) return "DF_XS";
+    if (/fusible|desconectador|\bddff\b|\bdf\b/.test(s)) return "DDFF";
+    return "";
+  }
   const OPENING_COLOR = "#DC2626";
   const UNASSIGNED_ZONE_COLOR = "#475569";
   const UMBRAL_ETIQUETA = 25;
@@ -138,7 +164,7 @@
     collapsed: false,
     // Filtros dinámicos combinables
     search: "",
-    filterType: "all",      // "all" | "PUNTO" | "APERTURA"
+    filterTypes: new Set(), // combinable: "PUNTO", "APERTURA", "REMATE" (vacío = todos)
     filterZones: new Set(), // legacy
     hiddenZones: new Set(), // visibilidad por exclusión (vacío = todas visibles; "__NONE__" = sin zona)
     hiddenStatuses: new Set(),
@@ -150,6 +176,7 @@
     ]),
     filterSups: new Set(),  // empty = all
     lastSearchMissing: [],  // códigos pegados en el buscador que no están en la tabla
+    syncQueue: { running: false, paused: false, cancelled: false, total: 0, done: 0, items: [] }
     showIntermediosInTable: false,
     selectedIntermedios: new Set(),
     // Opciones de visualización en mapa
@@ -450,6 +477,10 @@
         sseeCode: f.get("sseeCode") || "",
         codigoTerreno: String(f.get("codigoTerreno") || ""),
         estadoEjec: String(f.get("estadoEjec") || "pendiente"),
+        proteccionTipo: String(f.get("proteccionTipo") || ""),
+        eptTipo: String(f.get("eptTipo") || ""),
+        gnatMeta: f.get("gnatMeta") || null,
+        syncNote: String(f.get("syncNote") || ""),
         observaciones: Array.isArray(f.get("observaciones")) ? f.get("observaciones") : [],
         colorPersonalizado: String(f.get("colorPersonalizado") || "")
       };
@@ -1154,6 +1185,45 @@
       background: #fff; border: 1px solid #E2E8F0; border-radius: 5px; padding: 5px 7px; font-size: 11px;
     }
     .obs-date { font-size: 10px; color: #64748B; font-weight: 600; margin-bottom: 2px; }
+    .sync-queue-bar {
+      display: flex; align-items: center; justify-content: space-between; gap: 6px;
+      padding: 5px 10px; background: #EFF6FF; border-bottom: 1px solid #BFDBFE;
+      font-size: 11px; color: #1E40AF;
+    }
+    .sync-queue-bar button {
+      padding: 2px 7px; font-size: 10px; border-radius: 5px;
+      border: 1px solid #93C5FD; background: #fff; color: #1E40AF; cursor: pointer; font-weight: 600;
+    }
+    .sync-queue-bar button:hover { background: #DBEAFE; }
+    .meta-card {
+      background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px;
+      padding: 8px 10px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .meta-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      font-size: 11px; font-weight: 700; color: #334155;
+    }
+    .meta-grid {
+      display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px;
+    }
+    .meta-kv {
+      background: #fff; border: 1px solid #E2E8F0; border-radius: 6px; padding: 5px 7px;
+    }
+    .meta-k { font-size: 10px; color: #64748B; text-transform: uppercase; letter-spacing: 0.02em; }
+    .meta-v { font-size: 12px; font-weight: 600; color: #0F172A; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .meta-alert {
+      font-size: 11px; color: #B45309; background: #FFFBEB; border: 1px solid #FDE68A;
+      border-radius: 6px; padding: 5px 8px; display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    }
+    .prot-badge {
+      display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 5px;
+      border-radius: 4px; margin-left: 4px; background: #FEF2F2; color: #B91C1C; border: 1px solid #FECACA;
+    }
+    .prot-badge.bt { background: #FEF3C7; color: #92400E; border-color: #FDE68A; }
+    .sel-mini-pill {
+      display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 5px;
+      border-radius: 99px; background: #DBEAFE; color: #1D4ED8; margin-left: 4px;
+    }
     .inter-badge {
       display: inline-block;
       font-size: 10px;
@@ -1473,6 +1543,7 @@
 
   const searchMissingNote = el("div", "search-missing-note hidden", null, drawerHead);
   const filterChips = el("div", "filter-chips", null, drawerHead);
+  const syncQueueBar = el("div", "sync-queue-bar hidden", null, drawer);
   const tableWrap = el("div", "table-wrap", null, drawer);
   tableWrap.tabIndex = 0;
   const table = el("table", "", null, tableWrap);
@@ -1593,10 +1664,14 @@
     };
 
     const out = state.points.filter(f => {
-      if (state.filterType === "REMATE") {
-        if (!f.get("esRemate")) return false;
-      } else if (state.filterType !== "all" && (f.get("tipo") || "PUNTO") !== state.filterType) {
-        return false;
+      if (state.filterTypes.size > 0) {
+        const isAp = (f.get("tipo") || "PUNTO") === "APERTURA";
+        const isRem = Boolean(f.get("esRemate"));
+        const isPoste = !isAp && !isRem;
+        const ok = (state.filterTypes.has("APERTURA") && isAp)
+          || (state.filterTypes.has("REMATE") && isRem)
+          || (state.filterTypes.has("PUNTO") && (isPoste || isRem));
+        if (!ok) return false;
       }
       // Visibilidad de Zonas (por exclusión: todas visibles salvo las que están en hiddenZones)
       if (state.hiddenZones.size > 0) {
@@ -2022,7 +2097,7 @@
   // =========================================================================
   // 9. ALGORITMO INTERACTIVO DE RED MT: TRAMOS A->B, APERTURAS Y REMATES
   // =========================================================================
-  function upsertPointOnMap({ codigo, codigoTerreno = "", numero = null, lonlat = null, tipo = "PUNTO", bloqueId = "D", bloques = ["D"], tipoEquipo = "", rolPT = "", accionPT = "", esRemate = false, esIntermedio = false, sseeCode = "", estadoEjec = "pendiente", observaciones = null, syncStatus = "ok" }) {
+  function upsertPointOnMap({ codigo, codigoTerreno = "", numero = null, lonlat = null, tipo = "PUNTO", bloqueId = "D", bloques = ["D"], tipoEquipo = "", proteccionTipo = "", eptTipo = "", rolPT = "", accionPT = "", esRemate = false, esIntermedio = false, sseeCode = "", estadoEjec = "pendiente", observaciones = null, syncStatus = "ok", syncNote = "", gnatMeta = null }) {
     const cleanCode = String(codigo || "").trim().toUpperCase();
     const cleanTer = String(codigoTerreno || "").trim().toUpperCase();
     const proj = map.getView().getProjection();
@@ -2049,6 +2124,11 @@
       if (tipoEquipo && !existing.get("tipoEquipo")) existing.set("tipoEquipo", tipoEquipo);
       if (esRemate) { existing.set("esRemate", true); existing.set("esIntermedio", false); }
       if (sseeCode && !existing.get("sseeCode")) existing.set("sseeCode", sseeCode);
+      const effProt = proteccionTipo || mapProtectionFromText(tipoEquipo) || (sseeCode ? "DF_XS" : "");
+      if (effProt && !existing.get("proteccionTipo")) existing.set("proteccionTipo", effProt);
+      if (eptTipo && !existing.get("eptTipo")) existing.set("eptTipo", eptTipo);
+      if (gnatMeta) existing.set("gnatMeta", gnatMeta);
+      if (syncNote !== undefined && syncNote !== "") existing.set("syncNote", syncNote);
       if (estadoEjec && estadoEjec !== "pendiente") existing.set("estadoEjec", estadoEjec);
       if (Array.isArray(observaciones) && observaciones.length) {
         const curObs = Array.isArray(existing.get("observaciones")) ? existing.get("observaciones") : [];
@@ -2083,9 +2163,13 @@
       esRemate,
       esIntermedio,
       sseeCode,
+      proteccionTipo: proteccionTipo || mapProtectionFromText(tipoEquipo) || (sseeCode ? "DF_XS" : ""),
+      eptTipo: eptTipo || (/ept/i.test(tipoEquipo || "") ? tipoEquipo : ""),
+      gnatMeta: gnatMeta || null,
+      syncNote: syncNote || "",
       estadoEjec: estadoEjec || "pendiente",
       observaciones: Array.isArray(observaciones) ? observaciones : [],
-      syncStatus: hasCoords ? "ok" : syncStatus
+      syncStatus: syncStatus || (hasCoords ? "ok" : "loading")
     });
     state.points.push(feat);
     return feat;
@@ -2097,7 +2181,7 @@
     let seedFeats = [...state.selected].map(i => state.points[i]).filter(f => f && f.getGeometry());
     const nonApSel = seedFeats.filter(f => f.get("tipo") !== "APERTURA");
     if (nonApSel.length) seedFeats = nonApSel;
-    const hasFilter = state.filterType !== "all" || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || Boolean(state.search.trim());
+    const hasFilter = state.filterTypes.size > 0 || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || Boolean(state.search.trim());
     if (!seedFeats.length && hasFilter) {
       seedFeats = getFilteredPoints().filter(f => f.getGeometry() && f.get("tipo") !== "APERTURA");
     }
@@ -2537,31 +2621,26 @@
       return c;
     };
 
-    const hasAnyFilter = state.filterType !== "all" || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || state.filterSups.size > 0;
+    const toggleTypeChip = (t) => {
+      if (state.filterTypes.has(t)) state.filterTypes.delete(t);
+      else state.filterTypes.add(t);
+      refreshAll();
+    };
+    const hasAnyFilter = state.filterTypes.size > 0 || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || state.filterSups.size > 0;
     makeChip("Todos", !hasAnyFilter, () => {
-      state.filterType = "all";
+      state.filterTypes.clear();
       state.hiddenZones.clear();
       state.hiddenStatuses.clear();
       state.filterSups.clear();
       refreshAll();
     });
 
-    makeChip("Postes", state.filterType === "PUNTO", () => {
-      state.filterType = state.filterType === "PUNTO" ? "all" : "PUNTO";
-      refreshAll();
-    });
-
-    makeChip("Aperturas ✕", state.filterType === "APERTURA", () => {
-      state.filterType = state.filterType === "APERTURA" ? "all" : "APERTURA";
-      refreshAll();
-    }, OPENING_COLOR);
+    makeChip("Postes", state.filterTypes.has("PUNTO"), () => toggleTypeChip("PUNTO"));
+    makeChip("Aperturas ✕", state.filterTypes.has("APERTURA"), () => toggleTypeChip("APERTURA"), OPENING_COLOR);
 
     const remateCount = state.points.filter(f => f.get("esRemate")).length;
-    if (remateCount > 0 || state.filterType === "REMATE") {
-      makeChip(`▲ Remates (${remateCount})`, state.filterType === "REMATE", () => {
-        state.filterType = state.filterType === "REMATE" ? "all" : "REMATE";
-        refreshAll();
-      }, "#7C3AED", "Filtrar solo remates aguas abajo detectados");
+    if (remateCount > 0 || state.filterTypes.has("REMATE")) {
+      makeChip(`▲ Remates (${remateCount})`, state.filterTypes.has("REMATE"), () => toggleTypeChip("REMATE"), "#7C3AED", "Combinable con otros filtros");
     }
 
     if (Array.isArray(state.graphNodes) && state.graphNodes.length > 0) {
@@ -2609,7 +2688,7 @@
       searchMissingNote.classList.add("hidden");
     }
     // Actualizar etiqueta dinámica de Analizar Red MT para dejar claro su alcance
-    const hasFilter = state.filterType !== "all" || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || Boolean(state.search.trim());
+    const hasFilter = state.filterTypes.size > 0 || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || Boolean(state.search.trim());
     if (state.selected.size > 0) {
       btnAnalyzeMt.textContent = `⚡ Analizar MT (${state.selected.size} sel.)`;
     } else if (hasFilter && visible.length > 0) {
@@ -2647,7 +2726,10 @@
 
     const thN = el("th", "", "Rol/N°", trh);
     thN.style.width = "48px";
-    el("th", "", "Código", trh);
+    const thCode = el("th", "", "Código", trh);
+    if (state.selected.size > 0) {
+      el("span", "sel-mini-pill", `${state.selected.size} sel.`, thCode);
+    }
     const thZ = el("th", "", "D / T / F", trh);
     thZ.style.width = "88px";
     if (multiSup) {
@@ -2698,10 +2780,10 @@
         sp.className = "sync-spin";
         sp.title = "Buscando en GNAT...";
         tdCode.appendChild(sp);
-      } else if (syncSt === "not_found") {
+      } else if (syncSt === "not_found" || syncSt === "mismatch") {
         const nf = doc.createElement("span");
         nf.textContent = "⚠️ ";
-        nf.title = "No encontrado en GNAT (doble clic o clic derecho para ubicar)";
+        nf.title = f.get("syncNote") || "Inconsistencia o no encontrado en GNAT (abrir Detalles para revisar)";
         tdCode.appendChild(nf);
       } else if (stObj) {
         const sd = doc.createElement("span");
@@ -2736,12 +2818,28 @@
         tdCode.appendChild(ob);
       }
 
-      const eqType = String(f.get("tipoEquipo") || "").trim();
-      if (eqType) {
+      const protObj = PROTECTION_TYPES.find(p => p.id && p.id === f.get("proteccionTipo"));
+      if (protObj) {
+        const pb = doc.createElement("span");
+        pb.className = "prot-badge" + (protObj.level === "BT" ? " bt" : "");
+        pb.textContent = protObj.short;
+        pb.title = protObj.label;
+        tdCode.appendChild(pb);
+      }
+      const eptTxt = String(f.get("eptTipo") || "").trim();
+      if (eptTxt) {
         const eq = doc.createElement("span");
         eq.className = "eq-badge";
-        eq.textContent = eqType;
+        eq.textContent = eptTxt;
         tdCode.appendChild(eq);
+      } else {
+        const eqType = String(f.get("tipoEquipo") || "").trim();
+        if (eqType && !protObj) {
+          const eq = doc.createElement("span");
+          eq.className = "eq-badge";
+          eq.textContent = eqType;
+          tdCode.appendChild(eq);
+        }
       }
       if (f.get("esRemate")) {
         const rb = doc.createElement("span");
@@ -3254,6 +3352,13 @@
       const bFit = el("button", "pop-item", "🔍 Encuadrar selección en mapa", pop);
       bFit.onclick = () => { closePopover(); fitPoints([...state.selected]); };
 
+      const bSyncSel = el("button", "pop-item", "🔄 Sincronizar seleccionados con GNAT", pop);
+      bSyncSel.onclick = () => {
+        closePopover();
+        const feats = [...state.selected].map(i => state.points[i]).filter(Boolean);
+        enqueueGnatMetadataSync(feats, true);
+      };
+
       const bColor = el("button", "pop-item", "🎨 Cambiar color individual ▾", pop);
       bColor.onclick = () => openColorPickerPopover(bColor, "#00C853", (c) => assignCustomColorToIndices([...state.selected], c), true);
 
@@ -3286,6 +3391,9 @@
 
       const bSt = el("button", "pop-item", "🚦 Cambiar estado ▾", pop);
       bSt.onclick = () => openAssignStatusPopover(bSt);
+
+      const bSyncOne = el("button", "pop-item", "🔄 Sincronizar / verificar en GNAT", pop);
+      bSyncOne.onclick = () => { closePopover(); enqueueGnatMetadataSync([f], true); };
 
       const bToggleType = el("button", "pop-item", f.get("tipo") === "APERTURA" ? "🔄 Convertir en Poste normal" : "✕ Marcar como Apertura (✕)", pop);
       bToggleType.onclick = () => {
@@ -3973,8 +4081,12 @@
         sseeCode: r.sseeCode || "",
         codigoTerreno: String(r.codigoTerreno || ""),
         estadoEjec: String(r.estadoEjec || "pendiente"),
+        proteccionTipo: String(r.proteccionTipo || mapProtectionFromText(r.tipoEquipo) || (r.sseeCode ? "DF_XS" : "")),
+        eptTipo: String(r.eptTipo || (/ept/i.test(r.tipoEquipo || "") ? r.tipoEquipo : "")),
+        gnatMeta: r.gnatMeta || null,
+        syncNote: String(r.syncNote || ""),
         observaciones: Array.isArray(r.observaciones) ? r.observaciones : [],
-        syncStatus: "ok",
+        syncStatus: r.syncNote ? "mismatch" : "ok",
         colorPersonalizado: String(r.colorPersonalizado || "")
       });
     });
@@ -4417,13 +4529,81 @@
     modalBackdrop.replaceChildren();
     modalBackdrop.classList.remove("hidden");
     const card = el("div", "modal-card", null, modalBackdrop);
-    card.style.width = "min(520px, 94vw)";
+    card.style.width = "min(560px, 95vw)";
     const head = el("div", "modal-head", null, card);
     el("h2", "", `Detalles · ${getPointCode(f)}`, head);
     const bClose = el("button", "btn-outline", "×", head);
     bClose.onclick = closeModal;
 
     const body = el("div", "modal-body", null, card);
+
+    // 1. Ficha ordenada de Metadata GNAT
+    const metaCard = el("div", "meta-card", null, body);
+    const renderMetaCard = () => {
+      metaCard.replaceChildren();
+      const gm = f.get("gnatMeta") || {};
+      const st = f.get("syncStatus") || "ok";
+      const note = String(f.get("syncNote") || "");
+      const mHead = el("div", "meta-head", null, metaCard);
+      const badgeTxt = st === "loading" ? "⏳ Sincronizando con GNAT..."
+        : st === "mismatch" ? "⚠️ Inconsistencia detectada"
+        : st === "not_found" ? "⚠️ No encontrado en GNAT"
+        : gm.syncedAt ? `✓ Metadata GNAT (${gm.syncedAt})`
+        : "Metadata GNAT (pendiente)";
+      const lbl = el("span", "", badgeTxt, mHead);
+      lbl.style.color = (st === "mismatch" || st === "not_found") ? "#B45309" : gm.syncedAt ? "#15803D" : "#475569";
+
+      const bVerify = el("button", "btn-outline", "🔄 Verificar en GNAT", mHead);
+      bVerify.style.cssText = "padding:2px 8px;font-size:11px;";
+      bVerify.onclick = async () => {
+        bVerify.disabled = true;
+        await syncSinglePointWithGnat(f, true);
+        bVerify.disabled = false;
+        renderMetaCard();
+        if (f.get("sseeCode") && !inpSsee.value.trim()) inpSsee.value = String(f.get("sseeCode")).replace(/^SSEE\s+/i, "");
+        if (f.get("proteccionTipo") && !selProt.value) selProt.value = f.get("proteccionTipo");
+      };
+
+      const mGrid = el("div", "meta-grid", null, metaCard);
+      const kv = (k, v) => {
+        const box = el("div", "meta-kv", null, mGrid);
+        el("div", "meta-k", k, box);
+        const val = el("div", "meta-v", v || "—", box);
+        val.title = String(v || "—");
+      };
+      const curLL = f.getGeometry() ? ol.proj.toLonLat(f.getGeometry().getCoordinates(), map.getView().getProjection()) : null;
+      kv("S/E GNAT", gm.sseeCode || f.get("sseeCode") || "—");
+      kv("COCI 3F", gm.coci3f != null ? `${gm.coci3f} kA` : "—");
+      kv("Equipo GNAT", gm.deviceDisplay || gm.display || "—");
+      kv("Poste GNAT", gm.poleCode || "—");
+      kv("Dist. Excel↔GNAT", gm.distMeters != null ? `${Math.round(gm.distMeters)} m` : "—");
+      kv("Coordenadas", curLL ? `${curLL[1].toFixed(5)}, ${curLL[0].toFixed(5)}` : "Sin ubicar");
+
+      if (note) {
+        const alertBox = el("div", "meta-alert", null, metaCard);
+        el("span", "", note, alertBox);
+        if (Array.isArray(gm.gnatLonLat) && gm.gnatLonLat.length === 2) {
+          const bSnap = el("button", "btn-outline", "Usar coord. GNAT", alertBox);
+          bSnap.style.cssText = "padding:2px 7px;font-size:10px;white-space:nowrap;";
+          bSnap.onclick = () => {
+            const proj = map.getView().getProjection();
+            f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(gm.gnatLonLat, proj)));
+            gm.distMeters = 0;
+            f.set("gnatMeta", gm);
+            f.set("syncNote", "");
+            f.set("syncStatus", "ok");
+            ensureVectorLayer();
+            markDirty();
+            refreshAll();
+            renderMetaCard();
+            showToast("Coordenada ajustada al poste real en GNAT.");
+          };
+        }
+      }
+    };
+    renderMetaCard();
+
+    // 2. Identificación y Operación (Protección separada de EPT + S/E + Terreno)
     const grid = el("div", "form-grid", null, body);
 
     el("label", "", "N° / Rol PT:", grid);
@@ -4438,9 +4618,14 @@
     inpRol.placeholder = "Rol opcional (ej. T1, F1)";
     inpRol.value = String(f.get("rolPT") || "");
 
-    el("label", "", "Código GNAT:", grid);
+    el("label", "", "Código Poste (GNAT):", grid);
     const inpCode = el("input", "", null, grid);
     inpCode.value = getPointCode(f);
+
+    el("label", "", "Cód. Subestación (S/E):", grid);
+    const inpSsee = el("input", "", null, grid);
+    inpSsee.placeholder = "Ej. F75219 (asume DF XS al sincronizar)";
+    inpSsee.value = String(f.get("sseeCode") || "").replace(/^SSEE\s+/i, "");
 
     el("label", "", "Código en terreno:", grid);
     const inpTer = el("input", "", null, grid);
@@ -4462,20 +4647,27 @@
     });
     selKind.value = f.get("tipo") || "PUNTO";
 
-    el("label", "", "Equipo / EPT:", grid);
-    const selEq = el("select", "", null, grid);
-    EQUIPMENT_TYPES.forEach(t => {
-      const o = el("option", "", t || "— Ninguno —", selEq); o.value = t;
+    el("label", "", "Protección / Apertura:", grid);
+    const selProt = el("select", "", null, grid);
+    PROTECTION_TYPES.forEach(p => {
+      const o = el("option", "", p.label, selProt); o.value = p.id;
     });
-    selEq.value = String(f.get("tipoEquipo") || "");
+    selProt.value = String(f.get("proteccionTipo") || "");
+
+    el("label", "", "Puesta a Tierra (EPT):", grid);
+    const selEpt = el("select", "", null, grid);
+    EPT_TYPES.forEach(t => {
+      const o = el("option", "", t || "— Ninguna —", selEpt); o.value = t;
+    });
+    selEpt.value = String(f.get("eptTipo") || "");
 
     el("label", "", "Acción a ejecutar:", grid);
     const inpAccion = el("input", "", null, grid);
     inpAccion.value = String(f.get("accionPT") || "");
 
-    // Bitácora de observaciones con fecha y hora automática
-    const obsTitle = el("div", "", "Observaciones (registro automático de fecha y hora):", body);
-    obsTitle.style.cssText = "font-size:12px;font-weight:700;color:#334155;margin-top:4px;";
+    // 3. Bitácora de observaciones con fecha y hora automática
+    const obsTitle = el("div", "", "Observaciones (fecha y hora automática):", body);
+    obsTitle.style.cssText = "font-size:12px;font-weight:700;color:#334155;margin-top:2px;";
     const obsList = el("div", "obs-list", null, body);
     const localObs = Array.isArray(f.get("observaciones")) ? f.get("observaciones").map(x => ({ ...x })) : [];
     const renderObs = () => {
@@ -4514,19 +4706,29 @@
     const bSave = el("button", "btn-primary", "Guardar", footer);
     bSave.onclick = () => {
       pushObs();
+      const prevProt = String(f.get("proteccionTipo") || "");
+      const prevSsee = String(f.get("sseeCode") || "");
       if (Number(inpNum.value) > 0) f.set("numero", Number(inpNum.value));
       f.set("rolPT", inpRol.value.trim());
       f.set("codigo", inpCode.value.trim() || "Sin código");
+      const sseeClean = inpSsee.value.trim().toUpperCase();
+      f.set("sseeCode", sseeClean ? `SSEE ${sseeClean}` : "");
       f.set("codigoTerreno", inpTer.value.trim().toUpperCase());
       f.set("estadoEjec", selSt.value);
       f.set("tipo", selKind.value);
-      f.set("tipoEquipo", selEq.value);
+      const chosenProt = selProt.value || (sseeClean ? "DF_XS" : "");
+      f.set("proteccionTipo", chosenProt);
+      f.set("eptTipo", selEpt.value);
+      f.set("tipoEquipo", selEpt.value || (PROTECTION_TYPES.find(p => p.id === chosenProt)?.short || ""));
       f.set("accionPT", inpAccion.value.trim());
       f.set("observaciones", localObs);
       styleCache = new WeakMap();
       markDirty();
       refreshAll();
       closeModal();
+      if ((chosenProt && chosenProt !== prevProt) || (sseeClean && `SSEE ${sseeClean}` !== prevSsee)) {
+        enqueueGnatMetadataSync([f], true);
+      }
     };
   }
 
@@ -4583,6 +4785,7 @@
       if (/^n[°ºo]?$|num/i.test(h)) { colRoles.push("numero"); continue; }
       if (/lat/i.test(h)) { colRoles.push("lat"); continue; }
       if (/lon/i.test(h)) { colRoles.push("lon"); continue; }
+      if (/s\/?e\b|ssee|subestaci|\bsed\b|trafo/i.test(h)) { colRoles.push("sseeCode"); continue; }
       if (/terreno|\bct\b/i.test(h)) { colRoles.push("codigoTerreno"); continue; }
       if (/estado/i.test(h)) { colRoles.push("estado"); continue; }
       if (/obs|nota/i.test(h)) { colRoles.push("obs"); continue; }
@@ -4608,38 +4811,197 @@
     return { rows: normRows, hasHeader, colRoles };
   }
 
-  async function resolvePendingPointsInBackground(feats) {
-    const resolvedIndices = [];
-    for (const f of feats) {
-      if (f.get("syncStatus") !== "loading") continue;
-      const code = getPointCode(f);
-      try {
-        const hit = await resolveCodeInGnat(code, true);
-        if (f.get("syncStatus") === "cancelled") continue;
-        if (hit?.lonlat) {
-          const proj = map.getView().getProjection();
-          f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(hit.lonlat, proj)));
-          f.set("codigo", hit.code);
-          if (hit.isOpeningDevice) f.set("tipo", "APERTURA");
-          f.set("syncStatus", "ok");
-          const idx = state.points.indexOf(f);
-          if (idx >= 0) resolvedIndices.push(idx);
+  function renderSyncQueueBar() {
+    const q = state.syncQueue;
+    if (!q.running && !q.paused) {
+      syncQueueBar.classList.add("hidden");
+      return;
+    }
+    syncQueueBar.classList.remove("hidden");
+    syncQueueBar.replaceChildren();
+    const statusTxt = q.paused
+      ? `⏸ Sincronización pausada (${q.done}/${q.total})`
+      : `⏳ Sincronizando metadata GNAT (${q.done}/${q.total})`;
+    el("span", "", statusTxt, syncQueueBar).style.fontWeight = "600";
+    const btns = el("div", "", null, syncQueueBar);
+    btns.style.cssText = "display:flex;gap:4px;";
+    const bPause = el("button", "", q.paused ? "▶ Reanudar" : "⏸ Pausar", btns);
+    bPause.onclick = () => {
+      q.paused = !q.paused;
+      renderSyncQueueBar();
+      if (!q.paused && !q.running) drainGnatSyncQueue();
+    };
+    const bCancel = el("button", "", "× Cancelar", btns);
+    bCancel.onclick = () => {
+      q.cancelled = true;
+      q.paused = false;
+      q.running = false;
+      for (const f of q.items) {
+        if (f.get("syncStatus") === "loading") f.set("syncStatus", "cancelled");
+      }
+      q.items = [];
+      renderSyncQueueBar();
+      renderTable();
+    };
+  }
+
+  async function syncSinglePointWithGnat(f, force = false) {
+    if (!f) return;
+    if (!force && f.get("syncStatus") === "cancelled") return;
+    const prevStatus = f.get("syncStatus");
+    f.set("syncStatus", "loading");
+    renderTable();
+
+    const proj = map.getView().getProjection();
+    const code = getPointCode(f);
+    const sseeRaw = String(f.get("sseeCode") || "").replace(/^SSEE\s+/i, "").trim().toUpperCase();
+    const hasExistingGeom = Boolean(f.getGeometry());
+    const existingLL = hasExistingGeom ? ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj) : null;
+    const notes = [];
+
+    try {
+      const hitPole = (code && code !== "Sin código") ? await resolveCodeInGnat(code, true) : null;
+      const hitSsee = (sseeRaw && sseeRaw !== code) ? await resolveCodeInGnat(sseeRaw, true) : null;
+      if (f.get("syncStatus") === "cancelled") return;
+
+      const primaryHit = hitPole || hitSsee;
+      if (!primaryHit?.lonlat) {
+        if (existingLL) {
+          const nb = await inspectPoleNeighborhoodInGnat(code, existingLL, [], true);
+          const nearPole = nb.detectedPoleCode || "";
+          const nearSsee = nb.sseeList[0] || "";
+          const nearDev = nb.devices[0] || null;
+          if (nearPole && code && nearPole !== code.toUpperCase()) {
+            notes.push(`En esa coord. GNAT muestra poste ${nearPole} (no ${code}) — verificar.`);
+          } else if (!nearPole && !nearSsee) {
+            notes.push(`Código ${code || sseeRaw} no encontrado en GNAT.`);
+          }
+          if (nearSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${nearSsee}`);
+          if (nearSsee && !f.get("proteccionTipo")) f.set("proteccionTipo", "DF_XS");
+          if (nearDev && !f.get("proteccionTipo")) f.set("proteccionTipo", mapProtectionFromText(nearDev.type || nearDev.display));
+          f.set("gnatMeta", {
+            poleCode: nearPole,
+            sseeCode: nearSsee ? `SSEE ${nearSsee}` : "",
+            coci3f: nb.coci3f,
+            deviceDisplay: nearDev ? `${nearDev.type}${nearDev.realState ? " · " + nearDev.realState : ""}` : "",
+            syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
+          });
+          f.set("syncNote", notes.join(" "));
+          f.set("syncStatus", notes.length ? "mismatch" : "ok");
         } else {
+          f.set("syncNote", `Código ${code || sseeRaw} no encontrado en GNAT.`);
           f.set("syncStatus", "not_found");
         }
-      } catch (_) {
-        if (f.get("syncStatus") === "loading") f.set("syncStatus", "not_found");
+        return;
       }
+
+      if (hitPole?.lonlat && hitSsee?.lonlat) {
+        const dBoth = haversineMeters(hitPole.lonlat, hitSsee.lonlat);
+        if (dBoth > 40) {
+          notes.push(`Poste ${code} y S/E ${sseeRaw} están a ${Math.round(dBoth)} m en GNAT — verificar.`);
+        }
+      }
+
+      let distMeters = null;
+      if (existingLL) {
+        distMeters = haversineMeters(existingLL, primaryHit.lonlat);
+        if (distMeters > 40) {
+          notes.push(`GNAT ubica ${primaryHit.code} a ${Math.round(distMeters)} m de tu coord. — verificar.`);
+        }
+      } else {
+        f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(primaryHit.lonlat, proj)));
+        distMeters = 0;
+      }
+
+      const probeLL = (distMeters !== null && distMeters <= 40) ? primaryHit.lonlat : (existingLL || primaryHit.lonlat);
+      const nb = await inspectPoleNeighborhoodInGnat(primaryHit.code, probeLL, primaryHit.extraCoords || [], true);
+      if (f.get("syncStatus") === "cancelled") return;
+
+      const foundSsee = nb.sseeList[0] || sseeRaw || "";
+      const foundDev = nb.devices[0] || primaryHit.devices?.[0] || null;
+      if (foundSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${foundSsee}`);
+
+      const detectedProt = foundDev
+        ? mapProtectionFromText(`${foundDev.type || ""} ${foundDev.display || ""}`)
+        : (foundSsee ? "DF_XS" : "");
+
+      const userProt = String(f.get("proteccionTipo") || "");
+      if (!userProt && detectedProt) {
+        f.set("proteccionTipo", detectedProt);
+        if (["RC", "DBC", "DC", "DDFF", "SECC", "INT_MT"].includes(detectedProt) && !foundSsee) {
+          f.set("tipo", "APERTURA");
+        }
+      } else if (userProt && !detectedProt && userProt !== "DF_XS" && !userProt.endsWith("_BT")) {
+        notes.push(`Declaraste ${PROTECTION_TYPES.find(p => p.id === userProt)?.short || userProt}, pero GNAT no reporta equipo de apertura en este punto — verificar.`);
+      }
+
+      f.set("gnatMeta", {
+        poleCode: nb.detectedPoleCode || primaryHit.code,
+        display: primaryHit.display || primaryHit.code,
+        sseeCode: foundSsee ? `SSEE ${foundSsee}` : "",
+        coci3f: nb.coci3f,
+        deviceDisplay: foundDev ? `${foundDev.type || foundDev.display}${foundDev.realState ? " · " + foundDev.realState : ""}` : (foundSsee ? "Desconectador Fusible XS (S/E)" : ""),
+        gnatLonLat: primaryHit.lonlat,
+        distMeters,
+        syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
+      });
+      f.set("syncNote", notes.join(" "));
+      f.set("syncStatus", notes.length ? "mismatch" : "ok");
+    } catch (_) {
+      if (f.get("syncStatus") === "loading") f.set("syncStatus", prevStatus === "ok" ? "ok" : "not_found");
+    }
+  }
+
+  async function drainGnatSyncQueue() {
+    const q = state.syncQueue;
+    if (q.running || q.paused) return;
+    q.running = true;
+    q.cancelled = false;
+    renderSyncQueueBar();
+
+    while (q.items.length > 0 && !q.paused && !q.cancelled) {
+      const f = q.items.shift();
+      if (!f || f.get("syncStatus") === "cancelled") {
+        q.done++;
+        renderSyncQueueBar();
+        continue;
+      }
+      await syncSinglePointWithGnat(f, false);
+      q.done++;
       ensureVectorLayer();
+      renderSyncQueueBar();
       renderTable();
       rebuildOverlayLayers();
     }
-    markDirty();
-    if (resolvedIndices.length) fitPoints(resolvedIndices);
-    const stillMissing = feats.filter(f => f.get("syncStatus") === "not_found").length;
-    showToast(stillMissing
-      ? `Carga finalizada: ${resolvedIndices.length} ubicados · ${stillMissing} no encontrados en GNAT.`
-      : `✓ ${resolvedIndices.length} código(s) ubicados en GNAT.`);
+
+    q.running = false;
+    if (q.items.length === 0) {
+      q.paused = false;
+      markDirty();
+    }
+    renderSyncQueueBar();
+  }
+
+  function enqueueGnatMetadataSync(feats, force = false) {
+    const list = (feats || []).filter(Boolean);
+    if (!list.length) return;
+    const q = state.syncQueue;
+    for (const f of list) {
+      if (force) f.set("syncStatus", "loading");
+      else if (f.get("syncStatus") !== "cancelled") f.set("syncStatus", "loading");
+      if (!q.items.includes(f)) {
+        q.items.push(f);
+        q.total++;
+      }
+    }
+    if (!q.running && !q.paused) {
+      q.done = 0;
+      q.total = q.items.length;
+      drainGnatSyncQueue();
+    } else {
+      renderSyncQueueBar();
+      renderTable();
+    }
   }
 
   function openPasteCodesModal() {
@@ -4687,7 +5049,8 @@
     let headerTouchedByUser = false;
 
     const ROLE_OPTIONS = [
-      ["codigo", "Código GNAT"],
+      ["codigo", "Código Poste (GNAT)"],
+      ["sseeCode", "Cód. S/E"],
       ["numero", "N°"],
       ["lat", "Latitud"],
       ["lon", "Longitud"],
@@ -4751,7 +5114,7 @@
       const placedIndices = [];
 
       for (const row of dataRows) {
-        let numero = null, codigo = "", codigoTerreno = "", lat = null, lon = null, obsText = "", stName = "";
+        let numero = null, codigo = "", sseeCode = "", codigoTerreno = "", lat = null, lon = null, obsText = "", stName = "";
         row.forEach((cell, ci) => {
           const role = roles[ci];
           const val = String(cell || "").trim();
@@ -4760,7 +5123,6 @@
             const n = Number(val.replace(/[^\d]/g, ""));
             if (n > 0) numero = n;
           } else if (role === "codigo") {
-            // Separar paréntesis tipo "F696214 (CT 696517)" -> codigo=F696214, codigoTerreno=CT 696517
             const pm = /^([^()]+?)\s*\(([^()]+)\)\s*$/.exec(val);
             if (pm) {
               codigo = pm[1].trim();
@@ -4768,6 +5130,8 @@
             } else {
               codigo = val;
             }
+          } else if (role === "sseeCode") {
+            sseeCode = val.replace(/^SSEE\s+/i, "").trim().toUpperCase();
           } else if (role === "codigoTerreno") {
             codigoTerreno = val;
           } else if (role === "lat") {
@@ -4783,7 +5147,7 @@
           }
         });
 
-        if (!codigo && !codigoTerreno) continue;
+        if (!codigo && !sseeCode && !codigoTerreno) continue;
         // Normalizar si lat/lon vinieran invertidos para Chile
         let lonlat = null;
         if (lat !== null && lon !== null) {
@@ -4801,8 +5165,10 @@
         const obsArr = obsText ? [{ text: obsText, at: new Date().toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" }) }] : [];
 
         const feat = upsertPointOnMap({
-          codigo: codigo || codigoTerreno,
+          codigo: codigo || sseeCode || codigoTerreno,
           codigoTerreno,
+          sseeCode: sseeCode ? `SSEE ${sseeCode}` : "",
+          proteccionTipo: sseeCode ? "DF_XS" : "",
           numero,
           lonlat,
           tipo: "PUNTO",
@@ -4810,11 +5176,11 @@
           bloques: targetZ ? [targetZ] : [],
           estadoEjec,
           observaciones: obsArr,
-          syncStatus: lonlat ? "ok" : "loading"
+          syncStatus: "loading"
         });
         const idx = state.points.indexOf(feat);
         if (lonlat && idx >= 0) placedIndices.push(idx);
-        else if (!lonlat) toResolveBg.push(feat);
+        toResolveBg.push(feat);
       }
 
       closeModal();
@@ -4823,10 +5189,8 @@
       refreshAll();
       if (placedIndices.length) fitPoints(placedIndices);
       if (toResolveBg.length) {
-        showToast(`${placedIndices.length + toResolveBg.length} filas agregadas · ubicando ${toResolveBg.length} en GNAT en segundo plano...`);
-        resolvePendingPointsInBackground(toResolveBg);
-      } else {
-        showToast(`✓ ${placedIndices.length} punto(s) agregados directo al mapa.`);
+        showToast(`${toResolveBg.length} fila(s) cargadas · sincronizando metadata GNAT en segundo plano...`);
+        enqueueGnatMetadataSync(toResolveBg, true);
       }
     };
   }
