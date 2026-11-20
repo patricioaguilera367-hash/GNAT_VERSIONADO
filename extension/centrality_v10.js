@@ -1039,7 +1039,7 @@
       flex-direction: column;
       overflow: hidden;
     }
-    .drawer.hidden { display: none; }
+    .drawer.hidden { display: none !important; }
     .drawer-head {
       padding: 10px;
       border-bottom: 1px solid var(--border);
@@ -1187,12 +1187,12 @@
     .obs-date { font-size: 10px; color: #64748B; font-weight: 600; margin-bottom: 2px; }
     .sync-queue-bar {
       display: flex; align-items: center; justify-content: space-between; gap: 6px;
-      padding: 5px 10px; background: #EFF6FF; border-bottom: 1px solid #BFDBFE;
-      font-size: 11px; color: #1E40AF;
+      padding: 4px 10px; background: #EFF6FF; border-bottom: 1px solid #BFDBFE;
+      font-size: 11px; color: #1E40AF; min-height: 28px;
     }
     .sync-queue-bar button {
-      padding: 2px 7px; font-size: 10px; border-radius: 5px;
-      border: 1px solid #93C5FD; background: #fff; color: #1E40AF; cursor: pointer; font-weight: 600;
+      width: 24px; height: 22px; padding: 0; justify-content: center; font-size: 12px; border-radius: 5px;
+      border: 1px solid #93C5FD; background: #fff; color: #1E40AF; cursor: pointer; font-weight: 700;
     }
     .sync-queue-bar button:hover { background: #DBEAFE; }
     .meta-card {
@@ -3025,18 +3025,6 @@
     ctxBar.classList.remove("hidden");
     el("span", "", `${state.selected.size} sel.`, ctxBar).style.fontWeight = "700";
 
-    const btnD = el("button", "", "→ D", ctxBar);
-    btnD.title = "Asignar a Zona Desconectada (D)";
-    btnD.onclick = () => assignZoneToIndices([...state.selected], "D");
-
-    const btnT = el("button", "", "→ T", ctxBar);
-    btnT.title = "Asignar a Zona de Trabajo (T)";
-    btnT.onclick = () => assignZoneToIndices([...state.selected], "T");
-
-    const btnF = el("button", "", "→ F", ctxBar);
-    btnF.title = "Asignar a Punto de Faenas (F)";
-    btnF.onclick = () => assignZoneToIndices([...state.selected], "F");
-
     const btnZone = el("button", "ctx-accent", "Zonas ▾", ctxBar);
     btnZone.onclick = (ev) => openAssignZonePopover(ev.currentTarget);
 
@@ -4820,18 +4808,20 @@
     syncQueueBar.classList.remove("hidden");
     syncQueueBar.replaceChildren();
     const statusTxt = q.paused
-      ? `⏸ Sincronización pausada (${q.done}/${q.total})`
-      : `⏳ Sincronizando metadata GNAT (${q.done}/${q.total})`;
+      ? `GNAT en pausa · ${q.done}/${q.total}`
+      : `⏳ GNAT · ${q.done}/${q.total}`;
     el("span", "", statusTxt, syncQueueBar).style.fontWeight = "600";
     const btns = el("div", "", null, syncQueueBar);
-    btns.style.cssText = "display:flex;gap:4px;";
-    const bPause = el("button", "", q.paused ? "▶ Reanudar" : "⏸ Pausar", btns);
+    btns.style.cssText = "display:flex;gap:4px;flex-shrink:0;";
+    const bPause = el("button", "", q.paused ? "▶" : "⏸", btns);
+    bPause.title = q.paused ? "Reanudar sincronización" : "Pausar sincronización";
     bPause.onclick = () => {
       q.paused = !q.paused;
       renderSyncQueueBar();
       if (!q.paused && !q.running) drainGnatSyncQueue();
     };
-    const bCancel = el("button", "", "× Cancelar", btns);
+    const bCancel = el("button", "", "×", btns);
+    bCancel.title = "Cancelar sincronización";
     bCancel.onclick = () => {
       q.cancelled = true;
       q.paused = false;
@@ -4850,89 +4840,128 @@
     if (!force && f.get("syncStatus") === "cancelled") return;
     const prevStatus = f.get("syncStatus");
     f.set("syncStatus", "loading");
-    renderTable();
 
     const proj = map.getView().getProjection();
-    const code = getPointCode(f);
+    const code = getPointCode(f).toUpperCase();
     const sseeRaw = String(f.get("sseeCode") || "").replace(/^SSEE\s+/i, "").trim().toUpperCase();
     const hasExistingGeom = Boolean(f.getGeometry());
     const existingLL = hasExistingGeom ? ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj) : null;
     const notes = [];
 
     try {
-      const hitPole = (code && code !== "Sin código") ? await resolveCodeInGnat(code, true) : null;
+      // RUTA RÁPIDA (1 solo request ~0.5s): si el punto YA tiene coordenadas, consultar directo ese punto en GNAT
+      if (existingLL) {
+        const nb = await inspectPoleNeighborhoodInGnat(code, existingLL, [], true);
+        if (f.get("syncStatus") === "cancelled") return;
+
+        const nearPole = (nb.detectedPoleCode || "").toUpperCase();
+        const nearSsee = (nb.sseeList[0] || "").toUpperCase();
+        const foundDev = nb.devices[0] || null;
+        const codeMatchesHere = Boolean(
+          (nearPole && code && (nearPole === code || nearPole === "F" + code || code === "F" + nearPole)) ||
+          (nearSsee && (nearSsee === code || nearSsee === sseeRaw)) ||
+          (foundDev && foundDev.code && foundDev.code.toUpperCase() === code)
+        );
+
+        let gnatLonLat = existingLL;
+        let distMeters = 0;
+
+        let snappedToGnat = false;
+        let finalNb = nb;
+        // Si en esa coordenada NO coincidió exacto el código (ej. Excel con 3-4 decimales / GPS corrido), buscar el poste exacto en GNAT
+        if (!codeMatchesHere && code && code !== "SIN CÓDIGO") {
+          const hit = await resolveCodeInGnat(code, true);
+          if (f.get("syncStatus") === "cancelled") return;
+          if (hit?.lonlat) {
+            gnatLonLat = hit.lonlat;
+            distMeters = haversineMeters(existingLL, hit.lonlat);
+            if (distMeters <= 150) {
+              // Dentro de radio razonable (<= 150m): ajustar pin a la coordenada exacta de GNAT (precisión completa)
+              f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(hit.lonlat, proj)));
+              snappedToGnat = true;
+              finalNb = await inspectPoleNeighborhoodInGnat(hit.code, hit.lonlat, hit.extraCoords || [], true);
+            } else {
+              // Lejos (> 150m, otro sector): NO mover el pin y marcar inconsistencia
+              notes.push(`GNAT ubica ${hit.code} a ${Math.round(distMeters)} m de tu coord.${nearPole ? ` (aquí figura ${nearPole})` : ""} — verificar.`);
+            }
+          } else if (nearPole) {
+            notes.push(`En esta coord. GNAT muestra ${nearPole} (tu tabla dice ${code}) — verificar.`);
+          } else {
+            notes.push(`Código ${code} no encontrado en GNAT.`);
+          }
+        } else if (codeMatchesHere && code && code !== "SIN CÓDIGO") {
+          // Si ya coincidió cerca, intentar precisión exacta del poste sin redondear si está en caché o disponible
+          const cached = await dbGetGnatCache(code);
+          if (cached?.lonlat && haversineMeters(existingLL, cached.lonlat) <= 150) {
+            f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(cached.lonlat, proj)));
+            gnatLonLat = cached.lonlat;
+            snappedToGnat = true;
+          }
+        }
+        const effNearPole = (finalNb.detectedPoleCode || "").toUpperCase();
+        const effNearSsee = (finalNb.sseeList[0] || "").toUpperCase();
+        const effFoundDev = finalNb.devices[0] || null;
+
+        const effSsee = effNearSsee || sseeRaw || "";
+        if (effSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${effSsee}`);
+        const detectedProt = effFoundDev
+          ? mapProtectionFromText(`${effFoundDev.type || ""} ${effFoundDev.display || ""}`)
+          : (effSsee ? "DF_XS" : "");
+
+        const userProt = String(f.get("proteccionTipo") || "");
+        if (!userProt && detectedProt) {
+          f.set("proteccionTipo", detectedProt);
+          if (["RC", "DBC", "DC", "DDFF", "SECC", "INT_MT"].includes(detectedProt) && !effSsee) {
+            f.set("tipo", "APERTURA");
+          }
+        } else if (userProt && !detectedProt && userProt !== "DF_XS" && !userProt.endsWith("_BT")) {
+          notes.push(`Declaraste ${PROTECTION_TYPES.find(p => p.id === userProt)?.short || userProt}, pero GNAT no reporta equipo de apertura en este punto — verificar.`);
+        }
+
+        f.set("gnatMeta", {
+          poleCode: effNearPole || code,
+          sseeCode: effSsee ? `SSEE ${effSsee}` : "",
+          coci3f: finalNb.coci3f,
+          deviceDisplay: effFoundDev ? `${effFoundDev.type || effFoundDev.display}${effFoundDev.realState ? " · " + effFoundDev.realState : ""}` : (effSsee ? "Desconectador Fusible XS (S/E)" : ""),
+          gnatLonLat,
+          distMeters: snappedToGnat ? 0 : distMeters,
+          syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
+        });
+        f.set("syncNote", notes.join(" "));
+        f.set("syncStatus", notes.length ? "mismatch" : "ok");
+        return snappedToGnat;
+      }
+
+      // RUTA SIN COORDENADAS: buscar código (o S/E) en GNAT para ubicar el pin
+      const hitPole = (code && code !== "SIN CÓDIGO") ? await resolveCodeInGnat(code, true) : null;
       const hitSsee = (sseeRaw && sseeRaw !== code) ? await resolveCodeInGnat(sseeRaw, true) : null;
       if (f.get("syncStatus") === "cancelled") return;
 
       const primaryHit = hitPole || hitSsee;
       if (!primaryHit?.lonlat) {
-        if (existingLL) {
-          const nb = await inspectPoleNeighborhoodInGnat(code, existingLL, [], true);
-          const nearPole = nb.detectedPoleCode || "";
-          const nearSsee = nb.sseeList[0] || "";
-          const nearDev = nb.devices[0] || null;
-          if (nearPole && code && nearPole !== code.toUpperCase()) {
-            notes.push(`En esa coord. GNAT muestra poste ${nearPole} (no ${code}) — verificar.`);
-          } else if (!nearPole && !nearSsee) {
-            notes.push(`Código ${code || sseeRaw} no encontrado en GNAT.`);
-          }
-          if (nearSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${nearSsee}`);
-          if (nearSsee && !f.get("proteccionTipo")) f.set("proteccionTipo", "DF_XS");
-          if (nearDev && !f.get("proteccionTipo")) f.set("proteccionTipo", mapProtectionFromText(nearDev.type || nearDev.display));
-          f.set("gnatMeta", {
-            poleCode: nearPole,
-            sseeCode: nearSsee ? `SSEE ${nearSsee}` : "",
-            coci3f: nb.coci3f,
-            deviceDisplay: nearDev ? `${nearDev.type}${nearDev.realState ? " · " + nearDev.realState : ""}` : "",
-            syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
-          });
-          f.set("syncNote", notes.join(" "));
-          f.set("syncStatus", notes.length ? "mismatch" : "ok");
-        } else {
-          f.set("syncNote", `Código ${code || sseeRaw} no encontrado en GNAT.`);
-          f.set("syncStatus", "not_found");
-        }
+        f.set("syncNote", `Código ${code || sseeRaw} no encontrado en GNAT.`);
+        f.set("syncStatus", "not_found");
         return;
       }
 
       if (hitPole?.lonlat && hitSsee?.lonlat) {
         const dBoth = haversineMeters(hitPole.lonlat, hitSsee.lonlat);
-        if (dBoth > 40) {
-          notes.push(`Poste ${code} y S/E ${sseeRaw} están a ${Math.round(dBoth)} m en GNAT — verificar.`);
-        }
+        if (dBoth > 40) notes.push(`Poste ${code} y S/E ${sseeRaw} están a ${Math.round(dBoth)} m en GNAT — verificar.`);
       }
 
-      let distMeters = null;
-      if (existingLL) {
-        distMeters = haversineMeters(existingLL, primaryHit.lonlat);
-        if (distMeters > 40) {
-          notes.push(`GNAT ubica ${primaryHit.code} a ${Math.round(distMeters)} m de tu coord. — verificar.`);
-        }
-      } else {
-        f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(primaryHit.lonlat, proj)));
-        distMeters = 0;
-      }
-
-      const probeLL = (distMeters !== null && distMeters <= 40) ? primaryHit.lonlat : (existingLL || primaryHit.lonlat);
-      const nb = await inspectPoleNeighborhoodInGnat(primaryHit.code, probeLL, primaryHit.extraCoords || [], true);
+      f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(primaryHit.lonlat, proj)));
+      const nb = await inspectPoleNeighborhoodInGnat(primaryHit.code, primaryHit.lonlat, primaryHit.extraCoords || [], true);
       if (f.get("syncStatus") === "cancelled") return;
 
       const foundSsee = nb.sseeList[0] || sseeRaw || "";
       const foundDev = nb.devices[0] || primaryHit.devices?.[0] || null;
       if (foundSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${foundSsee}`);
-
       const detectedProt = foundDev
         ? mapProtectionFromText(`${foundDev.type || ""} ${foundDev.display || ""}`)
         : (foundSsee ? "DF_XS" : "");
-
-      const userProt = String(f.get("proteccionTipo") || "");
-      if (!userProt && detectedProt) {
+      if (!f.get("proteccionTipo") && detectedProt) {
         f.set("proteccionTipo", detectedProt);
-        if (["RC", "DBC", "DC", "DDFF", "SECC", "INT_MT"].includes(detectedProt) && !foundSsee) {
-          f.set("tipo", "APERTURA");
-        }
-      } else if (userProt && !detectedProt && userProt !== "DF_XS" && !userProt.endsWith("_BT")) {
-        notes.push(`Declaraste ${PROTECTION_TYPES.find(p => p.id === userProt)?.short || userProt}, pero GNAT no reporta equipo de apertura en este punto — verificar.`);
+        if (["RC", "DBC", "DC", "DDFF", "SECC", "INT_MT"].includes(detectedProt) && !foundSsee) f.set("tipo", "APERTURA");
       }
 
       f.set("gnatMeta", {
@@ -4942,7 +4971,7 @@
         coci3f: nb.coci3f,
         deviceDisplay: foundDev ? `${foundDev.type || foundDev.display}${foundDev.realState ? " · " + foundDev.realState : ""}` : (foundSsee ? "Desconectador Fusible XS (S/E)" : ""),
         gnatLonLat: primaryHit.lonlat,
-        distMeters,
+        distMeters: 0,
         syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
       });
       f.set("syncNote", notes.join(" "));
@@ -4959,6 +4988,7 @@
     q.cancelled = false;
     renderSyncQueueBar();
 
+    const touchedZones = new Set();
     while (q.items.length > 0 && !q.paused && !q.cancelled) {
       const f = q.items.shift();
       if (!f || f.get("syncStatus") === "cancelled") {
@@ -4966,7 +4996,8 @@
         renderSyncQueueBar();
         continue;
       }
-      await syncSinglePointWithGnat(f, false);
+      const moved = await syncSinglePointWithGnat(f, false);
+      if (moved) getPointZoneIds(f).forEach(z => touchedZones.add(z));
       q.done++;
       ensureVectorLayer();
       renderSyncQueueBar();
@@ -4974,9 +5005,18 @@
       rebuildOverlayLayers();
     }
 
+    // Reajustar automáticamente los polígonos de las zonas cuyos puntos se movieron a su poste exacto en GNAT
+    for (const zid of touchedZones) {
+      const z = state.zones.get(zid);
+      if (z && Array.isArray(z.customRing) && z.customRing.length >= 3) {
+        generateZonePolygonFromPoints(zid);
+      }
+    }
+
     q.running = false;
     if (q.items.length === 0) {
       q.paused = false;
+      rebuildOverlayLayers();
       markDirty();
     }
     renderSyncQueueBar();
