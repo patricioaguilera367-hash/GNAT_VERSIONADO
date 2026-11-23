@@ -597,9 +597,9 @@
 
   async function resolveCodeInGnat(rawCode, useCache = true, preferOpening = false, opts = {}) {
     const queries = buildCandidateSearchQueries(rawCode);
+    const prefProt = String(opts?.preferredProt || "").toUpperCase();
+    const nearLL = Array.isArray(opts?.nearLonLat) && opts.nearLonLat.length === 2 ? opts.nearLonLat : null;
     for (const q of queries) {
-      const prefProt = String(opts?.preferredProt || "").toUpperCase();
-      const nearLL = Array.isArray(opts?.nearLonLat) && opts.nearLonLat.length === 2 ? opts.nearLonLat : null;
       if (useCache && !nearLL && !opts?.returnAllDevices) {
         const cacheKey = preferOpening ? `OP:${prefProt || "ANY"}:${q}` : q;
         const cached = await dbGetGnatCache(cacheKey);
@@ -4475,9 +4475,10 @@
         if (!f.get("proteccionTipo")) f.set("proteccionTipo", "DF_XS");
       }
 
-      const detectedProt = foundSsee
-        ? "DF_XS"
-        : (foundDev ? mapProtectionFromText(`${foundDev.type || ""} ${foundDev.display || ""}`) : "");
+      const hitProt = primaryHit.protId || (primaryHit.isOpeningDevice ? mapProtectionFromText(primaryHit.display || "") : "");
+      const detectedProt = hitProt
+        || (foundDev ? mapProtectionFromText(`${foundDev.type || ""} ${foundDev.display || ""}`) : "")
+        || (foundSsee ? "DF_XS" : "");
 
       const userProt = String(f.get("proteccionTipo") || "");
       if (!userProt && detectedProt) {
@@ -4485,7 +4486,7 @@
         if (["RC", "DBC", "DC", "DDFF", "SECC", "INT_MT"].includes(detectedProt) && !foundSsee) {
           f.set("tipo", "APERTURA");
         }
-      } else if (userProt && !detectedProt && userProt !== "DF_XS" && !userProt.endsWith("_BT")) {
+      } else if (userProt && !detectedProt && !primaryHit.isOpeningDevice && userProt !== "DF_XS" && !userProt.endsWith("_BT")) {
         notes.push(`Declaraste ${PROTECTION_TYPES.find(p => p.id === userProt)?.short || userProt}, pero GNAT no reporta equipo de apertura aquí — verificar.`);
       }
 
@@ -4502,8 +4503,12 @@
       f.set("syncNote", notes.join(" "));
       f.set("syncStatus", notes.length ? "mismatch" : "ok");
       return snappedToGnat;
-    } catch (_) {
-      if (f.get("syncStatus") === "loading") f.set("syncStatus", prevStatus === "ok" ? "ok" : "not_found");
+    } catch (err) {
+      console.warn("syncSinglePointWithGnat error:", err);
+      if (f.get("syncStatus") === "loading") {
+        f.set("syncNote", `Error al consultar GNAT: ${err?.message || "timeout"}`);
+        f.set("syncStatus", prevStatus === "ok" ? "ok" : "not_found");
+      }
       return snappedToGnat;
     }
   }
