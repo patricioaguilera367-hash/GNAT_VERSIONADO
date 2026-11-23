@@ -601,7 +601,7 @@
     const nearLL = Array.isArray(opts?.nearLonLat) && opts.nearLonLat.length === 2 ? opts.nearLonLat : null;
     for (const q of queries) {
       if (useCache && !nearLL && !opts?.returnAllDevices) {
-        const cacheKey = preferOpening ? `OP:${prefProt || "ANY"}:${q}` : q;
+        const cacheKey = opts?.preferSsee ? `SE:${q}` : preferOpening ? `OP:${prefProt || "ANY"}:${q}` : q;
         const cached = await dbGetGnatCache(cacheKey);
         if (cached && Array.isArray(cached.lonlat) && cached.lonlat.length === 2) {
           return cached;
@@ -716,6 +716,9 @@
             if (prefProt && mapProtectionFromText(d) === prefProt) return 6;
             return OPENING_DEVICE_REGEX.test(d) && !POLE_CLASS_REGEX.test(d) ? 4 : POLE_CLASS_REGEX.test(d) ? 2 : SSEE_CLASS_REGEX.test(d) ? 1 : 0;
           }
+          if (opts?.preferSsee) {
+            return SSEE_CLASS_REGEX.test(d) ? 5 : OPENING_DEVICE_REGEX.test(d) ? 2 : POLE_CLASS_REGEX.test(d) ? 1 : 0;
+          }
           return POLE_CLASS_REGEX.test(d) ? 3 : SSEE_CLASS_REGEX.test(d) ? 2 : OPENING_DEVICE_REGEX.test(d) ? 1 : 0;
         };
         return score(b.display || "") - score(a.display || "");
@@ -733,7 +736,7 @@
             const pt = extractPointFromGeoJsonFeature(feat);
             if (pt && Number.isFinite(pt[0]) && Number.isFinite(pt[1])) {
               const entry = {
-                code: preferOpening ? `OP:${prefProt || "ANY"}:${q}` : q,
+                code: opts?.preferSsee ? `SE:${q}` : preferOpening ? `OP:${prefProt || "ANY"}:${q}` : q,
                 rawCode: q,
                 lonlat: pt,
                 extraCoords: [],
@@ -4149,11 +4152,11 @@
 
     const paneProp = el("div", "", null, body);
     paneProp.style.cssText = "display:flex;flex-direction:column;gap:10px;";
-    const paneObs = el("div", "hidden", null, body);
-    paneObs.style.cssText = "display:flex;flex-direction:column;gap:8px;";
+    const paneObs = el("div", "", null, body);
+    paneObs.style.cssText = "display:none;flex-direction:column;gap:8px;";
 
-    tProp.onclick = () => { tProp.classList.add("active"); tObs.classList.remove("active"); paneProp.classList.remove("hidden"); paneObs.classList.add("hidden"); };
-    tObs.onclick = () => { tObs.classList.add("active"); tProp.classList.remove("active"); paneObs.classList.remove("hidden"); paneProp.classList.add("hidden"); };
+    tProp.onclick = () => { tProp.classList.add("active"); tObs.classList.remove("active"); paneProp.style.display = "flex"; paneObs.style.display = "none"; };
+    tObs.onclick = () => { tObs.classList.add("active"); tProp.classList.remove("active"); paneObs.style.display = "flex"; paneProp.style.display = "none"; };
 
     // 1. Metadata GNAT card inside Propiedades
     const metaCard = el("div", "meta-card", null, paneProp);
@@ -4436,7 +4439,7 @@
         : null;
       if (isApPoint && hitPole?.protId && !userProtPref) f.set("proteccionTipo", hitPole.protId);
       if (f.get("syncStatus") === "cancelled") return false;
-      const hitSsee = (sseeRaw && sseeRaw !== code) ? await resolveCodeInGnat(sseeRaw, true, false) : null;
+      const hitSsee = (sseeRaw && sseeRaw !== code) ? await resolveCodeInGnat(sseeRaw, true, false, { preferSsee: true }) : null;
       if (f.get("syncStatus") === "cancelled") return false;
 
       const primaryHit = hitPole || hitSsee;
@@ -4469,12 +4472,10 @@
         return false;
       }
 
-      // Validar consistencia Poste <-> S/E cuando ambos vienen declarados
+      let bothDistPending = null;
       if (hitPole?.lonlat && hitSsee?.lonlat) {
         const dBoth = haversineMeters(hitPole.lonlat, hitSsee.lonlat);
-        if (dBoth > 40) {
-          notes.push(`Poste ${code} y S/E ${sseeRaw} están a ${Math.round(dBoth)} m en GNAT — verificar.`);
-        }
+        if (dBoth > 40) bothDistPending = dBoth;
       }
 
       // Validar contra coordenada Excel: <= 150 m -> auto-snap exacto a GNAT; > 150 m -> inconsistencia sin mover el pin
@@ -4497,6 +4498,10 @@
       const nb = await inspectPoleNeighborhoodInGnat(primaryHit.code, probeLL, [], true);
       if (f.get("syncStatus") === "cancelled") return snappedToGnat;
 
+      const sseeConfirmedHere = sseeRaw && nb.sseeList.some(x => x.toUpperCase() === sseeRaw);
+      if (bothDistPending !== null && !sseeConfirmedHere) {
+        notes.push(`Poste ${code} y S/E ${sseeRaw} están a ${Math.round(bothDistPending)} m en GNAT — verificar.`);
+      }
       const foundSsee = (nb.sseeList[0] || sseeRaw || "").toUpperCase();
       const foundDev = nb.devices[0] || primaryHit.devices?.[0] || null;
       if (foundSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${foundSsee}`);
