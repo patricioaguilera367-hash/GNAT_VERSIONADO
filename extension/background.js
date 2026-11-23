@@ -41,7 +41,7 @@ chrome.action.onClicked.addListener(async (tab) => {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         world: "MAIN",
-        files: ["centrality_v10.js"]
+        files: ["src/icons.js", "src/tokens.js", "src/catalogs.js", "src/app.js"]
       });
       return;
     }
