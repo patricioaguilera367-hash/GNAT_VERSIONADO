@@ -51,7 +51,7 @@
   function mapProtectionFromText(txt) {
     const s = String(txt || "").toLowerCase();
     if (!s) return "";
-    if (/reconectador|\brc\b/.test(s)) return "RC";
+    if (/reconectador|\brec\b|\brc\b/.test(s)) return "RC";
     if (/bajo carga|\bdbc\b/.test(s)) return "DBC";
     if (/cuchill|\bddcc\b|\bdc\b/.test(s)) return "DC";
     if (/pole\s*top|seccionador/.test(s)) return /bt|baja/.test(s) ? "SECC_BT" : "SECC";

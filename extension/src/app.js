@@ -538,10 +538,10 @@
   const COCI_3F_REGEX = /<td>\s*(\d+(?:\.\d+)?)\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>/i;
   const REAL_STATE_REGEX = /<b>\s*Real:\s*<\/b>\s*([^<]+)/i;
   // Equipos de maniobra EN SERIE con línea MT (siempre cortan el grafo)
-  const LINE_OPENING_REGEX = /\b(reconectador|seccionador|seccional|cuchill[ao]|interruptor|pole\s*top|bajo\s+carga|sin\s+carga|desconectador\s+(?:bajo\s+carga|sin\s+carga|tripolar|monopolar|en\s+aire|de\s+l[ií]nea|a[eé]reo)|\bddcc\b|\bdbc\b|\bdc\b|\brc\d*\b)/i;
+  const LINE_OPENING_REGEX = /\b(reconectador|seccionador|seccional|cuchill[ao]|interruptor|pole\s*top|bajo\s+carga|sin\s+carga|desconectador\s+(?:bajo\s+carga|sin\s+carga|tripolar|monopolar|en\s+aire|de\s+l[ií]nea|a[eé]reo)|\bddcc\b|\bdbc\b|\bdc\b|\brec\b|\brc\d*\b)/i;
   // Fusibles (pueden ser de arranque MT o de protección de transformador/SSEE)
   const FUSE_DEVICE_REGEX = /\b(desconectador\s+fusible|fusible|\bddff\b|\bdf\b)\b/i;
-  const OPENING_DEVICE_REGEX = /\b(desconectador|fusible|seccionador|seccional|reconectador|cuchill[ao]|interruptor|pole\s*top|\bddff\b|\bddcc\b|\bdf\b|\bdbc\b|\bdc\b|\brc\d*\b)/i;
+  const OPENING_DEVICE_REGEX = /\b(desconectador|fusible|seccionador|seccional|reconectador|cuchill[ao]|interruptor|pole\s*top|\bddff\b|\bddcc\b|\bdf\b|\bdbc\b|\bdc\b|\brec\b|\brc\d*\b)/i;
   const SSEE_CLASS_REGEX = /\b(subestaci[oó]n|ssee|transformador|\bsed\b)\b/i;
   const SSEE_BRACKET_TAG = /\[\s*F?\d{4,}\s*\]/i;
   const POLE_CLASS_REGEX = /\b(poste|soporte|apoyo|retenci[oó]n|ensamblado|estructura|torre|c\.a\.)\b/i;
@@ -4201,6 +4201,37 @@
       kv("Dist. Excel↔GNAT", gm.distMeters != null ? `${Math.round(gm.distMeters)} m` : "—");
       kv("Coordenadas", curLL ? `${curLL[1].toFixed(5)}, ${curLL[0].toFixed(5)}` : "Sin ubicar");
 
+      if (Array.isArray(gm.availableDevices) && gm.availableDevices.length > 1) {
+        const devRow = el("div", "", null, metaCard);
+        devRow.style.cssText = "display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding-top:2px;";
+        el("span", "", "Elegir equipo en este poste:", devRow).style.cssText = "font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;";
+        for (const d of gm.availableDevices) {
+          const isCur = curLL && Array.isArray(d.lonlat) && haversineMeters(curLL, d.lonlat) < 3;
+          const bDev = el("button", isCur ? "active-pill" : "btn-outline", d.display.replace(new RegExp("^" + getPointCode(f) + "\\s*", "i"), "").slice(0, 34), devRow);
+          bDev.style.cssText = "padding:2px 7px;font-size:10.5px;";
+          bDev.title = `Ubicar ✕ exactamente sobre: ${d.display}`;
+          bDev.onclick = () => {
+            const proj = map.getView().getProjection();
+            f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(d.lonlat, proj)));
+            if (d.protId) {
+              f.set("proteccionTipo", d.protId);
+              if (selProt) selProt.value = d.protId;
+            }
+            gm.deviceDisplay = d.display;
+            gm.gnatLonLat = d.lonlat;
+            gm.distMeters = 0;
+            f.set("gnatMeta", gm);
+            f.set("syncNote", "");
+            f.set("syncStatus", "ok");
+            ensureVectorLayer();
+            markDirty();
+            refreshAll();
+            renderMetaCard();
+            showToast(`✕ ubicada sobre: ${d.display}`);
+          };
+        }
+      }
+
       if (note) {
         const alertBox = el("div", "meta-alert", null, metaCard);
         el("span", "", note, alertBox);
@@ -4397,7 +4428,7 @@
       const userProtPref = String(f.get("proteccionTipo") || "");
       // 1. Búsqueda DIRECTA por código (si es APERTURA prioriza tipo declarado o el equipo más cercano al clic)
       const hitPole = (code && code !== "SIN CÓDIGO")
-        ? await resolveCodeInGnat(code, true, isApPoint, { preferredProt: userProtPref, nearLonLat: existingLL })
+        ? await resolveCodeInGnat(code, true, isApPoint, { preferredProt: userProtPref, nearLonLat: existingLL, returnAllDevices: isApPoint })
         : null;
       if (isApPoint && hitPole?.protId && !userProtPref) f.set("proteccionTipo", hitPole.protId);
       if (f.get("syncStatus") === "cancelled") return false;
@@ -4497,6 +4528,11 @@
         coci3f: nb.coci3f,
         deviceDisplay: foundDev ? `${foundDev.type || foundDev.display}${foundDev.realState ? " · " + foundDev.realState : ""}` : (foundSsee ? "Desconectador Fusible XS (S/E)" : ""),
         gnatLonLat: primaryHit.lonlat,
+        availableDevices: Array.isArray(primaryHit.allDevices) ? primaryHit.allDevices.map(d => ({
+          display: d.display,
+          protId: d.protId || mapProtectionFromText(d.display || ""),
+          lonlat: d.lonlat
+        })) : [],
         distMeters: snappedToGnat ? 0 : distMeters,
         syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
       });
