@@ -3227,6 +3227,60 @@
     });
   };
 
+  // =========================================================================
+  // 14. INTERACCIÓN CON EL MAPA OPENLAYERS
+  // =========================================================================
+  function setCursorMode(mode, bannerMsg = "") {
+    state.cursorMode = mode;
+    btnModeNav.classList.toggle("active", mode === "nav");
+    btnModeBox.classList.toggle("active", mode === "box");
+    btnModeAdd.classList.toggle("active", mode === "add" || mode === "link-opening" || mode === "place-missing");
+    btnModePoly.classList.toggle("active", mode === "edit-poly" || mode === "draw-poly");
+
+    if (viewportEl) {
+      viewportEl.style.cursor = (mode === "add" || mode === "link-opening" || mode === "place-missing" || mode === "draw-poly" || mode === "box")
+        ? "crosshair" : "";
+    }
+
+    if (dragBoxInteraction) {
+      map.removeInteraction(dragBoxInteraction);
+      dragBoxInteraction = null;
+    }
+
+    if (ol.interaction?.DragBox && mode !== "edit-poly" && mode !== "draw-poly") {
+      dragBoxInteraction = new ol.interaction.DragBox({
+        condition: mode === "box"
+          ? () => true
+          : (ol.events?.condition?.shiftKeyOnly || ((e) => e.originalEvent?.shiftKey))
+      });
+      dragBoxInteraction.on("boxend", () => {
+        const extent = dragBoxInteraction.getGeometry().getExtent();
+        const visible = new Set(getFilteredPoints());
+        let added = 0;
+        state.points.forEach((f, idx) => {
+          if (!visible.has(f) || !f.getGeometry()) return;
+          const xy = f.getGeometry().getCoordinates();
+          if (xy[0] >= extent[0] && xy[0] <= extent[2] && xy[1] >= extent[1] && xy[1] <= extent[3]) {
+            state.selected.add(idx);
+            added++;
+          }
+        });
+        renderTable();
+        rebuildOverlayLayers();
+        if (added) showToast(`${added} punto(s) seleccionado(s).`);
+        if (mode === "box") setCursorMode("nav");
+      });
+      map.addInteraction(dragBoxInteraction);
+    }
+
+    if (bannerMsg) {
+      modeBannerText.textContent = bannerMsg;
+      modeBanner.classList.remove("hidden");
+    } else {
+      modeBanner.classList.add("hidden");
+    }
+  }
+
   function startLinkOpeningMode(indices) {
     state.pendingLinkIndices = indices;
     setCursorMode("link-opening", `Haz clic en una apertura (✕) o en un punto vacío para vincular ${indices.length} elemento(s)`);
