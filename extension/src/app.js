@@ -668,42 +668,40 @@
       if ((preferOpening || opts?.returnAllDevices) && openingCands.length > 1) {
         const idPairs = openingCands.map(c => ({ cand: c, id: Number(c.surrogate_in_map_id || c.object_id) })).filter(x => Number.isFinite(x.id) && x.id > 0);
         const resolvedDevs = [];
-        try {
-          const geo = await gnatRequest("svc_wmc.php", w.Ext.apply({
-            action: "get_objects_geojson",
-            object_ids: w.Ext.encode(idPairs.map(x => x.id))
-          }, wm.getViewportParams()));
-          const feats = Array.isArray(geo?.features) ? geo.features : (geo?.geometry ? [geo] : []);
-          for (let i = 0; i < feats.length; i++) {
-            const pt = extractPointFromGeoJsonFeature(feats[i]);
+        for (const item of idPairs.slice(0, 6)) {
+          try {
+            const geo = await gnatRequest("svc_wmc.php", w.Ext.apply({
+              action: "get_objects_geojson",
+              object_ids: w.Ext.encode([item.id])
+            }, wm.getViewportParams()));
+            const feat = Array.isArray(geo?.features) ? geo.features[0] : (geo?.geometry ? geo : null);
+            const pt = extractPointFromGeoJsonFeature(feat);
             if (!pt) continue;
-            const fid = Number(feats[i].id || feats[i].properties?.object_id || feats[i].properties?.surrogate_in_map_id || idPairs[i]?.id);
-            const matched = idPairs.find(x => x.id === fid) || idPairs[i];
-            if (!matched) continue;
-            const disp = String(matched.cand.display || q);
+            const disp = String(item.cand.display || q);
             resolvedDevs.push({
               code: q,
               lonlat: pt,
               display: disp,
               protId: mapProtectionFromText(disp),
-              objectId: Number(matched.cand.object_id),
-              surrogateId: matched.id,
+              objectId: Number(item.cand.object_id),
+              surrogateId: item.id,
               isOpeningDevice: true,
               isSsee: SSEE_CLASS_REGEX.test(disp),
               devices: devicesOnCode,
               spans: spansFromSearch
             });
-          }
-        } catch (_) {}
+          } catch (_) {}
+        }
 
         if (resolvedDevs.length) {
-          let picked = null;
-          if (prefProt) {
+          const lockedId = Number(opts?.lockedDeviceId || 0);
+          let picked = lockedId ? (resolvedDevs.find(d => d.surrogateId === lockedId || d.objectId === lockedId) || null) : null;
+          if (!picked && prefProt) {
             picked = resolvedDevs.find(d => d.protId === prefProt) || null;
           }
           if (!picked && nearLL) {
-            resolvedDevs.sort((a, b) => haversineMeters(nearLL, a.lonlat) - haversineMeters(nearLL, b.lonlat));
-            picked = resolvedDevs[0];
+            const byDist = [...resolvedDevs].sort((a, b) => haversineMeters(nearLL, a.lonlat) - haversineMeters(nearLL, b.lonlat));
+            picked = byDist[0];
           }
           if (!picked) picked = resolvedDevs[0];
           picked.allDevices = resolvedDevs;
@@ -4219,6 +4217,7 @@
             }
             gm.deviceDisplay = d.display;
             gm.gnatLonLat = d.lonlat;
+            gm.lockedDeviceId = d.surrogateId || 0;
             gm.distMeters = 0;
             f.set("gnatMeta", gm);
             f.set("syncNote", "");
@@ -4367,6 +4366,10 @@
       markDirty();
       refreshAll();
       closeModal();
+      if (chosenProt && chosenProt !== prevProt) {
+        const gmCur = f.get("gnatMeta");
+        if (gmCur && gmCur.lockedDeviceId) { gmCur.lockedDeviceId = 0; f.set("gnatMeta", gmCur); }
+      }
       if ((chosenProt && chosenProt !== prevProt) || (sseeClean && `SSEE ${sseeClean}` !== prevSsee)) {
         enqueueGnatMetadataSync([f], true);
       }
@@ -4427,8 +4430,9 @@
       const isApPoint = (f.get("tipo") || "PUNTO") === "APERTURA";
       const userProtPref = String(f.get("proteccionTipo") || "");
       // 1. Búsqueda DIRECTA por código (si es APERTURA prioriza tipo declarado o el equipo más cercano al clic)
+      const lockedDevId = Number(f.get("gnatMeta")?.lockedDeviceId || 0);
       const hitPole = (code && code !== "SIN CÓDIGO")
-        ? await resolveCodeInGnat(code, true, isApPoint, { preferredProt: userProtPref, nearLonLat: existingLL, returnAllDevices: isApPoint })
+        ? await resolveCodeInGnat(code, true, isApPoint, { preferredProt: userProtPref, nearLonLat: existingLL, returnAllDevices: isApPoint, lockedDeviceId: lockedDevId })
         : null;
       if (isApPoint && hitPole?.protId && !userProtPref) f.set("proteccionTipo", hitPole.protId);
       if (f.get("syncStatus") === "cancelled") return false;
@@ -4528,10 +4532,12 @@
         coci3f: nb.coci3f,
         deviceDisplay: foundDev ? `${foundDev.type || foundDev.display}${foundDev.realState ? " · " + foundDev.realState : ""}` : (foundSsee ? "Desconectador Fusible XS (S/E)" : ""),
         gnatLonLat: primaryHit.lonlat,
+        lockedDeviceId: lockedDevId || primaryHit.surrogateId || 0,
         availableDevices: Array.isArray(primaryHit.allDevices) ? primaryHit.allDevices.map(d => ({
           display: d.display,
           protId: d.protId || mapProtectionFromText(d.display || ""),
-          lonlat: d.lonlat
+          lonlat: d.lonlat,
+          surrogateId: d.surrogateId || d.objectId || 0
         })) : [],
         distMeters: snappedToGnat ? 0 : distMeters,
         syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
