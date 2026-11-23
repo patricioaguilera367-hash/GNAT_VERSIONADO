@@ -176,6 +176,7 @@
     ]),
     filterSups: new Set(),  // empty = all
     lastSearchMissing: [],  // códigos pegados en el buscador que no están en la tabla
+    recentColors: ["#00C853", "#FF6D00", "#DC2626", "#2979FF"],
     syncQueue: { running: false, paused: false, cancelled: false, total: 0, done: 0, items: [] },
     showIntermediosInTable: false,
     selectedIntermedios: new Set(),
@@ -640,11 +641,12 @@
     return null;
   }
 
-  async function resolveCodeInGnat(rawCode, useCache = true) {
+  async function resolveCodeInGnat(rawCode, useCache = true, preferOpening = false) {
     const queries = buildCandidateSearchQueries(rawCode);
     for (const q of queries) {
       if (useCache) {
-        const cached = await dbGetGnatCache(q);
+        const cacheKey = preferOpening ? `OP:${q}` : q;
+        const cached = await dbGetGnatCache(cacheKey);
         if (cached && Array.isArray(cached.lonlat) && cached.lonlat.length === 2) {
           return cached;
         }
@@ -704,9 +706,11 @@
       const candidates = exactMatches.length ? exactMatches : fallbackMatches;
       if (!candidates.length) continue;
 
-      // Priorizar Poste/Soporte/Estructura; luego SSEE; luego Equipos
+      // Si es APERTURA, priorizar el equipo de maniobra cortando la línea (ej. DC POLE TOP); si no, priorizar Poste/SSEE
       candidates.sort((a, b) => {
-        const score = (d) => (POLE_CLASS_REGEX.test(d) ? 3 : SSEE_CLASS_REGEX.test(d) ? 2 : OPENING_DEVICE_REGEX.test(d) ? 1 : 0);
+        const score = (d) => preferOpening
+          ? (OPENING_DEVICE_REGEX.test(d) && !POLE_CLASS_REGEX.test(d) ? 4 : POLE_CLASS_REGEX.test(d) ? 2 : SSEE_CLASS_REGEX.test(d) ? 1 : 0)
+          : (POLE_CLASS_REGEX.test(d) ? 3 : SSEE_CLASS_REGEX.test(d) ? 2 : OPENING_DEVICE_REGEX.test(d) ? 1 : 0);
         return score(b.display || "") - score(a.display || "");
       });
 
@@ -722,17 +726,20 @@
             const pt = extractPointFromGeoJsonFeature(feat);
             if (pt && Number.isFinite(pt[0]) && Number.isFinite(pt[1])) {
               const entry = {
-                code: q,
+                code: preferOpening ? `OP:${q}` : q,
+                rawCode: q,
                 lonlat: pt,
                 extraCoords: [],
                 display: String(cand.display || q),
                 objectId: Number(cand.object_id),
                 surrogateId: Number(cand.surrogate_in_map_id || id),
                 isOpeningDevice: OPENING_DEVICE_REGEX.test(cand.display) && !POLE_CLASS_REGEX.test(cand.display),
+                isSsee: SSEE_CLASS_REGEX.test(cand.display),
                 devices: devicesOnCode,
                 spans: spansFromSearch
               };
               await dbPutGnatCache(entry);
+              entry.code = q;
               return entry;
             }
           } catch (_) {}
@@ -975,19 +982,19 @@
       left: 56px;
       width: auto;
       max-width: calc(100vw - 360px);
-      height: 38px;
+      min-height: 38px;
+      height: auto;
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
-      gap: 6px;
-      padding: 0 8px;
+      gap: 4px 6px;
+      padding: 4px 8px;
       background: rgba(255, 255, 255, 0.95);
       border: 1px solid #CBD5E1;
       border-radius: 9px;
       box-shadow: 0 3px 12px rgba(15, 23, 42, 0.11);
       backdrop-filter: blur(8px);
-      overflow-x: auto;
-      scrollbar-width: none;
     }
     .topbar::-webkit-scrollbar { display: none; }
     .topbar button { padding: 4px 8px; font-size: 12px; white-space: nowrap; flex-shrink: 0; }
@@ -1190,10 +1197,17 @@
       font-size: 11px; padding: 2px 4px; border: 1px solid #94A3B8; border-radius: 4px;
       background: #fff; font-weight: 600; width: 100%;
     }
+    .modal-body > *, .meta-card, .form-grid, .obs-list { flex-shrink: 0; }
     .obs-list {
-      max-height: 130px; overflow-y: auto; border: 1px solid var(--border);
+      min-height: 68px; max-height: 150px; overflow-y: auto; border: 1px solid var(--border);
       border-radius: 7px; padding: 6px; background: #F8FAFC; display: flex;
       flex-direction: column; gap: 5px;
+    }
+    .search-missing-note.hidden, .sync-queue-bar.hidden { display: none !important; }
+    .recent-swatches { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0; }
+    .color-ref-dot {
+      display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+      margin-left: 4px; vertical-align: middle; border: 1px solid rgba(15,23,42,0.2);
     }
     .obs-item {
       background: #fff; border: 1px solid #E2E8F0; border-radius: 5px; padding: 5px 7px; font-size: 11px;
@@ -1647,8 +1661,10 @@
     const ro = new w.ResizeObserver(() => syncLayoutToMapViewport());
     if (viewportEl) ro.observe(viewportEl);
     ro.observe(doc.body);
+    map.on?.("change:size", syncLayoutToMapViewport);
   } catch (_) {}
   w.addEventListener("resize", syncLayoutToMapViewport);
+  w.setInterval(syncLayoutToMapViewport, 900);
   w.setTimeout(syncLayoutToMapViewport, 80);
 
   // =========================================================================
@@ -1715,7 +1731,7 @@
       return true;
     });
 
-    state.lastSearchMissing = tokens.length > 0
+    state.lastSearchMissing = isMultiToken
       ? [...new Set(tokens.map(t => t.toUpperCase()).filter(t => !matchedTokens.has(t)))]
       : [];
     return out;
@@ -2117,13 +2133,17 @@
     const proj = map.getView().getProjection();
     const hasCoords = Array.isArray(lonlat) && lonlat.length === 2 && Number.isFinite(lonlat[0]) && Number.isFinite(lonlat[1]);
 
-    // Antiduplicados: asociar por código GNAT, código en terreno, o cercanía <= 5 m del mismo tipo
+    const cleanSsee = String(sseeCode || "").replace(/^SSEE\s+/i, "").trim().toUpperCase();
+    // Antiduplicados: asociar por código GNAT, código en terreno, código S/E, o cercanía <= 5 m del mismo tipo
     let existing = state.points.find(f => {
+      if ((f.get("tipo") || "PUNTO") !== tipo) return false;
       const fc = getPointCode(f).toUpperCase();
       const ft = String(f.get("codigoTerreno") || "").toUpperCase();
-      if (cleanCode && cleanCode !== "SIN CÓDIGO" && (fc === cleanCode || (ft && ft === cleanCode)) && (f.get("tipo") || "PUNTO") === tipo) return true;
-      if (cleanTer && (fc === cleanTer || (ft && ft === cleanTer)) && (f.get("tipo") || "PUNTO") === tipo) return true;
-      if (hasCoords && (f.get("tipo") || "PUNTO") === tipo && f.getGeometry()) {
+      const fs = String(f.get("sseeCode") || "").replace(/^SSEE\s+/i, "").trim().toUpperCase();
+      if (cleanCode && cleanCode !== "SIN CÓDIGO" && (fc === cleanCode || (ft && ft === cleanCode) || (fs && fs === cleanCode))) return true;
+      if (cleanSsee && (fc === cleanSsee || (fs && fs === cleanSsee))) return true;
+      if (cleanTer && (fc === cleanTer || (ft && ft === cleanTer))) return true;
+      if (hasCoords && f.getGeometry()) {
         const fll = ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj);
         if (Number.isFinite(fll[0]) && Number.isFinite(fll[1]) && haversineMeters(fll, lonlat) <= 5) return true;
       }
@@ -2578,6 +2598,16 @@
 
   const viewportEl = map.getViewport?.();
   if (viewportEl) {
+    const blockGnatDuringPoly = (ev) => {
+      if (state.cursorMode !== "edit-poly" && state.cursorMode !== "draw-poly") return;
+      ev.stopPropagation();
+      ev.stopImmediatePropagation?.();
+      if (ev.type === "contextmenu" || ev.type === "dblclick") ev.preventDefault();
+    };
+    for (const evName of ["mousedown", "mouseup", "click", "dblclick", "contextmenu"]) {
+      viewportEl.addEventListener(evName, blockGnatDuringPoly, true);
+    }
+
     viewportEl.addEventListener("pointerdown", (ev) => {
       if (state.cursorMode !== "edit-poly" || ev.button !== 0) return;
       const pixel = map.getEventPixel(ev);
@@ -2697,8 +2727,9 @@
       el("span", "", `No encontrados (${state.lastSearchMissing.length}): ${shown}`, searchMissingNote);
       const bClr = el("button", "sync-cancel", "×", searchMissingNote);
       bClr.title = "Limpiar búsqueda";
-      bClr.onclick = () => { searchInput.value = ""; state.search = ""; refreshAll(); };
+      bClr.onclick = () => { searchInput.value = ""; state.search = ""; state.lastSearchMissing = []; refreshAll(); };
     } else {
+      searchMissingNote.replaceChildren();
       searchMissingNote.classList.add("hidden");
     }
     // Actualizar etiqueta dinámica de Analizar Red MT para dejar claro su alcance
@@ -2753,10 +2784,7 @@
       return th;
     };
     makeSortableTh("numero", "Rol/N°", "54px");
-    const thCode = makeSortableTh("codigo", "Código");
-    if (state.selected.size > 0) {
-      el("span", "sel-mini-pill", `${state.selected.size} sel.`, thCode);
-    }
+    makeSortableTh("codigo", "Código");
     makeSortableTh("zona", "D / T / F", "88px");
     if (multiSup) {
       const thS = el("th", "", "Sup.", trh);
@@ -2890,6 +2918,14 @@
         ib.className = "inter-badge";
         ib.textContent = "Intermedio";
         tdCode.appendChild(ib);
+      }
+      const custCol = String(f.get("colorPersonalizado") || "").trim();
+      if (isHex(custCol)) {
+        const cd = doc.createElement("span");
+        cd.className = "color-ref-dot";
+        cd.style.background = custCol;
+        cd.title = `Color propio: ${custCol}`;
+        tdCode.appendChild(cd);
       }
       const sseeTxt = String(f.get("sseeCode") || "").trim();
       if (sseeTxt && !eqType.includes(sseeTxt)) {
@@ -3386,8 +3422,8 @@
         enqueueGnatMetadataSync(feats, true);
       };
 
-      const bColor = el("button", "pop-item", "🎨 Cambiar color individual ▾", pop);
-      bColor.onclick = () => openColorPickerPopover(bColor, "#00C853", (c) => assignCustomColorToIndices([...state.selected], c), true);
+      const bColor = el("button", "pop-item", "🎨 Color de referencia (opcional) ▾", pop);
+      bColor.onclick = () => openColorPickerPopover(bColor, "#00C853", (c) => assignCustomColorToIndices([...state.selected], c), true, true);
 
       el("div", "pop-sep", null, pop);
       el("div", "pop-title", "Responsable (opcional)", pop);
@@ -3434,8 +3470,8 @@
       const bZone = el("button", "pop-item", "🏷 Asignar a Zona (D / T / F) ▾", pop);
       bZone.onclick = () => openAssignZonePopover(bZone);
 
-      const bColor = el("button", "pop-item", "🎨 Cambiar color ▾", pop);
-      bColor.onclick = () => openColorPickerPopover(bColor, getPointColor(f), (c) => assignCustomColorToIndices([...state.selected], c));
+      const bColor = el("button", "pop-item", "🎨 Color de referencia ▾", pop);
+      bColor.onclick = () => openColorPickerPopover(bColor, getPointColor(f), (c) => assignCustomColorToIndices([...state.selected], c), false, true);
 
       el("div", "pop-sep", null, pop);
       const bDel = el("button", "pop-item", "🗑 Eliminar", pop);
@@ -3444,24 +3480,51 @@
     });
   }
 
-  function openColorPickerPopover(anchorEl, currentColor, onPick, anchorAbove = false) {
+  function rememberRecentColor(hex) {
+    if (!isHex(hex)) return;
+    const up = hex.toUpperCase();
+    state.recentColors = [up, ...state.recentColors.filter(c => c.toUpperCase() !== up)].slice(0, 6);
+  }
+
+  function openColorPickerPopover(anchorEl, currentColor, onPick, anchorAbove = false, allowReset = false) {
     const r = anchorEl.getBoundingClientRect();
     showPopoverAt(anchorAbove ? r.left : r.right + 6, anchorAbove ? r.top - 6 : r.top, (pop) => {
+      pop.style.minWidth = "210px";
       el("div", "pop-title", "Paleta de alto contraste", pop);
       const grid = el("div", "palette-grid", null, pop);
       for (const c of HIGH_CONTRAST_PALETTE) {
         const sw = el("button", "swatch", "", grid);
         sw.style.background = c;
         if (c.toUpperCase() === String(currentColor || "").toUpperCase()) sw.style.outline = "2px solid #0F172A";
-        sw.onclick = () => { onPick(c); closePopover(); };
+        sw.onclick = () => { rememberRecentColor(c); onPick(c); closePopover(); };
       }
+
+      if (state.recentColors.length) {
+        el("div", "pop-title", "Recientes", pop).style.marginTop = "4px";
+        const rGrid = el("div", "recent-swatches", null, pop);
+        for (const c of state.recentColors) {
+          const sw = el("button", "swatch", "", rGrid);
+          sw.style.background = c;
+          sw.onclick = () => { rememberRecentColor(c); onPick(c); closePopover(); };
+        }
+      }
+
       el("div", "pop-sep", null, pop);
-      const customRow = el("label", "pop-item", "Color libre:", pop);
-      customRow.style.justifyContent = "space-between";
+      const customRow = el("div", "inline-input-row", null, pop);
       const inp = el("input", "", null, customRow);
       inp.type = "color";
+      inp.style.cssText = "width:34px;height:28px;padding:1px;border-radius:6px;border:1px solid var(--border);";
       inp.value = isHex(currentColor) ? currentColor : "#00C853";
       inp.oninput = () => onPick(inp.value);
+      const bApply = el("button", "btn-primary", "Aplicar", customRow);
+      bApply.style.cssText = "flex:1;justify-content:center;padding:4px 8px;font-size:11px;";
+      bApply.onclick = () => { rememberRecentColor(inp.value); onPick(inp.value); closePopover(); };
+
+      if (allowReset) {
+        const bReset = el("button", "pop-item", "↺ Usar color de zona", pop);
+        bReset.style.marginTop = "4px";
+        bReset.onclick = () => { onPick(""); closePopover(); };
+      }
     }, anchorAbove);
   }
 
@@ -3492,10 +3555,10 @@
       if (typeof w.showDirectoryPicker === "function") {
         el("div", "pop-sep", null, pop);
         const label = !state.backupDirHandle
-          ? "📁 Definir carpeta de respaldo en PC..."
+          ? "📁 Carpeta autoguardado (OneDrive / PC)..."
           : state.backupDirPerm === "granted"
-            ? `📁 Carpeta respaldo: ${state.backupDirHandle.name} (Activa ✓)`
-            : `⚠️ Reactivar permiso carpeta (${state.backupDirHandle.name})...`;
+            ? `📁 Carpeta activa: ${state.backupDirHandle.name} ✓ (cambiar)`
+            : `⚠️ Reautorizar carpeta: ${state.backupDirHandle.name}`;
         const bDir = el("button", "pop-item", label, pop);
         bDir.onclick = async () => {
           closePopover();
@@ -3509,7 +3572,7 @@
                 return;
               }
             }
-            const handle = await w.showDirectoryPicker({ mode: "readwrite" });
+            const handle = await w.showDirectoryPicker({ mode: "readwrite", startIn: "documents" });
             state.backupDirHandle = handle;
             state.backupDirPerm = "granted";
             await dbSaveSetting("backupDirHandle", handle);
@@ -4889,10 +4952,11 @@
     let snappedToGnat = false;
 
     try {
-      // 1. Búsqueda DIRECTA por código (el buscador nativo de GNAT: ~0.6s exacto)
-      const hitPole = (code && code !== "SIN CÓDIGO") ? await resolveCodeInGnat(code, true) : null;
+      const isApPoint = (f.get("tipo") || "PUNTO") === "APERTURA";
+      // 1. Búsqueda DIRECTA por código (si es APERTURA prioriza el equipo cortando la línea)
+      const hitPole = (code && code !== "SIN CÓDIGO") ? await resolveCodeInGnat(code, true, isApPoint) : null;
       if (f.get("syncStatus") === "cancelled") return false;
-      const hitSsee = (sseeRaw && sseeRaw !== code) ? await resolveCodeInGnat(sseeRaw, true) : null;
+      const hitSsee = (sseeRaw && sseeRaw !== code) ? await resolveCodeInGnat(sseeRaw, true, false) : null;
       if (f.get("syncStatus") === "cancelled") return false;
 
       const primaryHit = hitPole || hitSsee;
@@ -4957,9 +5021,18 @@
       const foundDev = nb.devices[0] || primaryHit.devices?.[0] || null;
       if (foundSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${foundSsee}`);
 
-      const detectedProt = foundDev
-        ? mapProtectionFromText(`${foundDev.type || ""} ${foundDev.display || ""}`)
-        : (foundSsee ? "DF_XS" : "");
+      // Reconciliación automática S/E <-> Poste: si el usuario cargó el código de la S/E como código principal,
+      // moverlo a Cód. S/E y promover el código real del poste (ej. F59430 -> Poste F628190 + SSEE F59430 + DF XS)
+      const realPole = (nb.detectedPoleCode || "").toUpperCase();
+      if (foundSsee && code === foundSsee && realPole && realPole !== code) {
+        f.set("sseeCode", `SSEE ${foundSsee}`);
+        f.set("codigo", realPole);
+        if (!f.get("proteccionTipo")) f.set("proteccionTipo", "DF_XS");
+      }
+
+      const detectedProt = foundSsee
+        ? "DF_XS"
+        : (foundDev ? mapProtectionFromText(`${foundDev.type || ""} ${foundDev.display || ""}`) : "");
 
       const userProt = String(f.get("proteccionTipo") || "");
       if (!userProt && detectedProt) {
@@ -5087,18 +5160,48 @@
     chkHeader.type = "checkbox";
     el("span", "", "Primera fila es encabezado", hdrLbl);
 
-    const zoneWrap = el("div", "", null, optRow);
-    zoneWrap.style.cssText = "display:flex;align-items:center;gap:6px;";
-    el("span", "", "Zona:", zoneWrap).style.cssText = "font-size:12px;font-weight:600;";
-    const selTargetZone = el("select", "", null, zoneWrap);
-    selTargetZone.style.cssText = "padding:4px 6px;border:1px solid var(--border);border-radius:6px;font-size:12px;";
-    const optNoZ = el("option", "", "— Sin zona —", selTargetZone);
-    optNoZ.value = "";
+    const grpRow = el("div", "", null, body);
+    grpRow.style.cssText = "display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;background:#F8FAFC;border:1px solid var(--border);border-radius:8px;padding:8px;";
+
+    const mkGrp = (lblTxt) => {
+      const box = el("div", "", null, grpRow);
+      box.style.cssText = "display:flex;flex-direction:column;gap:3px;";
+      el("span", "", lblTxt, box).style.cssText = "font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;";
+      const sel = el("select", "", null, box);
+      sel.style.cssText = "padding:4px 6px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:#fff;";
+      return sel;
+    };
+
+    const selTargetZone = mkGrp("Zona del lote");
+    const optNoZ = el("option", "", "— Sin zona —", selTargetZone); optNoZ.value = "";
     for (const z of state.zones.values()) {
-      const o = el("option", "", `${z.id} · ${z.name}`, selTargetZone);
-      o.value = z.id;
+      const o = el("option", "", `${z.id} · ${z.name}`, selTargetZone); o.value = z.id;
     }
+    const optNewZ = el("option", "", "+ Crear zona nueva...", selTargetZone); optNewZ.value = "__NEW__";
     selTargetZone.value = "T";
+
+    const selTargetSup = mkGrp("Supervisor (opc.)");
+    for (const s of state.supervisors.values()) {
+      const o = el("option", "", s.id === "default" ? "— Sin asignar —" : `${s.initials} · ${s.name}`, selTargetSup);
+      o.value = s.id;
+    }
+
+    const selTargetSt = mkGrp("Estado inicial");
+    for (const st of state.statuses.values()) {
+      const o = el("option", "", st.name, selTargetSt); o.value = st.id;
+    }
+    selTargetSt.value = "pendiente";
+
+    const newZoneRow = el("div", "inline-input-row hidden", null, body);
+    const inpNewZoneName = el("input", "", null, newZoneRow);
+    inpNewZoneName.placeholder = "Nombre o ID de la nueva zona (ej. V2, Tramo Norte)...";
+    const inpNewZoneCol = el("input", "", null, newZoneRow);
+    inpNewZoneCol.type = "color";
+    inpNewZoneCol.value = "#00C853";
+    inpNewZoneCol.style.cssText = "width:36px;height:30px;padding:1px;border:1px solid var(--border);border-radius:6px;";
+    selTargetZone.addEventListener("change", () => {
+      newZoneRow.classList.toggle("hidden", selTargetZone.value !== "__NEW__");
+    });
 
     const previewTitle = el("div", "", "Vista previa de columnas (puedes cambiar cualquier etiqueta):", body);
     previewTitle.style.cssText = "font-size:11px;font-weight:700;color:#475569;display:none;";
@@ -5168,7 +5271,13 @@
       if (!parsedState.rows.length) return;
       const dataRows = parsedState.hasHeader ? parsedState.rows.slice(1) : parsedState.rows;
       const roles = parsedState.colRoles;
-      const targetZ = selTargetZone.value;
+      let targetZ = selTargetZone.value;
+      if (targetZ === "__NEW__") {
+        targetZ = createZone(inpNewZoneName.value.trim() || "Nueva", inpNewZoneCol.value);
+      }
+      const targetSup = selTargetSup.value || "default";
+      if (targetSup !== "default") state.multiSupervisorEnabled = true;
+      const defaultSt = selTargetSt.value || "pendiente";
       const toResolveBg = [];
       const placedIndices = [];
 
@@ -5216,7 +5325,7 @@
           lonlat = extractLatLonFromLine(row.join(" "));
         }
 
-        let estadoEjec = "pendiente";
+        let estadoEjec = defaultSt;
         if (stName) {
           const matchSt = [...state.statuses.values()].find(s => s.name.toLowerCase() === stName.toLowerCase());
           if (matchSt) estadoEjec = matchSt.id;
@@ -5237,6 +5346,7 @@
           observaciones: obsArr,
           syncStatus: "loading"
         });
+        if (targetSup !== "default") feat.set("supervisorId", targetSup);
         const idx = state.points.indexOf(feat);
         if (lonlat && idx >= 0) placedIndices.push(idx);
         toResolveBg.push(feat);
@@ -5344,8 +5454,14 @@
   // Búsqueda instantánea local + Enter para resolver el código en GNAT
   searchInput.oninput = () => {
     state.search = searchInput.value;
+    if (!state.search.trim()) state.lastSearchMissing = [];
     refreshAll();
   };
+  searchInput.addEventListener("search", () => {
+    state.search = searchInput.value;
+    if (!state.search.trim()) state.lastSearchMissing = [];
+    refreshAll();
+  });
   searchInput.onkeydown = async (ev) => {
     if (ev.key === "Enter" && searchInput.value.trim()) {
       const q = searchInput.value.trim();
