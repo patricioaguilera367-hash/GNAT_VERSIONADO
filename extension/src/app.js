@@ -1197,20 +1197,28 @@
     const matchedTokens = new Set();
 
     const matchesToken = (f, tok) => {
-      const t = tok.toLocaleLowerCase("es");
+      // Un solo predicado para uno o varios términos. Antes el caso multi-palabra
+      // ignoraba supervisor, estado y zona, y el de una palabra no incluía las
+      // iniciales: "cesar castro" y "cc" no encontraban nada. Se compara sin tildes
+      // ni mayúsculas, así "tomas" encuentra a "Tomás" y "cesar" a "César".
+      const fold = (v) => CAT.foldText(v);
+      const t = fold(tok);
+      if (!t) return true;
       const tF = state.autoPrefixF && /^\d+$/.test(t) ? "f" + t : t;
-      const code = getPointCode(f).toLocaleLowerCase("es");
-      const ter = String(f.get("codigoTerreno") || "").toLocaleLowerCase("es");
-      const num = String(f.get("numero") || "").toLocaleLowerCase("es");
-      const rol = String(f.get("rolPT") || "").toLocaleLowerCase("es");
-      const zids = getPointZoneIds(f).join(" ").toLocaleLowerCase("es");
-      const eq = String(f.get("tipoEquipo") || "").toLocaleLowerCase("es");
-      const st = (state.statuses.get(f.get("estadoEjec") || "pendiente")?.name || "").toLocaleLowerCase("es");
-      if (isMultiToken) {
-        return code === t || code === tF || code.includes(t) || (ter && (ter === t || ter.includes(t))) || num === t || rol === t;
-      }
-      const sup = (state.supervisors.get(getSupId(f))?.name || "").toLocaleLowerCase("es");
-      const haystack = `${num} ${code} ${ter} ${zids} ${eq} ${rol} ${st} ${sup} ${getSupId(f)}`;
+      const supId = getSupId(f);
+      const supObj = state.supervisors.get(supId) || {};
+      const haystack = [
+        f.get("numero"),
+        getPointCode(f),
+        f.get("codigoTerreno"),
+        getPointZoneIds(f).join(" "),
+        f.get("tipoEquipo"),
+        f.get("rolPT"),
+        state.statuses.get(f.get("estadoEjec") || "pendiente")?.name,
+        supObj.name,
+        supObj.initials,
+        supId
+      ].map(fold).join(" ");
       return haystack.includes(t) || (tF !== t && haystack.includes(tF));
     };
 
@@ -2345,10 +2353,7 @@
     makeSortableTh("numero", "Rol/N°", "54px");
     makeSortableTh("codigo", "Código");
     makeSortableTh("zona", "D / T / F", "88px");
-    if (multiSup) {
-      const thS = el("th", "", "Sup.", trh);
-      thS.style.width = "40px";
-    }
+    if (multiSup) makeSortableTh("sup", "Sup.", "40px");
 
     const sortedVisible = [...visible].sort((a, b) => {
       const mul = state.sortDir === "asc" ? 1 : -1;
@@ -2359,6 +2364,11 @@
         const za = getPointZoneIds(a).join(",") || "zzz";
         const zb = getPointZoneIds(b).join(",") || "zzz";
         return za.localeCompare(zb, "es", { numeric: true, sensitivity: "base" }) * mul;
+      }
+      if (state.sortBy === "sup") {
+        const sa = CAT.foldText(state.supervisors.get(getSupId(a))?.name || "");
+        const sb = CAT.foldText(state.supervisors.get(getSupId(b))?.name || "");
+        return sa.localeCompare(sb, "es", { numeric: true }) * mul;
       }
       const na = Number(a.get("numero")) || 0;
       const nb = Number(b.get("numero")) || 0;

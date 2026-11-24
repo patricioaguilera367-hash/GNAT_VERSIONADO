@@ -1,14 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "Centrality Local V13.1.6 — Planificador PT DMS",
-  "version": "13.1.6",
+  "name": "Centrality Local V13.1.7 — Planificador PT DMS",
+  "version": "13.1.7",
   "description": "Planificador técnico de Permisos de Trabajo (D / T / F), sincronización GNAT DMS y edición de polígonos sobre Mapas (SAESA / Frontel).",
   "permissions": [
     "scripting",
     "activeTab"
   ],
   "action": {
-    "default_title": "Activar / Ocultar Centrality Local V13.1.6"
+    "default_title": "Activar / Ocultar Centrality Local V13.1.7"
   },
   "background": {
     "service_worker": "background.js"
