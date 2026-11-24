@@ -4272,6 +4272,37 @@
     modalBackdrop.replaceChildren();
   }
 
+  // --- Política única de capas (U1, U16) -----------------------------------
+  // Un solo lugar decide cuándo y cómo se cierra una capa. Ningún botón trae su
+  // propio cierre ni su propia confirmación: todo pasa por acá.
+  function modalIsOpen() {
+    return !modalBackdrop.classList.contains("hidden");
+  }
+
+  const modalFieldValues = (card) => [...card.querySelectorAll("input, textarea, select")]
+    .map((el) => (el.type === "checkbox" ? String(el.checked) : String(el.value)));
+
+  function snapshotModalInputs(card) {
+    card.__initial = modalFieldValues(card);
+  }
+
+  function modalHasUnsavedChanges() {
+    const card = modalBackdrop.querySelector(".modal-card");
+    if (!card || !card.__initial) return false;
+    const now = modalFieldValues(card);
+    if (now.length !== card.__initial.length) return true;
+    return now.some((v, i) => v !== card.__initial[i]);
+  }
+
+  // El estado inicial se toma cuando la ventana ya terminó de construirse, así
+  // ningún modal tiene que acordarse de declararlo a mano.
+  try {
+    new w.MutationObserver(() => {
+      const card = modalBackdrop.querySelector(".modal-card");
+      if (card && !card.__initial) w.setTimeout(() => snapshotModalInputs(card), 0);
+    }).observe(modalBackdrop, { childList: true });
+  } catch (_) {}
+
   // "Empezar en mapa vacío" no creaba nada: sólo cerraba el modal, así que el
   // proyecto anterior seguía cargado. Acá se arranca un proyecto nuevo de verdad,
   // reusando el mismo camino que usa el undo (serializeProjectPayload ↔ loadProjectData).
@@ -5364,14 +5395,26 @@
   // En fase de captura, para conocer el disparador antes que nadie.
   doc.addEventListener("mousedown", (ev) => { lastMouseDownTarget = ev.target; }, true);
   doc.addEventListener("mousedown", (ev) => {
-    if (!activePopover) return;
-    // Cerrar sólo si el clic fue realmente afuera. Si cayó sobre el disparador
-    // que abrió el popover, el click del propio botón hace el toggle: cerrarlo
-    // acá era justo lo que hacía que el botón reabriera en vez de cerrar.
     const path = ev.composedPath();
-    if (path.includes(activePopover)) return;
-    if (activePopoverAnchor && path.includes(activePopoverAnchor)) return;
-    closePopover();
+    if (activePopover) {
+      // Cerrar sólo si el clic fue realmente afuera. Si cayó sobre el disparador
+      // que abrió el popover, el click del propio botón hace el toggle: cerrarlo
+      // acá era justo lo que hacía que el botón reabriera en vez de cerrar.
+      if (path.includes(activePopover)) return;
+      if (activePopoverAnchor && path.includes(activePopoverAnchor)) return;
+      closePopover();
+      return;
+    }
+    if (modalIsOpen()) {
+      const card = modalBackdrop.querySelector(".modal-card");
+      if (card && path.includes(card)) return;
+      // U16: no cerrar en silencio una ventana con cambios sin guardar.
+      if (modalHasUnsavedChanges()) {
+        showToast("Hay cambios sin guardar: usá Cancelar o Guardar.");
+        return;
+      }
+      closeModal();
+    }
   });
 
   function destroy() {
