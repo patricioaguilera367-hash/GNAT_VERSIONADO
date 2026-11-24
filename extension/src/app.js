@@ -531,7 +531,7 @@
     });
     const backedUp = await writeToBackupFolder(payload);
     state.dirty = false;
-    updateSaveIndicator(backedUp ? "✓ Guardado (PC + Local)" : "✓ Guardado");
+    updateSaveIndicator(backedUp ? `Guardado en ${state.backupDirHandle.name}` : "Guardado · solo navegador");
   }
 
   // =========================================================================
@@ -958,7 +958,7 @@
 
   const saveBadge = el("span", "save-badge", "", topLeft);
   saveBadge.innerHTML = '<span class="save-dot"></span><span>Sin datos</span>';
-  saveBadge.title = "Estado de autoguardado (clic para guardar ahora)";
+  saveBadge.title = "Autoguardado: solo en este navegador (IndexedDB); no se escribe ningun archivo en disco.";
   saveBadge.onclick = () => autosaveNow();
   el("div", "divider", null, topLeft);
 
@@ -1074,6 +1074,11 @@
     const clean = String(txt || "").replace(/^✓\s*/, "");
     saveBadge.innerHTML = `<span class="save-dot"></span><span>${clean}</span>`;
     saveBadge.classList.toggle("dirty", state.dirty);
+    // Que se vea DONDE guarda, no solo que guardo.
+    const destino = state.backupDirHandle
+      ? `carpeta "${state.backupDirHandle.name}" (${state.projectName}.json) y en este navegador`
+      : "solo en este navegador (IndexedDB); no se escribe ningun archivo en disco";
+    saveBadge.title = `Autoguardado: ${destino}. Clic para guardar ahora.`;
   }
 
   let toastTimer = null;
