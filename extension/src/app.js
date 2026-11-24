@@ -1079,11 +1079,21 @@
     toastTimer = w.setTimeout(() => toastEl.classList.remove("show"), 3600);
   }
 
+  var activePopoverPos = null;
+  var popoverAnchor = null;      // lo setea el llamador justo antes de abrir
+  var activePopoverAnchor = null;
+  var popoverKey = null;         // clave estable de categoría ('zones', 'supervisors', ...)
+  var activePopoverKey = null;
+  var lastMouseDownTarget = null; // disparador del click en curso, capturado antes del popover
+
   function closePopover() {
     if (activePopover) {
       activePopover.remove();
       activePopover = null;
     }
+    activePopoverPos = null;
+    activePopoverAnchor = null;
+    activePopoverKey = null;
   }
 
   function syncLayoutToMapViewport() {
@@ -1162,7 +1172,8 @@
       if (isMultiToken) {
         return code === t || code === tF || code.includes(t) || (ter && (ter === t || ter.includes(t))) || num === t || rol === t;
       }
-      const haystack = `${num} ${code} ${ter} ${zids} ${eq} ${rol} ${st}`;
+      const sup = (state.supervisors.get(getSupId(f))?.name || "").toLocaleLowerCase("es");
+      const haystack = `${num} ${code} ${ter} ${zids} ${eq} ${rol} ${st} ${sup} ${getSupId(f)}`;
       return haystack.includes(t) || (tF !== t && haystack.includes(tF));
     };
 
@@ -1388,8 +1399,17 @@
     // 1. Polígonos D / T / F + Vértices de edición nativos
     if (state.showHulls && ol.geom?.Polygon) {
       const hullFeatures = [];
+      // Una zona se dibuja sólo si no está oculta y, cuando tiene puntos, si al
+      // menos uno sobrevive a los filtros: ocultar las ejecutadas tiene que
+      // ocultar también el polígono de su zona, no sólo los pines.
+      const zonesWithPoints = new Set();
+      const zonesVisible = new Set();
+      for (const f of state.points) for (const zid of getPointZoneIds(f)) zonesWithPoints.add(zid);
+      for (const f of visible) for (const zid of getPointZoneIds(f)) zonesVisible.add(zid);
       for (const z of state.zones.values()) {
         if (state.filterZones.size > 0 && !state.filterZones.has(z.id)) continue;
+        if (state.hiddenZones.has(z.id)) continue;
+        if (zonesWithPoints.has(z.id) && !zonesVisible.has(z.id)) continue;
         const ringLonLat = getZoneRingLonLat(z.id);
         if (!ringLonLat || ringLonLat.length < 3) continue;
 
@@ -2175,6 +2195,19 @@
     makeChip("Postes", state.filterTypes.has("PUNTO"), () => toggleTypeChip("PUNTO"));
     makeChip("Aperturas ✕", state.filterTypes.has("APERTURA"), () => toggleTypeChip("APERTURA"), OPENING_COLOR);
 
+    // Un chip por categoría, como Zonas y Estados: el patrón de la app.
+    const supAll = [...new Set(state.points.map(f => getSupId(f)))];
+    if (supAll.length > 1) {
+      const supVis = Math.max(0, supAll.length - state.filterSups.size);
+      const supLabel = state.filterSups.size > 0
+        ? `Supervisor (${supVis}/${supAll.length}) ▾`
+        : "Supervisor ▾";
+      const cSup = makeChip(supLabel, state.filterSups.size > 0, (ev) => {
+        openSupervisorsVisibilityPopover(ev.currentTarget);
+      }, null, "Filtrar por supervisor");
+      cSup.style.fontWeight = "600";
+    }
+
     const remateCount = state.points.filter(f => f.get("esRemate")).length;
     if (remateCount > 0 || state.filterTypes.has("REMATE")) {
       makeChip(`▲ Remates (${remateCount})`, state.filterTypes.has("REMATE"), () => toggleTypeChip("REMATE"), "#7C3AED", "Combinable con otros filtros");
@@ -2771,16 +2804,86 @@
     showToast(`Estado "${state.statuses.get(statusId).name}" asignado a ${indices.length} elemento(s).`);
   }
 
-  function openZonesVisibilityPopover(anchorEl) {
+  function openSupervisorsVisibilityPopover(anchorEl) {
     const r = anchorEl.getBoundingClientRect();
+    popoverAnchor = anchorEl;
+    popoverKey = "supervisors";
     showPopoverAt(r.left, r.bottom + 6, (pop) => {
       pop.style.minWidth = "250px";
+      const supIds = [...new Set(state.points.map(f => getSupId(f)))];
+      const hiddenSup = supIds.filter((sid) => state.filterSups.has(sid)).length;
       const topRow = el("div", "", null, pop);
-      topRow.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:2px 6px 6px;";
+      topRow.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 6px 6px;";
+      const allCb = el("input", "", null, topRow);
+      allCb.type = "checkbox";
+      allCb.checked = hiddenSup === 0;
+      allCb.indeterminate = hiddenSup > 0 && hiddenSup < supIds.length;
+      allCb.title = "Marcar o desmarcar todos los supervisores";
+      allCb.onchange = () => {
+        const boxes = [...pop.querySelectorAll("input[data-sup-id]")];
+        for (const b of boxes) {
+          if (allCb.checked) state.filterSups.delete(b.dataset.supId);
+          else state.filterSups.add(b.dataset.supId);
+          b.checked = allCb.checked;
+        }
+        refreshAll();
+      };
+      el("span", "pop-title", "Visibilidad por Supervisor", topRow).style.padding = "0";
+
+      const wrap = el("div", "", null, pop);
+      wrap.style.cssText = "max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;";
+      for (const sid of supIds) {
+        const sup = state.supervisors.get(sid);
+        const label = sid === "default" ? "Sin supervisor" : ((sup && sup.name) || sid);
+        const row = el("div", "", null, wrap);
+        row.style.cssText = "display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:6px;";
+        const lbl = el("label", "", null, row);
+        lbl.style.cssText = "display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;flex:1;min-width:0;";
+        const cb = el("input", "", null, lbl);
+        cb.type = "checkbox";
+        cb.dataset.supId = sid;
+        cb.checked = !state.filterSups.has(sid);
+        cb.onchange = () => {
+          if (cb.checked) state.filterSups.delete(sid);
+          else state.filterSups.add(sid);
+          refreshAll();
+        };
+        const dot = el("span", "dot", null, lbl);
+        dot.style.background = (sup && sup.color) || "#94a3b8";
+        const count = state.points.filter(f => getSupId(f) === sid).length;
+        el("span", "", `${label} (${count})`, lbl).style.cssText =
+          "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+      }
+    });
+  }
+
+  function openZonesVisibilityPopover(anchorEl) {
+    const r = anchorEl.getBoundingClientRect();
+    popoverAnchor = anchorEl;
+    popoverKey = "zones";
+    showPopoverAt(r.left, r.bottom + 6, (pop) => {
+      pop.style.minWidth = "250px";
+      const allZ = [...state.zones.keys()];
+      const hiddenZ = allZ.filter((id) => state.hiddenZones.has(id)).length;
+      const topRow = el("div", "", null, pop);
+      topRow.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 6px 6px;";
+      // Un solo checkbox en el encabezado, como la cabecera de Excel: tilda todo,
+      // destilda todo, y queda indeterminado cuando hay mezcla.
+      const allCb = el("input", "", null, topRow);
+      allCb.type = "checkbox";
+      allCb.checked = hiddenZ === 0;
+      allCb.indeterminate = hiddenZ > 0 && hiddenZ < allZ.length;
+      allCb.title = "Marcar o desmarcar todas las zonas";
+      allCb.onchange = () => {
+        const boxes = [...pop.querySelectorAll("input[data-zone-id]")];
+        for (const b of boxes) {
+          if (allCb.checked) state.hiddenZones.delete(b.dataset.zoneId);
+          else state.hiddenZones.add(b.dataset.zoneId);
+          b.checked = allCb.checked;
+        }
+        refreshAll();
+      };
       el("span", "pop-title", "Visibilidad de Zonas", topRow).style.padding = "0";
-      const bAll = el("button", "btn-outline", "Todas", topRow);
-      bAll.style.cssText = "padding:2px 6px;font-size:10px;";
-      bAll.onclick = () => { state.hiddenZones.clear(); refreshAll(); openZonesVisibilityPopover(anchorEl); };
 
       const listWrap = el("div", "", null, pop);
       listWrap.style.cssText = "max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;";
@@ -2792,6 +2895,7 @@
         lbl.style.cssText = "display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;flex:1;min-width:0;";
         const cb = el("input", "", null, lbl);
         cb.type = "checkbox";
+        cb.dataset.zoneId = id;
         cb.checked = !state.hiddenZones.has(id);
         cb.onchange = () => {
           if (cb.checked) state.hiddenZones.delete(id);
@@ -2802,7 +2906,8 @@
           const d = el("span", "dot", null, lbl);
           d.style.background = color;
         }
-        const sp = el("span", "", label, lbl);
+        const count = state.points.filter(f => getPointZoneIds(f).includes(id)).length;
+        const sp = el("span", "", count ? `${label} (${count})` : label, lbl);
         sp.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
         const bSolo = el("button", "btn-outline", "Solo", row);
         bSolo.style.cssText = "padding:1px 6px;font-size:10px;";
@@ -2824,21 +2929,36 @@
   }
 
   function openStatusesVisibilityPopover(anchorEl) {
+    popoverKey = "statuses";
     const r = anchorEl.getBoundingClientRect();
     showPopoverAt(r.left, r.bottom + 6, (pop) => {
       pop.style.minWidth = "240px";
+      const stIds = [...state.statuses.keys()];
+      const hiddenSt = stIds.filter((id) => state.hiddenStatuses.has(id)).length;
       const topRow = el("div", "", null, pop);
-      topRow.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:2px 6px 6px;";
+      topRow.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 6px 6px;";
+      const allCb = el("input", "", null, topRow);
+      allCb.type = "checkbox";
+      allCb.checked = hiddenSt === 0;
+      allCb.indeterminate = hiddenSt > 0 && hiddenSt < stIds.length;
+      allCb.title = "Marcar o desmarcar todos los estados";
+      allCb.onchange = () => {
+        const boxes = [...pop.querySelectorAll("input[data-status-id]")];
+        for (const b of boxes) {
+          if (allCb.checked) state.hiddenStatuses.delete(b.dataset.statusId);
+          else state.hiddenStatuses.add(b.dataset.statusId);
+          b.checked = allCb.checked;
+        }
+        refreshAll();
+      };
       el("span", "pop-title", "Estados de ejecución", topRow).style.padding = "0";
-      const bAll = el("button", "btn-outline", "Todos", topRow);
-      bAll.style.cssText = "padding:2px 6px;font-size:10px;";
-      bAll.onclick = () => { state.hiddenStatuses.clear(); refreshAll(); openStatusesVisibilityPopover(anchorEl); };
 
       for (const st of state.statuses.values()) {
         const row = el("label", "pop-item", null, pop);
         row.style.cursor = "pointer";
         const cb = el("input", "", null, row);
         cb.type = "checkbox";
+        cb.dataset.statusId = st.id;
         cb.checked = !state.hiddenStatuses.has(st.id);
         cb.onchange = () => {
           if (cb.checked) state.hiddenStatuses.delete(st.id);
@@ -2889,6 +3009,27 @@
   }
 
   function showPopoverAt(x, y, buildFn, anchorBottom = false) {
+    // El ancla manda: la identidad del elemento es estable, la posición no.
+    // La fila de chips se desplaza unos píxeles entre clics y el chequeo por
+    // coordenadas fallaba, así que el segundo clic reabría en vez de cerrar.
+    const anchor = popoverAnchor || lastMouseDownTarget;
+    const key = popoverKey;
+    popoverAnchor = null;
+    popoverKey = null;
+    // La clave de categoría es lo más estable: sobrevive a que las fichas se
+    // re-rendericen y a que la barra se reposicione sola cada 900 ms.
+    if (activePopover && key && activePopoverKey === key) {
+      closePopover();
+      return null;
+    }
+    if (activePopover && anchor && activePopoverAnchor === anchor) {
+      closePopover();
+      return null;
+    }
+    if (activePopover && !anchor && activePopoverPos && Math.abs(activePopoverPos.x - x) <= 4 && Math.abs(activePopoverPos.y - y) <= 4) {
+      closePopover();
+      return null;
+    }
     closePopover();
     const pop = el("div", "popover");
     buildFn(pop);
@@ -2901,6 +3042,9 @@
     pop.style.left = left + "px";
     pop.style.top = top + "px";
     activePopover = pop;
+    activePopoverPos = { x, y };
+    activePopoverAnchor = anchor;
+    activePopoverKey = key;
     return pop;
   }
 
@@ -3124,6 +3268,21 @@
           z.color = newColor; styleCache = new WeakMap(); markDirty(); refreshAll();
         });
 
+        // Ocultar/mostrar la zona entera: pines y polígono, con el mismo set que
+        // usa el filtro de puntos, para que la tabla y el mapa no se contradigan.
+        const isHidden = state.hiddenZones.has(z.id);
+        const bEye = el("button", "btn-outline icon-btn", "", row);
+        bEye.textContent = isHidden ? "◌" : "◉";
+        bEye.title = isHidden
+          ? `Mostrar "${z.name}" en el mapa`
+          : `Ocultar "${z.name}" del mapa (puntos y polígono)`;
+        if (isHidden) bEye.style.opacity = "0.55";
+        bEye.onclick = () => {
+          if (state.hiddenZones.has(z.id)) state.hiddenZones.delete(z.id);
+          else state.hiddenZones.add(z.id);
+          markDirty(); refreshAll(); btnZonas.click();
+        };
+
         const nameInp = el("input", "", null, row);
         nameInp.type = "text";
         nameInp.value = z.name || z.id;
@@ -3150,6 +3309,11 @@
           bDelZ.title = `Eliminar zona "${z.id}"`;
           bDelZ.style.color = "var(--danger)";
           bDelZ.onclick = () => { deleteZone(z.id); btnZonas.click(); };
+        } else {
+          const locked = el("span", "", "base", row);
+          locked.title = "Zona base D/T/F: no se elimina, se oculta con el botón de visibilidad";
+          locked.style.opacity = "0.6";
+          locked.style.fontSize = "11px";
         }
       }
 
@@ -5091,8 +5255,17 @@
     }
   };
   doc.addEventListener("keydown", onKeyDown);
+  // En fase de captura, para conocer el disparador antes que nadie.
+  doc.addEventListener("mousedown", (ev) => { lastMouseDownTarget = ev.target; }, true);
   doc.addEventListener("mousedown", (ev) => {
-    if (activePopover && !ev.composedPath().includes(activePopover)) closePopover();
+    if (!activePopover) return;
+    // Cerrar sólo si el clic fue realmente afuera. Si cayó sobre el disparador
+    // que abrió el popover, el click del propio botón hace el toggle: cerrarlo
+    // acá era justo lo que hacía que el botón reabriera en vez de cerrar.
+    const path = ev.composedPath();
+    if (path.includes(activePopover)) return;
+    if (activePopoverAnchor && path.includes(activePopoverAnchor)) return;
+    closePopover();
   });
 
   function destroy() {
