@@ -1120,12 +1120,25 @@
     } catch (_) {}
     const maxBarW = Math.max(280, Math.round(gnatSearchLeft - leftPx));
 
+    // El desplegable del buscador nativo (ExtJS) crece hacia abajo y quedaba
+    // tapado por el panel. Si está abierto, el panel arranca debajo suyo: se
+    // desplaza y se achica, en vez de esconder los resultados de GNAT.
+    let gnatDropBottom = 0;
+    try {
+      for (const bl of w.document.querySelectorAll('.x-boundlist')) {
+        const br = bl.getBoundingClientRect();
+        if (br.height > 40 && br.width > 120 && br.top < rect.top + 320 && br.right > rect.left + 200) {
+          gnatDropBottom = Math.max(gnatDropBottom, Math.round(br.bottom));
+        }
+      }
+    } catch (_) {}
+
     topbar.style.left = `${leftPx}px`;
     topbar.style.width = "auto";
     topbar.style.maxWidth = `${maxBarW}px`;
     topbar.style.top = `${topPx}px`;
 
-    drawer.style.top = `${topPx + 46}px`;
+    drawer.style.top = `${Math.max(topPx + 46, gnatDropBottom > 0 ? gnatDropBottom + 8 : 0)}px`;
     drawer.style.right = `${rightGap}px`;
     drawer.style.bottom = `${Math.max(12, Math.round(w.innerHeight - rect.bottom) + 12)}px`;
 
