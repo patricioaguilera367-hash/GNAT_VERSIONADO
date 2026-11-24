@@ -3196,6 +3196,9 @@
 
   function openColorPickerPopover(anchorEl, currentColor, onPick, anchorAbove = false, allowReset = false) {
     const r = anchorEl.getBoundingClientRect();
+    // El ancla se fija explícitamente. Sin esto, showPopoverAt cae en lastMouseDownTarget
+    // —el propio botón de color— y el chequeo de toggle puede cerrar en vez de abrir.
+    popoverAnchor = anchorEl;
     showPopoverAt(anchorAbove ? r.left : r.right + 6, anchorAbove ? r.top - 6 : r.top, (pop) => {
       pop.style.minWidth = "210px";
       el("div", "pop-title", "Paleta de alto contraste", pop);
@@ -4667,6 +4670,10 @@
       if (f.get("syncStatus") === "cancelled") return false;
 
       const primaryHit = hitPole || hitSsee;
+      // Si sólo se resolvió la S/E, esa S/E NO es la ubicación del punto: sirve para
+      // los campos de S/E, no para mover el pin ni para medir la distancia Excel↔GNAT
+      // contra ella. Ese era el origen del "56449 m" con el poste ya cargado (S14).
+      const locHit = hitPole || (isApPoint ? primaryHit : null);
 
       if (!primaryHit?.lonlat) {
         // Fallback: si no apareció por código pero tiene coordenada Excel, mirar qué hay en esa coordenada
@@ -4706,21 +4713,25 @@
 
       // Validar contra coordenada Excel: <= 150 m -> auto-snap exacto a GNAT; > 150 m -> inconsistencia sin mover el pin
       let distMeters = 0;
-      if (existingLL) {
-        distMeters = haversineMeters(existingLL, primaryHit.lonlat);
+      if (!locHit) {
+        // Sólo se resolvió la S/E: no existe ubicación de poste contra la cual medir,
+        // así que no se mueve el pin ni se declara inconsistencia (S14).
+        infoNotes.push(`Sólo se resolvió la S/E ${primaryHit.code}; ese código no corresponde a un poste.`);
+      } else if (existingLL) {
+        distMeters = haversineMeters(existingLL, locHit.lonlat);
         if (distMeters <= 150) {
-          f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(primaryHit.lonlat, proj)));
+          f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(locHit.lonlat, proj)));
           snappedToGnat = true;
         } else {
-          notes.push(`GNAT ubica ${primaryHit.code} a ${Math.round(distMeters)} m de tu coord. Excel — verificar.`);
+          notes.push(`GNAT ubica ${locHit.code} a ${Math.round(distMeters)} m de tu coord. Excel — verificar.`);
         }
       } else {
-        f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(primaryHit.lonlat, proj)));
+        f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(locHit.lonlat, proj)));
         snappedToGnat = true;
       }
 
       // 2. Rescatar metadata técnica (S/E, COCI_3F kA, protecciones reales) en la coordenada exacta del poste en GNAT
-      const probeLL = (snappedToGnat || !existingLL) ? primaryHit.lonlat : existingLL;
+      const probeLL = (snappedToGnat || !existingLL) ? (locHit?.lonlat || existingLL || primaryHit.lonlat) : existingLL;
       const nb = await inspectPoleNeighborhoodInGnat(primaryHit.code, probeLL, [], true);
       if (f.get("syncStatus") === "cancelled") return snappedToGnat;
 
