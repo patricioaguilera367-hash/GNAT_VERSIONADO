@@ -4270,6 +4270,25 @@
   function closeModal() {
     modalBackdrop.classList.add("hidden");
     modalBackdrop.replaceChildren();
+    // U6: el foco vuelve a quien abrió la ventana.
+    const back = modalReturnFocus;
+    modalReturnFocus = null;
+    if (back && typeof back.focus === "function") {
+      try { back.focus({ preventScroll: true }); } catch (_) {}
+    }
+  }
+
+  // U6: al abrir una ventana el foco va al primer campo útil; si no hay campos,
+  // a la tarjeta misma. Una sola función, ningún modal lo declara por su cuenta.
+  let modalReturnFocus = null;
+  function focusModalFirstField(card) {
+    if (!card || card.__focused) return;
+    card.__focused = true;
+    const fields = [...card.querySelectorAll("input, textarea, select")]
+      .filter((el) => el.type !== "hidden" && !el.disabled && el.getClientRects().length > 0);
+    const target = fields[0] || card;
+    if (target === card) card.tabIndex = -1;
+    try { target.focus({ preventScroll: true }); } catch (_) {}
   }
 
   // --- Política única de capas (U1, U16) -----------------------------------
@@ -4299,7 +4318,19 @@
   try {
     new w.MutationObserver(() => {
       const card = modalBackdrop.querySelector(".modal-card");
-      if (card && !card.__initial) w.setTimeout(() => snapshotModalInputs(card), 0);
+      if (!card) return;
+      w.setTimeout(() => {
+        if (!card.__initial) snapshotModalInputs(card);
+        if (!card.__focused) {
+          if (!modalReturnFocus) {
+            // `root` es un div: el que sabe quién tiene el foco es el ShadowRoot.
+            const inner = (shadow && shadow.activeElement) || null;
+            const outer = doc.activeElement;
+            modalReturnFocus = inner || (outer && outer !== doc.body && outer !== host ? outer : null);
+          }
+          focusModalFirstField(card);
+        }
+      }, 0);
     }).observe(modalBackdrop, { childList: true });
   } catch (_) {}
 
