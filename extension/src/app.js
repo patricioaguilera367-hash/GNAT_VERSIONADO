@@ -537,7 +537,9 @@
   // =========================================================================
   // 5. MOTOR GNAT DMS (svc_wmc.php + Caché + Grafo MT A->B + Aperturas/Remates)
   // =========================================================================
-  const CODE_AT_START = /^([A-Z]{0,3}\d{3,12})\b/i;
+  // Un código de GNAT empieza con letra. Sin esta guarda, un id interno numérico
+  // (3985557) se parsea como código de poste y se muestra como tal (S12).
+  const CODE_AT_START = /^([A-Z]{1,3}\d{3,12})\b/i;
   // Permite nodos de hasta 12 dígitos (ej. 467251498) y sufijos descriptivos
   const SPAN_PAIR_REGEX = /^([A-Z]{0,3}\d{3,12})\s*[-–]\s*([A-Z]{0,3}\d{3,12})\b/i;
   const COCI_3F_REGEX = /<td>\s*(\d+(?:\.\d+)?)\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>\s*<td>\s*\d+(?:\.\d+)?\s*<\/td>/i;
@@ -729,7 +731,9 @@
         return score(b.display || "") - score(a.display || "");
       });
 
+      const resolvedEntries = [];
       for (const cand of candidates) {
+        if (resolvedEntries.length >= 4) break;
         const idsToTry = [...new Set([Number(cand.surrogate_in_map_id), Number(cand.object_id)].filter(n => Number.isFinite(n) && n > 0))];
         for (const id of idsToTry) {
           try {
@@ -756,10 +760,20 @@
               };
               await dbPutGnatCache(entry);
               entry.code = q;
-              return entry;
+              resolvedEntries.push(entry);
+              break;
             }
           } catch (_) {}
         }
+      }
+      if (resolvedEntries.length) {
+        // Un mismo código identifica VARIOS objetos. Se elige el más cercano al punto
+        // que se está editando, no el primero que devuelve la búsqueda: una S/E con el
+        // mismo código a 2 km no le gana a la que está al lado del poste (S8/S13).
+        if (nearLL && resolvedEntries.length > 1) {
+          resolvedEntries.sort((a, b) => haversineMeters(nearLL, a.lonlat) - haversineMeters(nearLL, b.lonlat));
+        }
+        return resolvedEntries[0];
       }
     }
     return null;
@@ -4649,7 +4663,7 @@
         : null;
       if (isApPoint && hitPole?.protId && !userProtPref) f.set("proteccionTipo", hitPole.protId);
       if (f.get("syncStatus") === "cancelled") return false;
-      const hitSsee = (sseeRaw && sseeRaw !== code) ? await resolveCodeInGnat(sseeRaw, true, false, { preferSsee: true }) : null;
+      const hitSsee = (sseeRaw && sseeRaw !== code) ? await resolveCodeInGnat(sseeRaw, true, false, { preferSsee: true, nearLonLat: existingLL || hitPole?.lonlat || null }) : null;
       if (f.get("syncStatus") === "cancelled") return false;
 
       const primaryHit = hitPole || hitSsee;
@@ -4687,6 +4701,8 @@
         const dBoth = haversineMeters(hitPole.lonlat, hitSsee.lonlat);
         if (dBoth > 40) bothDistPending = dBoth;
       }
+      // Avisos que NO son una inconsistencia del punto: se muestran, pero no lo marcan en rojo.
+      const infoNotes = [];
 
       // Validar contra coordenada Excel: <= 150 m -> auto-snap exacto a GNAT; > 150 m -> inconsistencia sin mover el pin
       let distMeters = 0;
@@ -4710,7 +4726,9 @@
 
       const sseeConfirmedHere = sseeRaw && nb.sseeList.some(x => x.toUpperCase() === sseeRaw);
       if (bothDistPending !== null && !sseeConfirmedHere) {
-        notes.push(`Poste ${code} y S/E ${sseeRaw} están a ${Math.round(bothDistPending)} m en GNAT — verificar.`);
+        // No es un error del punto: la S/E resuelta puede ser otro objeto con el mismo
+        // código. Con DIST. EXCEL↔GNAT en 0 m marcarlo en rojo contradecía el dato (S11).
+        infoNotes.push(`La S/E ${sseeRaw} resuelta está a ${Math.round(bothDistPending)} m del poste ${code}: puede ser otro objeto con el mismo código.`);
       }
       const foundSsee = (nb.sseeList[0] || sseeRaw || "").toUpperCase();
       const foundDev = nb.devices[0] || primaryHit.devices?.[0] || null;
@@ -4719,10 +4737,17 @@
       // Reconciliación automática S/E <-> Poste: si el usuario cargó el código de la S/E como código principal,
       // moverlo a Cód. S/E y promover el código real del poste (ej. F59430 -> Poste F628190 + SSEE F59430 + DF XS)
       const realPole = (nb.detectedPoleCode || "").toUpperCase();
-      if (foundSsee && code === foundSsee && realPole && realPole !== code) {
+      if (foundSsee && code === foundSsee) {
+        // El código cargado es el de la S/E, no el de un poste: va al campo de S/E.
         f.set("sseeCode", `SSEE ${foundSsee}`);
-        f.set("codigo", realPole);
-        if (!f.get("proteccionTipo")) f.set("proteccionTipo", "DF_XS");
+        if (realPole && realPole !== code) {
+          f.set("codigo", realPole);
+          if (!f.get("proteccionTipo")) f.set("proteccionTipo", "DF_XS");
+        } else {
+          // Sin un poste distinto no se repite el código de la S/E en los dos campos (S7).
+          f.set("codigo", "Sin código");
+          notes.push(`El código ${code} corresponde a la S/E, no a un poste: falta el código del poste — verificar.`);
+        }
       }
 
       const hitProt = primaryHit.protId || (primaryHit.isOpeningDevice ? mapProtectionFromText(primaryHit.display || "") : "");
@@ -4741,7 +4766,7 @@
       }
 
       f.set("gnatMeta", {
-        poleCode: nb.detectedPoleCode || primaryHit.code,
+        poleCode: (primaryHit.isSsee && !nb.detectedPoleCode) ? "" : (nb.detectedPoleCode || primaryHit.code),
         display: primaryHit.display || primaryHit.code,
         sseeCode: foundSsee ? `SSEE ${foundSsee}` : "",
         coci3f: nb.coci3f,
@@ -4757,7 +4782,7 @@
         distMeters: snappedToGnat ? 0 : distMeters,
         syncedAt: new Date().toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
       });
-      f.set("syncNote", notes.join(" "));
+      f.set("syncNote", [...notes, ...infoNotes].join(" "));
       f.set("syncStatus", notes.length ? "mismatch" : "ok");
       return snappedToGnat;
     } catch (err) {
@@ -5043,7 +5068,10 @@
         const obsArr = obsText ? [{ text: obsText, at: new Date().toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" }) }] : [];
 
         const feat = upsertPointOnMap({
-          codigo: codigo || sseeCode || codigoTerreno,
+          // El código de la S/E no se usa como código de poste: repetirlo en los dos
+          // campos es lo que rompía la sincronización (S7). Sin poste, el punto queda
+          // sin código de poste pero conserva su S/E.
+          codigo: codigo || codigoTerreno,
           codigoTerreno,
           sseeCode: sseeCode ? `SSEE ${sseeCode}` : "",
           proteccionTipo: sseeCode ? "DF_XS" : "",
