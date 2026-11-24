@@ -4919,6 +4919,7 @@
       ["lat", "Latitud"],
       ["lon", "Longitud"],
       ["codigoTerreno", "Cód. terreno"],
+      ["supervisor", "Supervisor"],
       ["obs", "Observación"],
       ["estado", "Estado"],
       ["ignorar", "Ignorar"]
@@ -4984,7 +4985,7 @@
       const placedIndices = [];
 
       for (const row of dataRows) {
-        let numero = null, codigo = "", sseeCode = "", codigoTerreno = "", lat = null, lon = null, obsText = "", stName = "";
+        let numero = null, codigo = "", sseeCode = "", codigoTerreno = "", lat = null, lon = null, obsText = "", stName = "", supName = "";
         row.forEach((cell, ci) => {
           const role = roles[ci];
           const val = String(cell || "").trim();
@@ -5014,6 +5015,8 @@
             obsText = obsText ? `${obsText} · ${val}` : val;
           } else if (role === "estado") {
             stName = val;
+          } else if (role === "supervisor") {
+            supName = val;
           }
         });
 
@@ -5029,7 +5032,7 @@
 
         let estadoEjec = defaultSt;
         if (stName) {
-          const matchSt = [...state.statuses.values()].find(s => s.name.toLowerCase() === stName.toLowerCase());
+          const matchSt = [...state.statuses.values()].find(s => CAT.foldText(s.name) === CAT.foldText(stName));
           if (matchSt) estadoEjec = matchSt.id;
         }
         const obsArr = obsText ? [{ text: obsText, at: new Date().toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" }) }] : [];
@@ -5048,7 +5051,25 @@
           observaciones: obsArr,
           syncStatus: "loading"
         });
-        if (targetSup !== "default") feat.set("supervisorId", targetSup);
+        // El supervisor de la fila gana sobre el desplegable global. Se compara sin
+        // tildes ni mayusculas, y se acepta el nombre recortado ("Tomas Lem" vs
+        // "Tomas Lemunao"), que es como lo escribe la planilla a mano.
+        let rowSup = targetSup;
+        if (supName) {
+          const folded = CAT.foldText(supName);
+          const hit = [...state.supervisors.values()].find((s) => {
+            const n = CAT.foldText(s.name);
+            const ini = CAT.foldText(s.initials);
+            if (folded === n || folded === ini) return true;
+            return folded.length >= 4 && (n.startsWith(folded) || folded.startsWith(n));
+          });
+          if (hit) rowSup = hit.id;
+          else if (LEGACY_COLOR_TO_SUP[supName]) rowSup = LEGACY_COLOR_TO_SUP[supName];
+        }
+        if (rowSup !== "default") {
+          feat.set("supervisorId", rowSup);
+          state.multiSupervisorEnabled = true;
+        }
         const idx = state.points.indexOf(feat);
         if (lonlat && idx >= 0) placedIndices.push(idx);
         toResolveBg.push(feat);

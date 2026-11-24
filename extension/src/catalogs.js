@@ -125,8 +125,8 @@
     });
 
     const first = normRows[0];
-    const headerRegex = /^(n[°ºo]?|num|numero|c[oó]d|codigo|poste|lat|lon|long|estado|obs|zona|terreno|ct|s\/?e|ssee)/i;
-    const hasHeader = normRows.length >= 2 && first.some(c => headerRegex.test(c)) && !first.some(c => /^-?\d{2}[.,]\d{3,9}$/.test(c));
+    const headerRegex = /^(n[°ºo]?|num|numero|c[oó]d|codigo|poste|lat|lon|long|estado|obs|zona|terreno|ct|s\/?e|ssee|supervis|responsable|encargad|instalador|tecnico)/i;
+    const hasHeader = normRows.length >= 2 && first.some(c => headerRegex.test(String(c || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""))) && !first.some(c => /^-?\d{2}[.,]\d{3,9}$/.test(c));
     const dataRows = hasHeader ? normRows.slice(1) : normRows;
 
     const parseCoordNum = (v) => {
@@ -135,13 +135,17 @@
       return Number(s);
     };
 
+    // Comparacion tolerante: sin tildes, sin mayusculas y sin puntuacion. Asi
+    // "SUPERVISOR", "Supervisor" y "Supervisión" caen en la misma regla.
+    const foldText = (s) => String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
     const colRoles = [];
     for (let c = 0; c < maxCols; c++) {
-      const h = (hasHeader ? first[c] : "").toLowerCase();
+      const h = foldText(hasHeader ? first[c] : "");
       const sample = dataRows.slice(0, 12).map(r => r[c]).filter(Boolean);
       if (/^n[°ºo]?$|num/i.test(h)) { colRoles.push("numero"); continue; }
       if (/lat/i.test(h)) { colRoles.push("lat"); continue; }
       if (/lon/i.test(h)) { colRoles.push("lon"); continue; }
+      if (/supervis|responsable|encargad|instalador|tecnico/i.test(h)) { colRoles.push("supervisor"); continue; }
       if (/s\/?e\b|ssee|subestaci|\bsed\b|trafo/i.test(h)) { colRoles.push("sseeCode"); continue; }
       if (/terreno|\bct\b/i.test(h)) { colRoles.push("codigoTerreno"); continue; }
       if (/estado/i.test(h)) { colRoles.push("estado"); continue; }
@@ -165,6 +169,9 @@
   }
 
   window.__C_CATALOGS = {
+    // Normalizacion compartida: el mapeo de columnas y la resolucion de nombres
+    // tienen que comparar igual, sin depender de tildes ni mayusculas.
+    foldText: (s) => String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim(),
     HIGH_CONTRAST_PALETTE,
     DEFAULT_SUPERVISORS,
     LEGACY_COLOR_TO_SUP,
