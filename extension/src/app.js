@@ -468,7 +468,12 @@
     try {
       const snap = serializeProjectPayload();
       state.undoStack.push({ label, snap });
-      if (state.undoStack.length > 20) state.undoStack.shift();
+      const UNDO_LIMIT = 200;
+      if (state.undoStack.length > UNDO_LIMIT) {
+        // El origen nunca se descarta: se tiene que poder volver hasta el principio.
+        const origin = state.undoStack[0];
+        state.undoStack = [origin, ...state.undoStack.slice(1 - UNDO_LIMIT)];
+      }
     } catch (_) {}
   }
 
@@ -4245,6 +4250,29 @@
     modalBackdrop.replaceChildren();
   }
 
+  // "Empezar en mapa vacío" no creaba nada: sólo cerraba el modal, así que el
+  // proyecto anterior seguía cargado. Acá se arranca un proyecto nuevo de verdad,
+  // reusando el mismo camino que usa el undo (serializeProjectPayload ↔ loadProjectData).
+  function startBlankProject() {
+    loadProjectData({
+      version: 6,
+      formato: "CentralityLocal",
+      id: "proj-" + Date.now(),
+      nombre: "Proyecto sin título",
+      updatedAt: Date.now(),
+      multiSupervisorEnabled: false,
+      supervisors: [],
+      statuses: [],
+      bloques: [],
+      spans: [],
+      graphNodes: [],
+      registros: []
+    });
+    state.undoStack = [];
+    closeModal();
+    showToast("Proyecto nuevo en blanco");
+  }
+
   async function openStartModal() {
     modalBackdrop.replaceChildren();
     modalBackdrop.classList.remove("hidden");
@@ -4252,7 +4280,7 @@
     const head = el("div", "modal-head", null, card);
     el("h2", "", "Centrality · Planificación D / T / F", head);
     const bBlank = el("button", "btn-primary", "Empezar en mapa vacío", head);
-    bBlank.onclick = closeModal;
+    bBlank.onclick = () => startBlankProject();
 
     const body = el("div", "modal-body", null, card);
     const dz = el("div", "dropzone", null, body);
