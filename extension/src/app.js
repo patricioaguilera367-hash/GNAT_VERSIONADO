@@ -86,6 +86,9 @@
   const OPENING_COLOR = "#DC2626";
   const UNASSIGNED_ZONE_COLOR = "#475569";
   const UMBRAL_ETIQUETA = 25;
+  // Tolerancia para decir "esta coordenada es este punto": 150 m cubre el redondeo de
+  // la planilla y sigue distinguiendo dos postes distintos.
+  const COORD_MATCH_METERS = 150;
 
   // =========================================================================
   // 2. ESTADO DE LA APLICACIÓN
@@ -4714,6 +4717,19 @@
     };
   }
 
+  // S15: el código de poste y el código de S/E son dos nombres igual de válidos del
+  // mismo punto, así que la coordenada ingresada se valida contra los dos y gana el
+  // que coincide. El que no coincide se descarta sin reportarlo: no es un error del
+  // dato. Sólo cuando no coincide con ninguno de los dos, la coordenada es el problema.
+  // Puro a propósito —recibe el medidor de distancia— porque la decisión no depende
+  // del mapa ni de la red, y así se puede probar sola.
+  function pickCoordCandidate(candidates, enteredLL, meters) {
+    if (!enteredLL || !Array.isArray(candidates) || !candidates.length) return null;
+    return candidates
+      .map(c => ({ label: c.label, hit: c.hit, meters: meters(enteredLL, c.hit.lonlat) }))
+      .sort((a, b) => a.meters - b.meters)[0];
+  }
+
   async function syncSinglePointWithGnat(f, force = false) {
     if (!f) return false;
     if (!force && f.get("syncStatus") === "cancelled") return false;
@@ -4742,10 +4758,15 @@
       if (f.get("syncStatus") === "cancelled") return false;
 
       const primaryHit = hitPole || hitSsee;
-      // Si sólo se resolvió la S/E, esa S/E NO es la ubicación del punto: sirve para
-      // los campos de S/E, no para mover el pin ni para medir la distancia Excel↔GNAT
-      // contra ella. Ese era el origen del "56449 m" con el poste ya cargado (S14).
-      const locHit = hitPole || (isApPoint ? primaryHit : null);
+      // Los dos nombres del punto, medidos contra la coordenada ingresada: gana el más
+      // cercano. Sin coordenada ingresada no hay nada que validar y ahí se conserva la
+      // regla S14: una S/E resuelta sola no mueve el pin ni se usa para medir distancia.
+      const locCandidates = [
+        hitPole?.lonlat ? { label: "poste", hit: hitPole } : null,
+        hitSsee?.lonlat ? { label: "S/E", hit: hitSsee } : null
+      ].filter(Boolean);
+      const locMatch = pickCoordCandidate(locCandidates, existingLL, haversineMeters);
+      const locHit = locMatch ? locMatch.hit : (hitPole || (isApPoint ? primaryHit : null));
 
       if (!primaryHit?.lonlat) {
         // Fallback: si no apareció por código pero tiene coordenada Excel, mirar qué hay en esa coordenada
@@ -4783,23 +4804,27 @@
       // Avisos que NO son una inconsistencia del punto: se muestran, pero no lo marcan en rojo.
       const infoNotes = [];
 
-      // Validar contra coordenada Excel: <= 150 m -> auto-snap exacto a GNAT; > 150 m -> inconsistencia sin mover el pin
+      // Validar la coordenada ingresada contra los dos nombres del punto: <= 150 m del
+      // poste o de la S/E es el mismo punto, y el pin se ajusta al que coincide. Si no
+      // coincide con ninguno, la coordenada es el problema y el aviso da las dos
+      // distancias para poder descartar el nombre equivocado de un vistazo.
       let distMeters = 0;
-      if (!locHit) {
-        // Sólo se resolvió la S/E: no existe ubicación de poste contra la cual medir,
-        // así que no se mueve el pin ni se declara inconsistencia (S14).
-        infoNotes.push(`Sólo se resolvió la S/E ${primaryHit.code}; ese código no corresponde a un poste.`);
-      } else if (existingLL) {
-        distMeters = haversineMeters(existingLL, locHit.lonlat);
-        if (distMeters <= 150) {
-          f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(locHit.lonlat, proj)));
-          snappedToGnat = true;
-        } else {
-          notes.push(`GNAT ubica ${locHit.code} a ${Math.round(distMeters)} m de tu coord. Excel — verificar.`);
-        }
-      } else {
+      if (locMatch && locMatch.meters <= COORD_MATCH_METERS) {
+        distMeters = locMatch.meters;
         f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(locHit.lonlat, proj)));
         snappedToGnat = true;
+      } else if (locMatch) {
+        distMeters = locMatch.meters;
+        const measured = locCandidates
+          .map(c => `${c.label} ${c.hit.code} a ${Math.round(haversineMeters(existingLL, c.hit.lonlat))} m`)
+          .join(" y ");
+        notes.push(`Tu coord. Excel no coincide con GNAT: ${measured} — verificar la coordenada.`);
+      } else if (locHit) {
+        f.setGeometry(new ol.geom.Point(ol.proj.fromLonLat(locHit.lonlat, proj)));
+        snappedToGnat = true;
+      } else {
+        // Sólo se resolvió la S/E y no hay coordenada con la cual ubicar el punto.
+        infoNotes.push(`Se ubicó la S/E ${primaryHit.code}; sin coordenada no hay dónde ubicar el punto.`);
       }
 
       // 2. Rescatar metadata técnica (S/E, COCI_3F kA, protecciones reales) en la coordenada exacta del poste en GNAT
