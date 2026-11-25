@@ -89,6 +89,17 @@
   // Tolerancia para decir "esta coordenada es este punto": 150 m cubre el redondeo de
   // la planilla y sigue distinguiendo dos postes distintos.
   const COORD_MATCH_METERS = 150;
+  // S16: una sola definición de columnas. El <colgroup>, el encabezado y cada fila
+  // salen de esta lista, así el ancho de una columna no se declara dos veces y no
+  // puede diferir entre encabezado y cuerpo. `requiresMultiSup` reemplaza al
+  // condicional suelto que antes decidía la columna Sup. por su cuenta.
+  const TABLE_COLUMNS = [
+    { id: "check", label: "", width: "30px" },
+    { id: "numero", label: "Rol/N°", width: "72px", sortKey: "numero" },
+    { id: "codigo", label: "Código", width: "", sortKey: "codigo" },
+    { id: "zona", label: "D / T / F", width: "96px", sortKey: "zona" },
+    { id: "sup", label: "Sup.", width: "52px", sortKey: "sup", requiresMultiSup: true }
+  ];
 
   // =========================================================================
   // 2. ESTADO DE LA APLICACIÓN
@@ -1069,6 +1080,7 @@
   const tableWrap = el("div", "table-wrap", null, drawer);
   tableWrap.tabIndex = 0;
   const table = el("table", "", null, tableWrap);
+  const colgroup = el("colgroup", "", null, table);
   const thead = el("thead", "", null, table);
   const tbody = el("tbody", "", null, table);
   const ctxBar = el("div", "ctx-bar hidden", null, drawer);
@@ -2321,42 +2333,53 @@
         : []
     );
 
+    const columns = TABLE_COLUMNS.filter(c => !c.requiresMultiSup || multiSup);
+    // El ancho vive en la lista: con table-layout:fixed el <colgroup> manda para el
+    // encabezado y para el cuerpo por igual, así no hay dos verdades sobre el ancho.
+    colgroup.replaceChildren();
+    for (const col of columns) {
+      const c = doc.createElement("col");
+      if (col.width) c.style.width = col.width;
+      colgroup.appendChild(c);
+    }
     thead.replaceChildren();
     const trh = el("tr", "", null, thead);
-    const thCheck = el("th", "", null, trh);
-    thCheck.style.width = "28px";
-    const checkAll = el("input", "", null, thCheck);
-    checkAll.type = "checkbox";
-    checkAll.checked = visible.length > 0 && visible.every(f => state.selected.has(state.points.indexOf(f)));
-    checkAll.indeterminate = !checkAll.checked && visible.some(f => state.selected.has(state.points.indexOf(f)));
-    checkAll.onchange = () => {
-      for (const f of visible) {
-        const idx = state.points.indexOf(f);
-        if (checkAll.checked) state.selected.add(idx);
-        else state.selected.delete(idx);
+    let checkAll = null;
+    for (const col of columns) {
+      const th = el("th", "", null, trh);
+      if (col.id === "check") {
+        checkAll = el("input", "", null, th);
+        continue;
       }
-      renderTable();
-      rebuildOverlayLayers();
-    };
-
-    const makeSortableTh = (key, label, width = "") => {
-      const arrow = state.sortBy === key ? (state.sortDir === "asc" ? " ▴" : " ▾") : "";
-      const th = el("th", "", label + arrow, trh);
-      if (width) th.style.width = width;
+      if (col.label) th.appendChild(doc.createTextNode(col.label));
+      // La flecha ocupa su lugar siempre: si apareciera sólo al ordenar, la etiqueta
+      // se correría de su columna al cambiar de criterio.
+      const arrow = el("span", "sort-arrow", "", th);
+      if (!col.sortKey) continue;
+      arrow.textContent = state.sortBy === col.sortKey ? (state.sortDir === "asc" ? "▴" : "▾") : "";
       th.style.cursor = "pointer";
       th.style.userSelect = "none";
       th.title = "Clic para ordenar ascendente / descendente";
       th.onclick = () => {
-        if (state.sortBy === key) state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
-        else { state.sortBy = key; state.sortDir = "asc"; }
+        if (state.sortBy === col.sortKey) state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+        else { state.sortBy = col.sortKey; state.sortDir = "asc"; }
         renderTable();
       };
-      return th;
-    };
-    makeSortableTh("numero", "Rol/N°", "54px");
-    makeSortableTh("codigo", "Código");
-    makeSortableTh("zona", "D / T / F", "88px");
-    if (multiSup) makeSortableTh("sup", "Sup.", "40px");
+    }
+    if (checkAll) {
+      checkAll.type = "checkbox";
+      checkAll.checked = visible.length > 0 && visible.every(f => state.selected.has(state.points.indexOf(f)));
+      checkAll.indeterminate = !checkAll.checked && visible.some(f => state.selected.has(state.points.indexOf(f)));
+      checkAll.onchange = () => {
+        for (const f of visible) {
+          const idx = state.points.indexOf(f);
+          if (checkAll.checked) state.selected.add(idx);
+          else state.selected.delete(idx);
+        }
+        renderTable();
+        rebuildOverlayLayers();
+      };
+    }
 
     const sortedVisible = [...visible].sort((a, b) => {
       const mul = state.sortDir === "asc" ? 1 : -1;
@@ -2382,7 +2405,7 @@
     if (state.points.length === 0) {
       const trEmpty = doc.createElement("tr");
       const tdEmpty = doc.createElement("td");
-      tdEmpty.colSpan = multiSup ? 5 : 4;
+      tdEmpty.colSpan = columns.length;
       const box = el("div", "empty-state", null, tdEmpty);
       el("div", "empty-state-title", "Sin puntos en este proyecto", box);
       el("div", "empty-state-sub", "Pega una tabla directo desde Excel o importa un KMZ, JSON o CSV para comenzar.", box);
@@ -2409,9 +2432,12 @@
       else if (isLinked) tr.classList.add("linked-highlight");
 
       const pColor = getPointColor(f);
-      tr.style.borderLeft = `3px solid ${pColor}`;
 
       const tdCb = doc.createElement("td");
+      // El color del punto va como sombra interior de la primera celda: un border-left
+      // en el <tr> corría 3 px todo el contenido del cuerpo respecto del encabezado,
+      // que no lleva ese borde. Mismo acento visual, sin desplazar nada.
+      tdCb.style.boxShadow = `inset 3px 0 0 ${pColor}`;
       const cb = doc.createElement("input");
       cb.type = "checkbox";
       cb.checked = isSel;
@@ -2439,12 +2465,10 @@
         rebuildOverlayLayers();
       };
       tdCb.appendChild(cb);
-      tr.appendChild(tdCb);
 
       const tdN = doc.createElement("td");
       tdN.className = "num-cell";
       tdN.textContent = String(f.get("rolPT") || f.get("numero"));
-      tr.appendChild(tdN);
 
       const tdCode = doc.createElement("td");
       const isAp = f.get("tipo") === "APERTURA";
@@ -2540,7 +2564,6 @@
         tdCode.appendChild(sub);
       }
       tdCode.title = `${getPointCode(f)} ${f.get("accionPT") ? "· " + f.get("accionPT") : ""}`;
-      tr.appendChild(tdCode);
 
       const tdZ = doc.createElement("td");
       const zids = getPointZoneIds(f);
@@ -2562,10 +2585,10 @@
         tdZ.textContent = "—";
         tdZ.style.color = "#94A3B8";
       }
-      tr.appendChild(tdZ);
 
+      let tdS = null;
       if (multiSup) {
-        const tdS = doc.createElement("td");
+        tdS = doc.createElement("td");
         const sup = state.supervisors.get(getSupId(f)) || DEFAULT_SUPERVISORS[0];
         const b = doc.createElement("span");
         b.className = "sup-badge";
@@ -2573,7 +2596,14 @@
         b.style.color = contrastText(sup.color);
         b.textContent = sup.initials;
         tdS.appendChild(b);
-        tr.appendChild(tdS);
+      }
+
+      // Las celdas entran en el orden de la lista de columnas: el encabezado y la fila
+      // no pueden separarse porque los dos leen la misma definición (S16).
+      const cellById = { check: tdCb, numero: tdN, codigo: tdCode, zona: tdZ, sup: tdS };
+      for (const col of columns) {
+        const cell = cellById[col.id];
+        if (cell) tr.appendChild(cell);
       }
 
       tr.onclick = () => navigateTo(idx);
@@ -2598,7 +2628,7 @@
         const trBar = doc.createElement("tr");
         trBar.style.background = "#EEF2FF";
         const tdBar = doc.createElement("td");
-        tdBar.colSpan = multiSup ? 5 : 4;
+        tdBar.colSpan = columns.length;
         tdBar.style.cssText = "padding:4px 8px;font-size:11px;";
         const barWrap = el("div", "", null, tdBar);
         barWrap.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;";
