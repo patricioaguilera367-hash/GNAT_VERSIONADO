@@ -107,6 +107,22 @@
     { id: "coci", label: "COCI_3F", width: "84px", sortKey: "coci", hiddenByDefault: true }
   ];
   const defaultHiddenColumns = () => TABLE_COLUMNS.filter(c => c.hiddenByDefault).map(c => c.id);
+  // S18: el orden de las columnas es dato del proyecto, no del código. Una columna que
+  // la lista guardada no conoce (recién agregada) entra al final en vez de desaparecer.
+  const orderedTableColumns = () => {
+    const byId = new Map(TABLE_COLUMNS.map(c => [c.id, c]));
+    const seen = new Set();
+    const out = [];
+    for (const id of state.columnOrder) {
+      const c = byId.get(id);
+      if (c && !seen.has(id)) {
+        out.push(c);
+        seen.add(id);
+      }
+    }
+    for (const c of TABLE_COLUMNS) if (!seen.has(c.id)) out.push(c);
+    return out;
+  };
 
   // =========================================================================
   // 2. ESTADO DE LA APLICACIÓN
@@ -126,6 +142,7 @@
     supervisors: new Map(DEFAULT_SUPERVISORS.map(s => [s.id, { ...s }])),
     multiSupervisorEnabled: false,
     hiddenColumns: new Set(defaultHiddenColumns()),
+    columnOrder: TABLE_COLUMNS.map(c => c.id),
     autoPrefixF: true,      // Pin [F] activo por defecto para Frontel
     selected: new Set(),    // Set<number> (indices in state.points)
     focused: -1,            // index in state.points
@@ -473,6 +490,7 @@
       updatedAt: Date.now(),
       multiSupervisorEnabled: state.multiSupervisorEnabled,
       hiddenColumns: [...state.hiddenColumns],
+      columnOrder: [...state.columnOrder],
       supervisors: [...state.supervisors.values()],
       statuses: [...state.statuses.values()],
       bloques: [...state.zones.values()].map(z => ({
@@ -2315,7 +2333,7 @@
     // revela en la tabla. Un solo chip por categoría, el mismo patrón de la app.
     const hiddenColCount = TABLE_COLUMNS.filter(c => state.hiddenColumns.has(c.id)).length;
     const cCols = makeChip(
-      hiddenColCount > 0 ? `Columnas (${hiddenColCount}) ▾` : "Columnas ▾",
+      "Columnas ▾",
       hiddenColCount > 0,
       (ev) => { openColumnsVisibilityPopover(ev.currentTarget); },
       null,
@@ -2354,7 +2372,10 @@
         : []
     );
 
-    const columns = TABLE_COLUMNS.filter(c => !c.requiresMultiSup || multiSup);
+    // S18: el orden del proyecto manda, y lo que está oculto no se renderiza. Sin este
+    // filtro las nueve columnas sumaban más ancho que la tabla y la única elástica
+    // (Código) colapsaba a 0 px, que se veía como "borraste el código del poste".
+    const columns = orderedTableColumns().filter(c => (!c.requiresMultiSup || multiSup) && !state.hiddenColumns.has(c.id));
     // El ancho vive en la lista: con table-layout:fixed el <colgroup> manda para el
     // encabezado y para el cuerpo por igual, así no hay dos verdades sobre el ancho.
     colgroup.replaceChildren();
@@ -3037,52 +3058,92 @@
     popoverAnchor = anchorEl;
     popoverKey = "columns";
     showPopoverAt(r.left, r.bottom + 6, (pop) => {
-      pop.style.minWidth = "220px";
-      const optional = TABLE_COLUMNS.filter(c => c.id !== "check" && (!c.requiresMultiSup || isMultiSupActive()));
-      const hiddenN = optional.filter(c => state.hiddenColumns.has(c.id)).length;
+      pop.style.minWidth = "240px";
+      const optionalIds = TABLE_COLUMNS.filter(c => c.id !== "check" && (!c.requiresMultiSup || isMultiSupActive())).map(c => c.id);
       const topRow = el("div", "", null, pop);
       topRow.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 6px 6px;";
       // Un solo checkbox en el encabezado, como la cabecera de Excel.
       const allCb = el("input", "", null, topRow);
       allCb.type = "checkbox";
-      allCb.checked = hiddenN === 0;
-      allCb.indeterminate = hiddenN > 0 && hiddenN < optional.length;
       allCb.title = "Marcar o desmarcar todas las columnas";
-      allCb.onchange = () => {
-        for (const c of optional) {
-          if (allCb.checked) state.hiddenColumns.delete(c.id);
-          else state.hiddenColumns.add(c.id);
-        }
-        // Una tabla sin ninguna columna no es un estado válido: siempre queda una.
-        if (optional.every(c => state.hiddenColumns.has(c.id))) state.hiddenColumns.delete(optional[0].id);
-        markDirty();
-        refreshAll();
-        openColumnsVisibilityPopover(anchorEl);
-      };
       const ttl = el("span", "", "Columnas visibles", topRow);
       ttl.style.cssText = "font-weight:700;font-size:11px;text-transform:uppercase;color:#475569;";
       const list = el("div", "", null, pop);
-      list.style.cssText = "display:flex;flex-direction:column;gap:2px;max-height:260px;overflow:auto;";
-      for (const c of optional) {
-        const row = el("label", "", null, list);
-        row.style.cssText = "display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:5px;cursor:pointer;";
-        const cb = el("input", "", null, row);
-        cb.type = "checkbox";
-        cb.checked = !state.hiddenColumns.has(c.id);
-        cb.onchange = () => {
-          if (cb.checked) state.hiddenColumns.delete(c.id);
-          else state.hiddenColumns.add(c.id);
-          if (optional.every(x => state.hiddenColumns.has(x.id))) {
-            state.hiddenColumns.delete(c.id);
-            cb.checked = true;
-            return;
-          }
-          markDirty();
-          refreshAll();
-          openColumnsVisibilityPopover(anchorEl);
-        };
-        el("span", "", c.label || c.id, row);
-      }
+      list.style.cssText = "display:flex;flex-direction:column;gap:2px;max-height:280px;overflow:auto;";
+
+      // El panel no se cierra ni se reconstruye al tocar una casilla: se aplica y se
+      // repinta la lista acá mismo. Reabrir el popover desde su propio manejador
+      // perdía el ancla (los chips se re-renderizan) y el panel terminaba cerrado.
+      const paint = () => {
+        const hiddenN = optionalIds.filter(id => state.hiddenColumns.has(id)).length;
+        allCb.checked = hiddenN === 0;
+        allCb.indeterminate = hiddenN > 0 && hiddenN < optionalIds.length;
+        list.replaceChildren();
+        const order = orderedTableColumns().filter(c => optionalIds.includes(c.id));
+        for (const c of order) {
+          const row = el("div", "", null, list);
+          row.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 4px;border-radius:5px;";
+          const cb = el("input", "", null, row);
+          cb.type = "checkbox";
+          cb.id = `col-cb-${c.id}`;
+          cb.checked = !state.hiddenColumns.has(c.id);
+          cb.onchange = () => {
+            if (cb.checked) state.hiddenColumns.delete(c.id);
+            else state.hiddenColumns.add(c.id);
+            apply();
+          };
+          const lbl = el("label", "", null, row);
+          lbl.htmlFor = cb.id;
+          lbl.style.cssText = "flex:1;cursor:pointer;display:flex;align-items:center;gap:6px;";
+          el("span", "", c.label || c.id, lbl);
+          // S18: reordenar. Mueve la columna dentro del orden guardado del proyecto.
+          const canMove = (delta) => {
+            const i = state.columnOrder.indexOf(c.id);
+            const j = i + delta;
+            return i >= 0 && j >= 0 && j < state.columnOrder.length && state.columnOrder[j] !== "check";
+          };
+          const mkMove = (text, delta, title) => {
+            const b = el("button", "", text, row);
+            b.type = "button";
+            b.title = title;
+            b.style.cssText = "padding:0 4px;font-size:10px;line-height:14px;border:1px solid #CBD5E1;background:#fff;border-radius:4px;cursor:pointer;";
+            b.disabled = !canMove(delta);
+            b.onclick = (ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              if (!canMove(delta)) return;
+              const i = state.columnOrder.indexOf(c.id);
+              const j = i + delta;
+              [state.columnOrder[i], state.columnOrder[j]] = [state.columnOrder[j], state.columnOrder[i]];
+              markDirty();
+              renderTable();
+              paint();
+            };
+          };
+          mkMove("\u25B2", -1, "Mover a la izquierda");
+          mkMove("\u25BC", 1, "Mover a la derecha");
+        }
+      };
+
+      const apply = () => {
+        // Una tabla sin ninguna columna no es un estado válido: siempre queda una.
+        if (optionalIds.every(id => state.hiddenColumns.has(id))) {
+          const first = optionalIds.find(id => id !== "codigo") || optionalIds[0];
+          state.hiddenColumns.delete(first);
+        }
+        markDirty();
+        renderTable();
+        paint();
+      };
+
+      allCb.onchange = () => {
+        for (const id of optionalIds) {
+          if (allCb.checked) state.hiddenColumns.delete(id);
+          else state.hiddenColumns.add(id);
+        }
+        apply();
+      };
+      paint();
     }, true);
   }
 
@@ -4053,6 +4114,14 @@
         ? data.hiddenColumns.filter(id => TABLE_COLUMNS.some(c => c.id === id && c.id !== "check"))
         : defaultHiddenColumns()
     );
+    state.columnOrder = Array.isArray(data.columnOrder) && data.columnOrder.length
+      ? (() => {
+          const known = new Set(TABLE_COLUMNS.map(c => c.id));
+          const kept = data.columnOrder.filter(id => known.has(id));
+          for (const c of TABLE_COLUMNS) if (!kept.includes(c.id)) kept.push(c.id);
+          return kept;
+        })()
+      : TABLE_COLUMNS.map(c => c.id);
     if (Array.isArray(data.statuses) && data.statuses.length) {
       state.statuses.clear();
       for (const st of data.statuses) {
@@ -4545,6 +4614,7 @@
       updatedAt: Date.now(),
       multiSupervisorEnabled: false,
       hiddenColumns: [...defaultHiddenColumns()],
+      columnOrder: TABLE_COLUMNS.map(c => c.id),
       supervisors: [],
       statuses: [],
       bloques: [],
