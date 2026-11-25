@@ -91,15 +91,22 @@
   const COORD_MATCH_METERS = 150;
   // S16: una sola definición de columnas. El <colgroup>, el encabezado y cada fila
   // salen de esta lista, así el ancho de una columna no se declara dos veces y no
-  // puede diferir entre encabezado y cuerpo. `requiresMultiSup` reemplaza al
-  // condicional suelto que antes decidía la columna Sup. por su cuenta.
+  // puede diferir entre encabezado y cuerpo.
+  // S17: un código de poste tiene mucha información asociada, así que las columnas que
+  // la revelan vienen ocultas por defecto y se encienden desde el chip «Columnas».
+  // `hiddenByDefault` es el único lugar donde se decide qué arranca oculto.
   const TABLE_COLUMNS = [
     { id: "check", label: "", width: "30px" },
-    { id: "numero", label: "Rol/N°", width: "72px", sortKey: "numero" },
+    { id: "numero", label: "Rol/N°", width: "64px", sortKey: "numero" },
     { id: "codigo", label: "Código", width: "", sortKey: "codigo" },
-    { id: "zona", label: "D / T / F", width: "96px", sortKey: "zona" },
-    { id: "sup", label: "Sup.", width: "52px", sortKey: "sup", requiresMultiSup: true }
+    { id: "zona", label: "Zona", width: "96px", sortKey: "zona" },
+    { id: "sup", label: "Sup.", width: "48px", sortKey: "sup", requiresMultiSup: true },
+    { id: "estado", label: "Estado", width: "112px", sortKey: "estado", hiddenByDefault: true },
+    { id: "equipo", label: "Equipo", width: "132px", sortKey: "equipo", hiddenByDefault: true },
+    { id: "dist", label: "Dist.", width: "68px", sortKey: "dist", hiddenByDefault: true },
+    { id: "coci", label: "COCI_3F", width: "84px", sortKey: "coci", hiddenByDefault: true }
   ];
+  const defaultHiddenColumns = () => TABLE_COLUMNS.filter(c => c.hiddenByDefault).map(c => c.id);
 
   // =========================================================================
   // 2. ESTADO DE LA APLICACIÓN
@@ -118,6 +125,7 @@
     ]),
     supervisors: new Map(DEFAULT_SUPERVISORS.map(s => [s.id, { ...s }])),
     multiSupervisorEnabled: false,
+    hiddenColumns: new Set(defaultHiddenColumns()),
     autoPrefixF: true,      // Pin [F] activo por defecto para Frontel
     selected: new Set(),    // Set<number> (indices in state.points)
     focused: -1,            // index in state.points
@@ -464,6 +472,7 @@
       nombre: state.projectName,
       updatedAt: Date.now(),
       multiSupervisorEnabled: state.multiSupervisorEnabled,
+      hiddenColumns: [...state.hiddenColumns],
       supervisors: [...state.supervisors.values()],
       statuses: [...state.statuses.values()],
       bloques: [...state.zones.values()].map(z => ({
@@ -2301,6 +2310,18 @@
       openStatusesVisibilityPopover(ev.currentTarget);
     }, null, "Filtrar por estado de ejecución o crear nuevos estados");
     cSt.style.fontWeight = "600";
+
+    // S17: el código de poste trae mucha información asociada; acá se elige cuál se
+    // revela en la tabla. Un solo chip por categoría, el mismo patrón de la app.
+    const hiddenColCount = TABLE_COLUMNS.filter(c => state.hiddenColumns.has(c.id)).length;
+    const cCols = makeChip(
+      hiddenColCount > 0 ? `Columnas (${hiddenColCount}) ▾` : "Columnas ▾",
+      hiddenColCount > 0,
+      (ev) => { openColumnsVisibilityPopover(ev.currentTarget); },
+      null,
+      "Mostrar u ocultar columnas de la tabla"
+    );
+    cCols.style.fontWeight = "600";
   }
 
   function renderTable() {
@@ -2395,6 +2416,27 @@
         const sa = CAT.foldText(state.supervisors.get(getSupId(a))?.name || "");
         const sb = CAT.foldText(state.supervisors.get(getSupId(b))?.name || "");
         return sa.localeCompare(sb, "es", { numeric: true }) * mul;
+      }
+      if (state.sortBy === "estado") {
+        const ea = state.statuses.get(a.get("estadoEjec") || "pendiente")?.name || "";
+        const eb = state.statuses.get(b.get("estadoEjec") || "pendiente")?.name || "";
+        return ea.localeCompare(eb, "es", { numeric: true, sensitivity: "base" }) * mul;
+      }
+      if (state.sortBy === "equipo") {
+        const da = String(a.get("gnatMeta")?.deviceDisplay || "");
+        const db = String(b.get("gnatMeta")?.deviceDisplay || "");
+        return da.localeCompare(db, "es", { numeric: true, sensitivity: "base" }) * mul;
+      }
+      if (state.sortBy === "dist") {
+        // -1 = sin dato, así los puntos sin medir quedan juntos en un extremo.
+        const qa = Number(a.get("gnatMeta")?.distMeters ?? -1);
+        const qb = Number(b.get("gnatMeta")?.distMeters ?? -1);
+        return (qa - qb) * mul;
+      }
+      if (state.sortBy === "coci") {
+        const ca = String(a.get("gnatMeta")?.coci3f || "");
+        const cb = String(b.get("gnatMeta")?.coci3f || "");
+        return ca.localeCompare(cb, "es", { numeric: true, sensitivity: "base" }) * mul;
       }
       const na = Number(a.get("numero")) || 0;
       const nb = Number(b.get("numero")) || 0;
@@ -2500,6 +2542,12 @@
       codeSpan.textContent = (isAp ? "✕ " : "") + getPointCode(f);
       if (isAp) codeSpan.style.color = OPENING_COLOR;
       codeSpan.style.fontWeight = "600";
+      // El chip de características conserva su tamaño y lo que se recorta es el código:
+      // es el chip inline lo que da la lectura orgánica de la fila, no la tabla.
+      codeSpan.style.minWidth = "0";
+      codeSpan.style.overflow = "hidden";
+      codeSpan.style.textOverflow = "ellipsis";
+      codeSpan.style.whiteSpace = "nowrap";
       mainLine.appendChild(codeSpan);
 
       if (syncSt === "loading") {
@@ -2568,19 +2616,24 @@
       const tdZ = doc.createElement("td");
       const zids = getPointZoneIds(f);
       if (zids.length) {
-        for (const zid of zids.slice(0, 3)) {
+        // Todas las zonas, sin tope. Van en un contenedor que envuelve: en una celda
+        // angosta el chip se comprimía hasta quedar en su borde y se veía como dos
+        // arcos sueltos, que era lo que el chip viejo mostraba.
+        const zWrap = doc.createElement("div");
+        zWrap.className = "zone-pill-wrap";
+        for (const zid of zids) {
           const z = state.zones.get(zid);
           const pill = doc.createElement("span");
           pill.className = "zone-pill";
-          pill.style.marginRight = "2px";
           const c = z?.color || HIGH_CONTRAST_PALETTE[0];
           pill.style.background = hexToRgba(c, 0.16);
           pill.style.color = "#0F172A";
           pill.style.border = `1px solid ${c}`;
           pill.textContent = zid;
           pill.title = z?.name || zid;
-          tdZ.appendChild(pill);
+          zWrap.appendChild(pill);
         }
+        tdZ.appendChild(zWrap);
       } else {
         tdZ.textContent = "—";
         tdZ.style.color = "#94A3B8";
@@ -2598,9 +2651,51 @@
         tdS.appendChild(b);
       }
 
+      // Columnas opcionales: revelan la información que el código de poste ya trae
+      // asociada. No reemplazan al chip inline del código, lo complementan (S17).
+      const showCol = (id) => columns.some(c => c.id === id);
+
+      let tdEstado = null;
+      if (showCol("estado")) {
+        tdEstado = doc.createElement("td");
+        const stx = state.statuses.get(f.get("estadoEjec") || "pendiente");
+        if (stx) {
+          const d = doc.createElement("span");
+          d.className = "status-dot";
+          d.style.background = stx.color;
+          tdEstado.appendChild(d);
+          const t = doc.createElement("span");
+          t.textContent = stx.name;
+          tdEstado.appendChild(t);
+        } else {
+          tdEstado.textContent = "—";
+        }
+      }
+
+      let tdEquipo = null;
+      if (showCol("equipo")) {
+        tdEquipo = doc.createElement("td");
+        tdEquipo.textContent = String(f.get("gnatMeta")?.deviceDisplay || "—");
+      }
+
+      let tdDist = null;
+      if (showCol("dist")) {
+        tdDist = doc.createElement("td");
+        tdDist.className = "num-cell";
+        const dm = f.get("gnatMeta")?.distMeters;
+        tdDist.textContent = Number.isFinite(dm) ? `${Math.round(dm)} m` : "—";
+      }
+
+      let tdCoci = null;
+      if (showCol("coci")) {
+        tdCoci = doc.createElement("td");
+        tdCoci.className = "num-cell";
+        tdCoci.textContent = String(f.get("gnatMeta")?.coci3f || "—");
+      }
+
       // Las celdas entran en el orden de la lista de columnas: el encabezado y la fila
       // no pueden separarse porque los dos leen la misma definición (S16).
-      const cellById = { check: tdCb, numero: tdN, codigo: tdCode, zona: tdZ, sup: tdS };
+      const cellById = { check: tdCb, numero: tdN, codigo: tdCode, zona: tdZ, sup: tdS, estado: tdEstado, equipo: tdEquipo, dist: tdDist, coci: tdCoci };
       for (const col of columns) {
         const cell = cellById[col.id];
         if (cell) tr.appendChild(cell);
@@ -2935,6 +3030,60 @@
           "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
       }
     });
+  }
+
+  function openColumnsVisibilityPopover(anchorEl) {
+    const r = anchorEl.getBoundingClientRect();
+    popoverAnchor = anchorEl;
+    popoverKey = "columns";
+    showPopoverAt(r.left, r.bottom + 6, (pop) => {
+      pop.style.minWidth = "220px";
+      const optional = TABLE_COLUMNS.filter(c => c.id !== "check" && (!c.requiresMultiSup || isMultiSupActive()));
+      const hiddenN = optional.filter(c => state.hiddenColumns.has(c.id)).length;
+      const topRow = el("div", "", null, pop);
+      topRow.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 6px 6px;";
+      // Un solo checkbox en el encabezado, como la cabecera de Excel.
+      const allCb = el("input", "", null, topRow);
+      allCb.type = "checkbox";
+      allCb.checked = hiddenN === 0;
+      allCb.indeterminate = hiddenN > 0 && hiddenN < optional.length;
+      allCb.title = "Marcar o desmarcar todas las columnas";
+      allCb.onchange = () => {
+        for (const c of optional) {
+          if (allCb.checked) state.hiddenColumns.delete(c.id);
+          else state.hiddenColumns.add(c.id);
+        }
+        // Una tabla sin ninguna columna no es un estado válido: siempre queda una.
+        if (optional.every(c => state.hiddenColumns.has(c.id))) state.hiddenColumns.delete(optional[0].id);
+        markDirty();
+        refreshAll();
+        openColumnsVisibilityPopover(anchorEl);
+      };
+      const ttl = el("span", "", "Columnas visibles", topRow);
+      ttl.style.cssText = "font-weight:700;font-size:11px;text-transform:uppercase;color:#475569;";
+      const list = el("div", "", null, pop);
+      list.style.cssText = "display:flex;flex-direction:column;gap:2px;max-height:260px;overflow:auto;";
+      for (const c of optional) {
+        const row = el("label", "", null, list);
+        row.style.cssText = "display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:5px;cursor:pointer;";
+        const cb = el("input", "", null, row);
+        cb.type = "checkbox";
+        cb.checked = !state.hiddenColumns.has(c.id);
+        cb.onchange = () => {
+          if (cb.checked) state.hiddenColumns.delete(c.id);
+          else state.hiddenColumns.add(c.id);
+          if (optional.every(x => state.hiddenColumns.has(x.id))) {
+            state.hiddenColumns.delete(c.id);
+            cb.checked = true;
+            return;
+          }
+          markDirty();
+          refreshAll();
+          openColumnsVisibilityPopover(anchorEl);
+        };
+        el("span", "", c.label || c.id, row);
+      }
+    }, true);
   }
 
   function openZonesVisibilityPopover(anchorEl) {
@@ -3897,6 +4046,13 @@
       state.supervisors = new Map(DEFAULT_SUPERVISORS.map(s => [s.id, { ...s }]));
     }
     state.multiSupervisorEnabled = Boolean(data.multiSupervisorEnabled);
+    // Las columnas ocultas son preferencia del proyecto: se validan contra la lista
+    // vigente para que una columna renombrada o retirada no quede como id fantasma.
+    state.hiddenColumns = new Set(
+      Array.isArray(data.hiddenColumns)
+        ? data.hiddenColumns.filter(id => TABLE_COLUMNS.some(c => c.id === id && c.id !== "check"))
+        : defaultHiddenColumns()
+    );
     if (Array.isArray(data.statuses) && data.statuses.length) {
       state.statuses.clear();
       for (const st of data.statuses) {
@@ -4388,6 +4544,7 @@
       nombre: "Proyecto sin título",
       updatedAt: Date.now(),
       multiSupervisorEnabled: false,
+      hiddenColumns: [...defaultHiddenColumns()],
       supervisors: [],
       statuses: [],
       bloques: [],
