@@ -2293,6 +2293,7 @@
     makeChip("Todos", !hasAnyFilter, () => {
       state.filterTypes.clear();
       state.hiddenZones.clear();
+      state.hiddenZoneAreas.clear();
       state.hiddenStatuses.clear();
       state.filterSups.clear();
       refreshAll();
@@ -2332,11 +2333,13 @@
 
     // Desplegable compacto de visibilidad de Zonas (desmarcas 1 para ocultarla)
     const totalZones = state.zones.size + 1; // + Sin zona
-    const visibleZones = Math.max(0, totalZones - state.hiddenZones.size);
-    const zChipLabel = state.hiddenZones.size > 0 ? `Zonas (${visibleZones}/${totalZones}) ▾` : "Zonas ▾";
-    const cZones = makeChip(zChipLabel, state.hiddenZones.size > 0, (ev) => {
+    // El chip cuenta áreas, que es el eje que la palabra «zona» describe. Los puntos
+    // de cada zona tienen su propia casilla etiquetada en el popover.
+    const visibleZones = Math.max(0, totalZones - state.hiddenZoneAreas.size);
+    const zChipLabel = state.hiddenZoneAreas.size > 0 ? `Zonas (${visibleZones}/${totalZones}) ▾` : "Zonas ▾";
+    const cZones = makeChip(zChipLabel, state.hiddenZoneAreas.size > 0, (ev) => {
       openZonesVisibilityPopover(ev.currentTarget);
-    }, null, "Mostrar u ocultar zonas individuales");
+    }, null, "Mostrar u ocultar el área pintada de cada zona");
     cZones.style.fontWeight = "600";
 
     // Desplegable compacto de visibilidad de Estados
@@ -3176,44 +3179,38 @@
     showPopoverAt(r.left, r.bottom + 6, (pop) => {
       pop.style.minWidth = "250px";
       const allZ = [...state.zones.keys()];
-      const hiddenZ = allZ.filter((id) => state.hiddenZones.has(id)).length;
+      const hiddenArea = allZ.filter((id) => state.hiddenZoneAreas.has(id)).length;
       const topRow = el("div", "", null, pop);
       topRow.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 6px 6px;";
-      // Un solo checkbox en el encabezado, como la cabecera de Excel: tilda todo,
-      // destilda todo, y queda indeterminado cuando hay mezcla.
+      // Un solo checkbox en el encabezado, como la cabecera de Excel, y manda sobre el
+      // ÁREA: es el eje que la palabra «zona» describe. Los puntos tienen su casilla
+      // por fila, y ninguna de las dos mueve a la otra.
       const allCb = el("input", "", null, topRow);
       allCb.type = "checkbox";
-      allCb.checked = hiddenZ === 0;
-      allCb.indeterminate = hiddenZ > 0 && hiddenZ < allZ.length;
-      allCb.title = "Marcar o desmarcar todas las zonas";
+      allCb.checked = hiddenArea === 0;
+      allCb.indeterminate = hiddenArea > 0 && hiddenArea < allZ.length;
+      allCb.title = "Pintar o no pintar el área de todas las zonas (los puntos no cambian)";
       allCb.onchange = () => {
-        const boxes = [...pop.querySelectorAll("input[data-zone-id]")];
+        const boxes = [...pop.querySelectorAll("input[data-zone-area]")];
         for (const b of boxes) {
-          if (allCb.checked) state.hiddenZones.delete(b.dataset.zoneId);
-          else state.hiddenZones.add(b.dataset.zoneId);
+          if (allCb.checked) state.hiddenZoneAreas.delete(b.dataset.zoneArea);
+          else state.hiddenZoneAreas.add(b.dataset.zoneArea);
           b.checked = allCb.checked;
         }
-        refreshAll();
+        markDirty();
+        renderFilterChips();
+        rebuildOverlayLayers();
       };
-      el("span", "pop-title", "Visibilidad de Zonas", topRow).style.padding = "0";
+      el("span", "pop-title", "Área y puntos por zona", topRow).style.padding = "0";
 
       const listWrap = el("div", "", null, pop);
       listWrap.style.cssText = "max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;";
 
       const addRow = (id, label, color) => {
         const row = el("div", "", null, listWrap);
-        row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:6px;padding:3px 6px;border-radius:6px;";
+        row.style.cssText = "display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:6px;";
         const lbl = el("label", "", null, row);
         lbl.style.cssText = "display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;flex:1;min-width:0;";
-        const cb = el("input", "", null, lbl);
-        cb.type = "checkbox";
-        cb.dataset.zoneId = id;
-        cb.checked = !state.hiddenZones.has(id);
-        cb.onchange = () => {
-          if (cb.checked) state.hiddenZones.delete(id);
-          else state.hiddenZones.add(id);
-          refreshAll();
-        };
         if (color) {
           const d = el("span", "dot", null, lbl);
           d.style.background = color;
@@ -3221,29 +3218,39 @@
         const count = state.points.filter(f => getPointZoneIds(f).includes(id)).length;
         const sp = el("span", "", count ? `${label} (${count})` : label, lbl);
         sp.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+
+        // S14: dos ejes con nombre, no un ícono. «Área» pinta o no pinta el relleno;
+        // «Puntos» decide si los puntos de la zona pasan los filtros. Ninguno mueve al otro.
+        const mkToggle = (text, isOn, title, onFlip) => {
+          const l = el("label", "", null, row);
+          l.style.cssText = "display:flex;align-items:center;gap:3px;font-size:10px;color:#475569;cursor:pointer;white-space:nowrap;";
+          const box = el("input", "", null, l);
+          box.type = "checkbox";
+          box.checked = isOn;
+          box.title = title;
+          box.onchange = () => onFlip(box.checked);
+          el("span", "", text, l);
+          return box;
+        };
+
+        const cbArea = mkToggle("Área", !state.hiddenZoneAreas.has(id), `Pintar el área de ${label} (los puntos no cambian)`, (on) => {
+          if (on) state.hiddenZoneAreas.delete(id);
+          else state.hiddenZoneAreas.add(id);
+          markDirty();
+          renderFilterChips();
+          rebuildOverlayLayers();
+        });
+        cbArea.dataset.zoneArea = id;
+
+        mkToggle("Puntos", !state.hiddenZones.has(id), `Mostrar los puntos de ${label}`, (on) => {
+          if (on) state.hiddenZones.delete(id);
+          else state.hiddenZones.add(id);
+          refreshAll();
+        });
+
         const bSolo = el("button", "btn-outline", "Solo", row);
         bSolo.style.cssText = "padding:1px 6px;font-size:10px;";
-        // Segundo eje, en la misma fila: el ojo apaga o prende el relleno de esta zona
-        // sin tocar qué puntos pasan. No agrega chip ni entrada de menú.
-        const bArea = el("button", "btn-outline", "", row);
-        setBtn(bArea, "eye", "", 12);
-        const paintAreaState = () => {
-          const on = isZoneAreaPainted(state.showHulls, state.hiddenZoneAreas, id);
-          bArea.style.cssText = `padding:1px 5px;font-size:10px;opacity:${on ? "1" : "0.35"};`;
-          bArea.title = on
-            ? `Dejar de pintar el área de ${label} (los puntos siguen visibles)`
-            : `Volver a pintar el área de ${label}`;
-        };
-        paintAreaState();
-        bArea.onclick = (ev) => {
-          ev.preventDefault();
-          ev.stopPropagation();
-          if (state.hiddenZoneAreas.has(id)) state.hiddenZoneAreas.delete(id);
-          else state.hiddenZoneAreas.add(id);
-          paintAreaState();
-          markDirty();
-          rebuildOverlayLayers();
-        };
+        bSolo.title = "Mostrar los puntos de esta zona y filtrar los de las demás";
         bSolo.onclick = () => {
           state.hiddenZones.clear();
           for (const oz of state.zones.keys()) if (oz !== id) state.hiddenZones.add(oz);
