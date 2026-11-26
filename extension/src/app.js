@@ -180,6 +180,8 @@
     // null/ausente = sin filtro en esa columna, Set vacío = nada pasa. Los chips de
     // filtro son el resumen de este estado, no un segundo mecanismo paralelo.
     columnFilters: new Map(), // Map<colId, Set<string>|null>
+    // S24: ancla del rango con Shift. Sin esto, Shift+clic no tiene desde dónde extender.
+    lastTouchedIdx: -1,
     lastSearchMissing: [],  // códigos pegados en el buscador que no están en la tabla
     recentColors: ["#00C853", "#FF6D00", "#DC2626", "#2979FF"],
     syncQueue: { running: false, paused: false, cancelled: false, total: 0, done: 0, items: [] },
@@ -2980,7 +2982,35 @@
         if (cell) tr.appendChild(cell);
       }
 
-      tr.onclick = () => navigateTo(idx);
+      // S24: el clic selecciona y NO mueve el mapa. Antes cada clic arrastraba la vista.
+      // Centrar queda como acción deliberada: doble clic abre la ficha, «Encuadrar» en la
+      // barra de selección y las flechas del teclado siguen centrando.
+      // Clic = reemplaza, Ctrl/Cmd = suma o resta, Shift = rango contiguo sobre lo visible.
+      tr.onclick = (ev) => {
+        const vis = visibleIndexSet();
+        const order = [];
+        state.points.forEach((f, i) => { if (vis.has(i)) order.push(i); });
+        const extendTo = (target) => {
+          const a = order.indexOf(state.lastTouchedIdx);
+          const b = order.indexOf(target);
+          if (a < 0 || b < 0) return false;
+          for (let k = Math.min(a, b); k <= Math.max(a, b); k++) state.selected.add(order[k]);
+          return true;
+        };
+        if (ev.shiftKey && extendTo(idx)) {
+          // rango tomado de lo visible, así no entra un punto que el filtro esconde
+        } else if (ev.ctrlKey || ev.metaKey) {
+          if (state.selected.has(idx)) state.selected.delete(idx);
+          else state.selected.add(idx);
+          state.lastTouchedIdx = idx;
+        } else {
+          state.selected.clear();
+          state.selected.add(idx);
+          state.lastTouchedIdx = idx;
+        }
+        state.focused = idx;
+        refreshAll();
+      };
       tr.ondblclick = (ev) => { ev.stopPropagation(); openEditPointModal(idx); };
       tr.oncontextmenu = (ev) => {
         ev.preventDefault();
