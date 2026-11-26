@@ -3961,13 +3961,13 @@
         if (it.kind === "title") { el("div", "pop-title", it.label, pop); continue; }
         const row = el("button", "pop-item", "", pop);
         if (it.items) {
-          row.innerHTML = `<span style="flex:1;text-align:left">${it.label}</span><span style="color:#94A3B8">\u25B8</span>`;
+          row.innerHTML = `<span style="flex:1;text-align:left">${it.label}</span>${it.hint ? `<span style="color:#94A3B8;font-size:10px;margin-right:6px">${it.hint}</span>` : ""}<span style="color:#94A3B8">\u25B8</span>`;
           row.onmouseenter = () => { timer = w.setTimeout(() => openFly(row, it.items), 220); };
           row.onmouseleave = () => { if (timer) { clearTimeout(timer); timer = 0; } };
           // El click también abre: el mouse no es la única mano, y el teclado necesita foco.
           row.onclick = () => openFly(row, it.items);
         } else {
-          row.innerHTML = `<span style="min-width:15px;display:inline-block">${cascadeMark(it)}</span><span>${it.label}</span>`;
+          row.innerHTML = `<span style="min-width:15px;display:inline-block">${cascadeMark(it)}</span><span style="flex:1">${it.label}</span>${it.hint ? `<span style="color:#94A3B8;font-size:10px">${it.hint}</span>` : ""}`;
           row.onclick = () => { closeFly(); it.pick(); };
         }
       }
@@ -4004,17 +4004,17 @@
       { kind: "check", label: "Pines de postes (H)", active: !state.hidePoles, pick: () => { toggleHidePoles(); closePopover(); } },
       { kind: "sep" },
       { kind: "title", label: "Aspecto del punto" },
-      { label: "Color por", items: [
-        { kind: "radio", label: "Zona", active: state.colorBy === "zone", pick: () => setColorBy("zone") },
-        { kind: "radio", label: "Supervisor", active: state.colorBy === "supervisor", pick: () => setColorBy("supervisor") },
-        { kind: "radio", label: "Estado", active: state.colorBy === "estado", pick: () => setColorBy("estado") },
-        { kind: "radio", label: "Color propio", active: state.colorBy === "propio", pick: () => setColorBy("propio") }
+      { label: "Color por", hint: "Alt+1..4", items: [
+        { kind: "radio", label: "Zona", hint: "Alt+1", active: state.colorBy === "zone", pick: () => setColorBy("zone") },
+        { kind: "radio", label: "Supervisor", hint: "Alt+2", active: state.colorBy === "supervisor", pick: () => setColorBy("supervisor") },
+        { kind: "radio", label: "Estado", hint: "Alt+3", active: state.colorBy === "estado", pick: () => setColorBy("estado") },
+        { kind: "radio", label: "Color propio", hint: "Alt+4", active: state.colorBy === "propio", pick: () => setColorBy("propio") }
       ] },
-      { label: "Texto en el mapa", items: [
-        { kind: "radio", label: "N°", active: state.labelContent === "numero", pick: () => setLabelContent("numero") },
-        { kind: "radio", label: "Código de poste", active: state.labelContent === "codigo", pick: () => setLabelContent("codigo") },
-        { kind: "radio", label: "Código SSEE", active: state.labelContent === "ssee", pick: () => setLabelContent("ssee") },
-        { kind: "radio", label: "N° + Código", active: state.labelContent === "numeroCodigo", pick: () => setLabelContent("numeroCodigo") }
+      { label: "Texto en el mapa", hint: "Alt+Shift+1..4", items: [
+        { kind: "radio", label: "N°", hint: "Alt+Shift+1", active: state.labelContent === "numero", pick: () => setLabelContent("numero") },
+        { kind: "radio", label: "Código de poste", hint: "Alt+Shift+2", active: state.labelContent === "codigo", pick: () => setLabelContent("codigo") },
+        { kind: "radio", label: "Código SSEE", hint: "Alt+Shift+3", active: state.labelContent === "ssee", pick: () => setLabelContent("ssee") },
+        { kind: "radio", label: "N° + Código", hint: "Alt+Shift+4", active: state.labelContent === "numeroCodigo", pick: () => setLabelContent("numeroCodigo") }
       ] },
       { label: "Visibilidad de etiquetas", items: [
         { kind: "radio", label: "Al acercar zoom", active: state.labelMode === "cerca", pick: () => setLabelMode("cerca") },
@@ -6071,12 +6071,35 @@
     fab.classList.add("hidden");
   };
 
+  // S23: una sola guardia decide si el teclado pertenece a un campo de texto. Los atajos
+  // de la extensión nunca deben escribir por el usuario en un buscador: por eso la regla
+  // vive acá y no repetida en cada atajo.
+  const isTypingTarget = (t) => {
+    if (!t || t.nodeType !== 1) return false;
+    const tag = String(t.tagName || "").toUpperCase();
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || t.isContentEditable === true;
+  };
+
+  // S23: el n-ésimo valor de una familia, como las pestañas del navegador. Un dígito con
+  // modificador no colisiona con escribir y escala sin agregar una letra que memorizar.
+  const COLOR_BY_ORDER = ["zone", "supervisor", "estado", "propio"];
+  const LABEL_CONTENT_ORDER = ["numero", "codigo", "ssee", "numeroCodigo"];
+
   const onKeyDown = (ev) => {
-    const inInput = ["INPUT", "TEXTAREA", "SELECT"].includes(doc.activeElement?.tagName);
+    const inInput = isTypingTarget(doc.activeElement) || isTypingTarget(ev.target);
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z" && !inInput) {
       ev.preventDefault();
       performUndo();
       return;
+    }
+    if ((ev.altKey && !ev.ctrlKey && !ev.metaKey) && !inInput) {
+      const n = Number(ev.key);
+      if (Number.isInteger(n) && n >= 1 && n <= 4) {
+        ev.preventDefault();
+        if (ev.shiftKey) setLabelContent(LABEL_CONTENT_ORDER[n - 1]);
+        else setColorBy(COLOR_BY_ORDER[n - 1]);
+        return;
+      }
     }
     if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && ev.key.toLowerCase() === "h" && !inInput) {
       toggleHidePoles();
