@@ -97,10 +97,14 @@
   // `hiddenByDefault` es el único lugar donde se decide qué arranca oculto.
   const TABLE_COLUMNS = [
     { id: "check", label: "", width: "30px" },
-    { id: "numero", label: "Rol/N°", width: "60px", sortKey: "numero" },
+    // El rótulo es "N°": «Rol» era la PK que se solapó con la numeración y sólo ensuciaba
+    // el encabezado. El valor sigue siendo el mismo (rolPT cuando existe, si no el número).
+    { id: "numero", label: "N°", width: "56px", sortKey: "numero" },
     { id: "codigo", label: "Código", width: "", sortKey: "codigo" },
     { id: "zona", label: "Zona", width: "88px", sortKey: "zona" },
-    { id: "sup", label: "Sup.", width: "46px", sortKey: "sup", requiresMultiSup: true },
+    // 60px porque el encabezado lleva dos marcas (orden y filtro) y "Sup.▴" se partía:
+    // el ancho del dato no es el ancho del encabezado, y manda el mayor de los dos.
+    { id: "sup", label: "Sup.", width: "60px", sortKey: "sup", requiresMultiSup: true },
     { id: "estado", label: "Estado", width: "112px", sortKey: "estado", hiddenByDefault: true },
     { id: "equipo", label: "Equipo", width: "132px", sortKey: "equipo", hiddenByDefault: true },
     { id: "dist", label: "Dist.", width: "68px", sortKey: "dist", hiddenByDefault: true },
@@ -2662,9 +2666,15 @@
       };
       // S22: el autofiltro de columna se abre desde una flecha chica del encabezado o
       // con clic derecho. La flecha de orden sigue igual; ésta sólo abre el filtro.
-      const bFilter = el("button", "col-filter" + (state.columnFilters.has(col.id) ? " on" : ""), "▾", th);
+      const bFilter = el("button", "col-filter" + (state.columnFilters.has(col.id) ? " on" : ""), state.columnFilters.has(col.id) ? "▼" : "▾", th);
       bFilter.type = "button";
       bFilter.title = "Filtrar por esta columna (clic derecho también)";
+      // S22: el filtro activo se ve en el encabezado, no sólo en el chip. La celda se
+      // tiñe y la flecha se rellena: el chip puede desaparecer y el estado sigue visible.
+      if (state.columnFilters.has(col.id)) {
+        th.classList.add("col-filtered");
+        bFilter.classList.add("on");
+      }
       bFilter.onclick = (ev) => { ev.stopPropagation(); openColumnFilterPopover(bFilter, col); };
       th.oncontextmenu = (ev) => { ev.preventDefault(); openColumnFilterPopover(th, col); };
     }
@@ -4004,13 +4014,17 @@
     });
   }
 
-  // S21: cambiar el modo de color es una decisión de vista, no de dato: repinta y listo.
+  // S23: cambiar el modo de color es una decisión de vista, no de dato: repinta y listo.
+  // El toast es el mismo recurso que ya usa el resto de la app: confirma qué se activó,
+  // porque el cambio ocurre en el mapa y desde un atajo no hay menú que lo muestre.
   function setColorBy(mode) {
     state.colorBy = mode;
     styleCache = new WeakMap();
     markDirty();
     refreshAll();
     closePopover();
+    const opt = COLOR_BY_OPTIONS.find((o) => o.id === mode);
+    showToast(`Color por: ${opt ? opt.label : mode}`);
   }
 
   function setLabelContent(mode) {
@@ -4019,6 +4033,8 @@
     markDirty();
     refreshAll();
     closePopover();
+    const opt = LABEL_CONTENT_OPTIONS.find((o) => o.id === mode);
+    showToast(`Texto en el mapa: ${opt ? opt.label : mode}`);
   }
 
   function setLabelMode(mode) {
@@ -4034,18 +4050,8 @@
       { kind: "check", label: "Pines de postes (H)", active: !state.hidePoles, pick: () => { toggleHidePoles(); closePopover(); } },
       { kind: "sep" },
       { kind: "title", label: "Aspecto del punto" },
-      { label: "Color por", hint: "Alt+1..4", items: [
-        { kind: "radio", label: "Zona", hint: "Alt+1", active: state.colorBy === "zone", pick: () => setColorBy("zone") },
-        { kind: "radio", label: "Supervisor", hint: "Alt+2", active: state.colorBy === "supervisor", pick: () => setColorBy("supervisor") },
-        { kind: "radio", label: "Estado", hint: "Alt+3", active: state.colorBy === "estado", pick: () => setColorBy("estado") },
-        { kind: "radio", label: "Color propio", hint: "Alt+4", active: state.colorBy === "propio", pick: () => setColorBy("propio") }
-      ] },
-      { label: "Texto en el mapa", hint: "Alt+Shift+1..4", items: [
-        { kind: "radio", label: "N°", hint: "Alt+Shift+1", active: state.labelContent === "numero", pick: () => setLabelContent("numero") },
-        { kind: "radio", label: "Código de poste", hint: "Alt+Shift+2", active: state.labelContent === "codigo", pick: () => setLabelContent("codigo") },
-        { kind: "radio", label: "Código SSEE", hint: "Alt+Shift+3", active: state.labelContent === "ssee", pick: () => setLabelContent("ssee") },
-        { kind: "radio", label: "N° + Código", hint: "Alt+Shift+4", active: state.labelContent === "numeroCodigo", pick: () => setLabelContent("numeroCodigo") }
-      ] },
+      { label: "Color por", hint: "Alt+1..4", items: COLOR_BY_OPTIONS.map((o) => ({ kind: "radio", label: o.label, hint: o.hint, active: state.colorBy === o.id, pick: () => setColorBy(o.id) })) },
+      { label: "Texto en el mapa", hint: "Alt+Shift+1..4", items: LABEL_CONTENT_OPTIONS.map((o) => ({ kind: "radio", label: o.label, hint: o.hint, active: state.labelContent === o.id, pick: () => setLabelContent(o.id) })) },
       { label: "Visibilidad de etiquetas", items: [
         { kind: "radio", label: "Al acercar zoom", active: state.labelMode === "cerca", pick: () => setLabelMode("cerca") },
         { kind: "radio", label: "Siempre visibles", active: state.labelMode === "siempre", pick: () => setLabelMode("siempre") },
@@ -6110,10 +6116,21 @@
     return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || t.isContentEditable === true;
   };
 
-  // S23: el n-ésimo valor de una familia, como las pestañas del navegador. Un dígito con
-  // modificador no colisiona con escribir y escala sin agregar una letra que memorizar.
-  const COLOR_BY_ORDER = ["zone", "supervisor", "estado", "propio"];
-  const LABEL_CONTENT_ORDER = ["numero", "codigo", "ssee", "numeroCodigo"];
+  // S23: una sola fuente para las dos familias de aspecto: el valor, el nombre que muestra
+  // el toast y el atajo. Antes el id vivía en un array, el rótulo en el menú y el atajo en
+  // otro lado — tres lugares que se desincronizan a la primera opción nueva.
+  const COLOR_BY_OPTIONS = [
+    { id: "zone", label: "Zona", hint: "Alt+1" },
+    { id: "supervisor", label: "Supervisor", hint: "Alt+2" },
+    { id: "estado", label: "Estado", hint: "Alt+3" },
+    { id: "propio", label: "Color propio", hint: "Alt+4" }
+  ];
+  const LABEL_CONTENT_OPTIONS = [
+    { id: "numero", label: "N°", hint: "Alt+Shift+1" },
+    { id: "codigo", label: "Código de poste", hint: "Alt+Shift+2" },
+    { id: "ssee", label: "Código SSEE", hint: "Alt+Shift+3" },
+    { id: "numeroCodigo", label: "N° + Código", hint: "Alt+Shift+4" }
+  ];
 
   const onKeyDown = (ev) => {
     const inInput = isTypingTarget(doc.activeElement) || isTypingTarget(ev.target);
@@ -6126,8 +6143,8 @@
       const n = Number(ev.key);
       if (Number.isInteger(n) && n >= 1 && n <= 4) {
         ev.preventDefault();
-        if (ev.shiftKey) setLabelContent(LABEL_CONTENT_ORDER[n - 1]);
-        else setColorBy(COLOR_BY_ORDER[n - 1]);
+        if (ev.shiftKey) setLabelContent(LABEL_CONTENT_OPTIONS[n - 1].id);
+        else setColorBy(COLOR_BY_OPTIONS[n - 1].id);
         return;
       }
     }
