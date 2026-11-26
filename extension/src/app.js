@@ -1146,19 +1146,36 @@
   // S25: la tabla se estira con la pestaña de la esquina, como cualquier ventana. El
   // tirador es un elemento propio y no el `resize` nativo porque además hay que
   // distinguir un doble clic (vista compacta) de un arrastre (redimensionar).
-  // S25: la pestaña de la esquina es la nativa del navegador (`resize`), que no interfiere
-  // con el contenido. El doble clic se detecta por coordenadas dentro del contenedor y no
-  // con un elemento propio: la manija nativa no recibe eventos, así que un div encima
-  // sólo agregaría una segunda manija encima de la real.
-  tableWrap.addEventListener("dblclick", (ev) => {
-    const r = tableWrap.getBoundingClientRect();
-    if (ev.clientX <= r.right - 18 || ev.clientY <= r.bottom - 18) return;
+  // S25: el panel está anclado a la derecha (`position: fixed; right: 10px`), así que
+  // ensanchar es sumar ancho y crece hacia la izquierda: nunca se sale de la pantalla.
+  // El tirador es propio y no el `resize` nativo porque la manija nativa sólo crece hacia
+  // la derecha y se dibuja al final del contenido desplazable, así que se iba con el
+  // scroll en vez de quedarse quieta en la esquina.
+  const tableGrip = el("div", "table-grip", null, drawer);
+  tableGrip.title = "Arrastrar hacia la izquierda para ensanchar · doble clic para vista compacta";
+  tableGrip.onpointerdown = (ev) => {
+    ev.preventDefault();
+    const startX = ev.clientX;
+    const startW = drawer.getBoundingClientRect().width;
+    const move = (e2) => {
+      const max = w.innerWidth - 40;
+      // Arrastrar a la izquierda suma ancho; el borde derecho no se mueve.
+      drawer.style.width = Math.max(260, Math.min(max, startW + (startX - e2.clientX))) + "px";
+    };
+    const up = () => {
+      doc.removeEventListener("pointermove", move);
+      doc.removeEventListener("pointerup", up);
+    };
+    doc.addEventListener("pointermove", move);
+    doc.addEventListener("pointerup", up);
+  };
+  tableGrip.ondblclick = (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
     state.compactTable = !state.compactTable;
     refreshAll();
     showToast(state.compactTable ? "Vista compacta: N° y Código" : "Vista completa");
-  });
+  };
   const table = el("table", "", null, tableWrap);
   const colgroup = el("colgroup", "", null, table);
   const thead = el("thead", "", null, table);
