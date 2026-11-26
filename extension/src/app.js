@@ -97,16 +97,22 @@
   // `hiddenByDefault` es el único lugar donde se decide qué arranca oculto.
   const TABLE_COLUMNS = [
     { id: "check", label: "", width: "30px" },
-    { id: "numero", label: "Rol/N°", width: "64px", sortKey: "numero" },
+    { id: "numero", label: "Rol/N°", width: "60px", sortKey: "numero" },
     { id: "codigo", label: "Código", width: "", sortKey: "codigo" },
-    { id: "zona", label: "Zona", width: "96px", sortKey: "zona" },
-    { id: "sup", label: "Sup.", width: "48px", sortKey: "sup", requiresMultiSup: true },
+    { id: "zona", label: "Zona", width: "88px", sortKey: "zona" },
+    { id: "sup", label: "Sup.", width: "46px", sortKey: "sup", requiresMultiSup: true },
     { id: "estado", label: "Estado", width: "112px", sortKey: "estado", hiddenByDefault: true },
     { id: "equipo", label: "Equipo", width: "132px", sortKey: "equipo", hiddenByDefault: true },
     { id: "dist", label: "Dist.", width: "68px", sortKey: "dist", hiddenByDefault: true },
     { id: "coci", label: "COCI_3F", width: "84px", sortKey: "coci", hiddenByDefault: true }
   ];
   const defaultHiddenColumns = () => TABLE_COLUMNS.filter(c => c.hiddenByDefault).map(c => c.id);
+  // S19: la tabla no comprime una columna por debajo de lo legible. Si al revelar
+  // columnas el ancho no alcanza, la tabla se ensancha y la barra desplaza: la columna
+  // elástica (Código) conserva su piso en vez de quedar en "F…" o desaparecer.
+  const CODE_COLUMN_MIN = 140;
+  const tableMinWidth = (cols) =>
+    cols.reduce((n, c) => n + (parseInt(c.width, 10) || 0), 0) + CODE_COLUMN_MIN;
   // S18: el orden de las columnas es dato del proyecto, no del código. Una columna que
   // la lista guardada no conoce (recién agregada) entra al final en vez de desaparecer.
   const orderedTableColumns = () => {
@@ -2376,6 +2382,9 @@
     // filtro las nueve columnas sumaban más ancho que la tabla y la única elástica
     // (Código) colapsaba a 0 px, que se veía como "borraste el código del poste".
     const columns = orderedTableColumns().filter(c => (!c.requiresMultiSup || multiSup) && !state.hiddenColumns.has(c.id));
+    // El piso de ancho se calcula con las columnas visibles: sumar una columna ensancha
+    // la tabla y aparece el desplazamiento horizontal, en vez de aplastar el código.
+    table.style.minWidth = `${tableMinWidth(columns)}px`;
     // El ancho vive en la lista: con table-layout:fixed el <colgroup> manda para el
     // encabezado y para el cuerpo por igual, así no hay dos verdades sobre el ancho.
     colgroup.replaceChildren();
