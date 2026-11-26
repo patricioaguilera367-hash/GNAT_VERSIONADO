@@ -1830,7 +1830,7 @@
   async function runMtNetworkDiscovery() {
     // 1. Determinar postes semilla (Seleccionados > Zona T > Zona F > Todos los postes)
     const proj = map.getView().getProjection();
-    let seedFeats = [...state.selected].map(i => state.points[i]).filter(f => f && f.getGeometry());
+    let seedFeats = selectedVisibleIndices().map(i => state.points[i]).filter(f => f && f.getGeometry());
     const nonApSel = seedFeats.filter(f => f.get("tipo") !== "APERTURA");
     if (nonApSel.length) seedFeats = nonApSel;
     const hasFilter = state.filterTypes.size > 0 || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || Boolean(state.search.trim());
@@ -2364,7 +2364,37 @@
     cCols.style.fontWeight = "600";
   }
 
+  // S20: la selección es siempre un subconjunto de lo visible, igual que en Excel: una
+  // fila que el filtro esconde deja de estar seleccionada. Así no quedan acciones sobre
+  // cosas que no se ven, ni selección vieja acumulada cuando buscás códigos nuevos.
+  // Ese invariante se sostiene en un solo punto —pruneSelection, al repintar la tabla— y
+  // ninguna acción lee el Set crudo: todas pasan por selectedVisibleIndices.
+  function visibleIndexSet() {
+    const order = new Map();
+    state.points.forEach((f, i) => order.set(f, i));
+    const vis = new Set();
+    for (const f of getFilteredPoints()) {
+      const i = order.get(f);
+      if (i !== undefined) vis.add(i);
+    }
+    return vis;
+  }
+
+  function pruneSelection() {
+    if (state.selected.size === 0) return;
+    const vis = visibleIndexSet();
+    for (const idx of Array.from(state.selected)) {
+      if (!vis.has(idx)) state.selected.delete(idx);
+    }
+  }
+
+  function selectedVisibleIndices() {
+    const vis = visibleIndexSet();
+    return Array.from(state.selected).filter((i) => vis.has(i));
+  }
+
   function renderTable() {
+    pruneSelection();
     const visible = getFilteredPoints();
     // Mostrar notita roja compacta si hubo códigos pegados en el buscador que no existen en la tabla
     if (state.lastSearchMissing.length > 0 && state.search.trim()) {
@@ -2883,7 +2913,7 @@
     btnSt.onclick = (ev) => openAssignStatusPopover(ev.currentTarget);
 
     const btnLink = el("button", "", "Vincular ✕", ctxBar);
-    btnLink.onclick = () => startLinkOpeningMode([...state.selected]);
+    btnLink.onclick = () => startLinkOpeningMode(selectedVisibleIndices());
 
     const btnMore = el("button", "", "Más ▾", ctxBar);
     btnMore.onclick = (ev) => {
@@ -3332,7 +3362,7 @@
         const d = el("span", "dot", null, b);
         d.style.background = st.color;
         el("span", "", st.name, b);
-        b.onclick = () => { closePopover(); assignStatusToIndices([...state.selected], st.id); };
+        b.onclick = () => { closePopover(); assignStatusToIndices(selectedVisibleIndices(), st.id); };
       }
       el("div", "pop-sep", null, pop);
       const newRow = el("div", "inline-input-row", null, pop);
@@ -3343,7 +3373,7 @@
         const sid = createStatus(inp.value.trim());
         if (!sid) return;
         closePopover();
-        assignStatusToIndices([...state.selected], sid);
+        assignStatusToIndices(selectedVisibleIndices(), sid);
       };
     }, true);
   }
@@ -3397,10 +3427,10 @@
         const d = el("span", "dot", null, b);
         d.style.background = z.color;
         el("span", "", `${z.id} · ${z.name}`, b);
-        b.onclick = () => { closePopover(); assignZoneToIndices([...state.selected], z.id, true); };
+        b.onclick = () => { closePopover(); assignZoneToIndices(selectedVisibleIndices(), z.id, true); };
       }
       const bNone = el("button", "pop-item", "Quitar de todas las zonas", pop);
-      bNone.onclick = () => { closePopover(); assignZoneToIndices([...state.selected], "", false); };
+      bNone.onclick = () => { closePopover(); assignZoneToIndices(selectedVisibleIndices(), "", false); };
 
       el("div", "pop-sep", null, pop);
       const newRow = el("div", "inline-input-row", null, pop);
@@ -3411,7 +3441,7 @@
         if (!inpName.value.trim()) return;
         const zid = createZone(inpName.value.trim());
         closePopover();
-        assignZoneToIndices([...state.selected], zid, false);
+        assignZoneToIndices(selectedVisibleIndices(), zid, false);
       };
     }, true);
   }
@@ -3419,22 +3449,22 @@
   function openSelectionMorePopover(x, y) {
     showPopoverAt(x, y, (pop) => {
       if (state.selected.size === 1) {
-        const onlyIdx = [...state.selected][0];
+        const onlyIdx = selectedVisibleIndices()[0];
         const bEdit = el("button", "pop-item", "✏️ Editar código / tipo / condición...", pop);
         bEdit.onclick = () => { closePopover(); openEditPointModal(onlyIdx); };
       }
       const bFit = el("button", "pop-item", "🔍 Encuadrar selección en mapa", pop);
-      bFit.onclick = () => { closePopover(); fitPoints([...state.selected]); };
+      bFit.onclick = () => { closePopover(); fitPoints(selectedVisibleIndices()); };
 
       const bSyncSel = el("button", "pop-item", "🔄 Sincronizar seleccionados con GNAT", pop);
       bSyncSel.onclick = () => {
         closePopover();
-        const feats = [...state.selected].map(i => state.points[i]).filter(Boolean);
+        const feats = selectedVisibleIndices().map(i => state.points[i]).filter(Boolean);
         enqueueGnatMetadataSync(feats, true);
       };
 
       const bColor = el("button", "pop-item", "🎨 Color de referencia (opcional) ▾", pop);
-      bColor.onclick = () => openColorPickerPopover(bColor, "#00C853", (c) => assignCustomColorToIndices([...state.selected], c), true, true);
+      bColor.onclick = () => openColorPickerPopover(bColor, "#00C853", (c) => assignCustomColorToIndices(selectedVisibleIndices(), c), true, true);
 
       el("div", "pop-sep", null, pop);
       el("div", "pop-title", "Responsable (opcional)", pop);
@@ -3443,13 +3473,13 @@
         const d = el("span", "dot", null, b);
         d.style.background = s.color;
         el("span", "", s.id === "default" ? "Sin asignar" : `${s.initials} · ${s.name}`, b);
-        b.onclick = () => { closePopover(); assignSupervisorToIndices([...state.selected], s.id); };
+        b.onclick = () => { closePopover(); assignSupervisorToIndices(selectedVisibleIndices(), s.id); };
       }
 
       el("div", "pop-sep", null, pop);
       const bDel = el("button", "pop-item", "🗑 Eliminar seleccionados", pop);
       bDel.style.color = "var(--danger)";
-      bDel.onclick = () => { closePopover(); deleteIndices([...state.selected]); };
+      bDel.onclick = () => { closePopover(); deleteIndices(selectedVisibleIndices()); };
     }, true);
   }
 
@@ -3482,12 +3512,12 @@
       bZone.onclick = () => openAssignZonePopover(bZone);
 
       const bColor = el("button", "pop-item", "🎨 Color de referencia ▾", pop);
-      bColor.onclick = () => openColorPickerPopover(bColor, getPointColor(f), (c) => assignCustomColorToIndices([...state.selected], c), false, true);
+      bColor.onclick = () => openColorPickerPopover(bColor, getPointColor(f), (c) => assignCustomColorToIndices(selectedVisibleIndices(), c), false, true);
 
       el("div", "pop-sep", null, pop);
       const bDel = el("button", "pop-item", "🗑 Eliminar", pop);
       bDel.style.color = "var(--danger)";
-      bDel.onclick = () => { closePopover(); deleteIndices([...state.selected]); };
+      bDel.onclick = () => { closePopover(); deleteIndices(selectedVisibleIndices()); };
     });
   }
 
@@ -3758,7 +3788,7 @@
       addMenuBtn(pop, "zap", `Analizar tramos, aperturas y remates (${scopeTxt})`, () => { closePopover(); runMtNetworkDiscovery(); });
       addMenuBtn(pop, "refresh", selCount > 0 ? `Sincronizar ${selCount} seleccionados con GNAT` : "Sincronizar todos los puntos con GNAT", () => {
         closePopover();
-        const list = selCount > 0 ? [...state.selected].map(i => state.points[i]).filter(Boolean) : [...state.points];
+        const list = selCount > 0 ? selectedVisibleIndices().map(i => state.points[i]).filter(Boolean) : [...state.points];
         enqueueGnatMetadataSync(list, true);
       }, { disabled: state.points.length === 0 });
       el("div", "pop-sep", null, pop);
