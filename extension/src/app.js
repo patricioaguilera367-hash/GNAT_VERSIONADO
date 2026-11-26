@@ -3685,26 +3685,31 @@
       // que se pinta encima, la base al final—, así se lee como se ve el mapa. Los grupos
       // que se tocan poco arrancan plegados para que el panel no crezca sin control.
       const group = (title, { collapsible = false, open = false } = {}) => {
-        el("div", "pop-sep", null, pop);
-        const head = el("div", "pop-title", null, pop);
-        const body = el("div", "", null, pop);
+        const body = doc.createElement("div");
         if (!collapsible) {
-          head.textContent = title;
+          el("div", "pop-sep", null, pop);
+          el("div", "pop-title", title, pop);
+          pop.appendChild(body);
           return body;
         }
-        const paintHead = () => {
-          const visible = !body.classList.contains("hidden");
-          head.textContent = `${title} ${visible ? "▾" : "▸"}`;
+        // El encabezado plegable es un <button class="pop-item">, el mismo elemento que
+        // ya responde en este popover. Con un <div class="pop-title"> el clic no llegaba y
+        // el grupo parecía no plegarse; el estado va por style.display y no depende de
+        // una clase que otra regla pueda ganar.
+        el("div", "pop-sep", null, pop);
+        const head = el("button", "pop-item", "", pop);
+        let visible = open;
+        const paint = () => {
+          head.innerHTML = `<span>${visible ? "\u25BE" : "\u25B8"} ${title}</span>`;
           head.title = visible ? "Plegar este grupo" : "Desplegar este grupo";
+          body.style.display = visible ? "" : "none";
         };
-        body.classList.toggle("hidden", !open);
-        head.style.cursor = "pointer";
-        head.style.userSelect = "none";
         head.onclick = () => {
-          body.classList.toggle("hidden");
-          paintHead();
+          visible = !visible;
+          paint();
         };
-        paintHead();
+        pop.appendChild(body);
+        paint();
         return body;
       };
 
