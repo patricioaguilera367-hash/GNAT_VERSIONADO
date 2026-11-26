@@ -3845,7 +3845,7 @@
       { label: "Zonas", items: [
         { kind: "check", label: "Polígonos de zonas (D / T / F)", active: state.showHulls, pick: () => { state.showHulls = !state.showHulls; rebuildOverlayLayers(); closePopover(); } },
         { kind: "sep" },
-        { label: "Colores y área por zona…", pick: () => { closePopover(); btnZonas.click(); } }
+        { label: "Colores y área por zona…", pick: () => { closePopover(); popoverAnchor = btnZonas; btnZonas.click(); } }
       ] },
       { label: "Base", items: [
         { kind: "radio", label: "Detalle WMTS original", active: state.mtbtDetail === 0, pick: () => { setMtBtDetail(0); closePopover(); } },
