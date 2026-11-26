@@ -176,6 +176,10 @@
       ["no_aplica", { id: "no_aplica", name: "No aplica ejecutar", color: "#D97706" }]
     ]),
     filterSups: new Set(),  // empty = all
+    // S22: filtro por columna (autofiltro de Excel). La clave es el id de columna;
+    // null/ausente = sin filtro en esa columna, Set vacío = nada pasa. Los chips de
+    // filtro son el resumen de este estado, no un segundo mecanismo paralelo.
+    columnFilters: new Map(), // Map<colId, Set<string>|null>
     lastSearchMissing: [],  // códigos pegados en el buscador que no están en la tabla
     recentColors: ["#00C853", "#FF6D00", "#DC2626", "#2979FF"],
     syncQueue: { running: false, paused: false, cancelled: false, total: 0, done: 0, items: [] },
@@ -1251,6 +1255,53 @@
   // =========================================================================
   // 8. CAPAS OPENLAYERS: PUNTOS, VECTORES MT (A->B), POLÍGONOS EDITABLES D/T/F
   // =========================================================================
+  // S22: el valor que una fila muestra para una columna vive en un solo lugar. La celda
+  // y el filtro de columna leen de acá, así el filtro jamás puede discrepar de lo que la
+  // celda enseña. Devuelve una lista porque una columna como Zona puede traer varios.
+  const columnValues = (f, colId) => {
+    switch (colId) {
+      case "numero": return [String(f.get("rolPT") || f.get("numero") || "")];
+      case "codigo": return [getPointCode(f)];
+      case "zona": return getPointZoneIds(f);
+      case "sup": {
+        const s = state.supervisors.get(getSupId(f)) || DEFAULT_SUPERVISORS[0];
+        return [String(s.initials || "")];
+      }
+      case "estado": {
+        const s = state.statuses.get(f.get("estadoEjec") || "pendiente");
+        return [s ? s.name : ""];
+      }
+      case "equipo": return [String(f.get("gnatMeta")?.deviceDisplay || "")];
+      case "dist": {
+        const dm = f.get("gnatMeta")?.distMeters;
+        return [Number.isFinite(dm) ? `${Math.round(dm)} m` : ""];
+      }
+      case "coci": return [String(f.get("gnatMeta")?.coci3f || "")];
+      default: return [];
+    }
+  };
+
+  // S22: marcador interno para la casilla "(Vacías)". Ningún valor plegado real lo
+  // contiene, así no puede chocar con un dato de la tabla.
+  const EMPTY_FILTER_KEY = "\u0000(vacías)\u0000";
+
+  // S22: un solo predicado decide si una fila pasa los filtros de columna. Los valores
+  // se comparan plegados (sin tildes ni mayúsculas), igual que el buscador.
+  function matchesColumnFilters(f) {
+    for (const [colId, filter] of state.columnFilters) {
+      if (!filter) continue; // null = sin filtro en esta columna
+      const vals = columnValues(f, colId).map((v) => CAT.foldText(String(v)));
+      const nonEmpty = vals.filter((v) => v !== "");
+      if (nonEmpty.length === 0) {
+        // Sin valor: sólo pasa si el usuario marcó "(Vacías)".
+        if (!filter.has(EMPTY_FILTER_KEY)) return false;
+        continue;
+      }
+      if (!nonEmpty.some((v) => filter.has(v))) return false;
+    }
+    return true;
+  }
+
   function getFilteredPoints() {
     const rawQ = state.search.trim();
     const tokens = rawQ ? rawQ.split(/[\s,;|\t\r\n]+/).map(s => s.trim()).filter(Boolean) : [];
@@ -1318,6 +1369,8 @@
         }
         if (!anyHit) return false;
       }
+      // S22: todos los filtros de columna activos pasan por el único predicado.
+      if (!matchesColumnFilters(f)) return false;
       return true;
     });
 
@@ -2288,6 +2341,118 @@
   // =========================================================================
   // 11. RENDER DE TABLA, CHIPS DINÁMICOS Y BARRA CONTEXTUAL
   // =========================================================================
+  // S22: autofiltro de columna. El universo de valores sale de `columnValues`, el mismo
+  // accessor que pintan las celdas, así el filtro no puede discrepar de lo que se ve.
+  // El buscador MANDA la selección (como Excel): escribir «syd» marca sólo lo que
+  // coincide, y con «Añadir al filtro actual» suma en vez de reemplazar. Nada se aplica
+  // hasta Aplicar: media palabra tipeada no debe reescribir la tabla.
+  function openColumnFilterPopover(anchorEl, col) {
+    const current = state.columnFilters.get(col.id) || null;
+    const counts = new Map();
+    for (const f of state.points) {
+      for (const raw of columnValues(f, col.id)) {
+        const text = String(raw === undefined || raw === null ? "" : raw).trim();
+        const key = text === "" ? EMPTY_FILTER_KEY : CAT.foldText(text);
+        const entry = counts.get(key) || { label: text === "" ? "(Vacías)" : text, n: 0 };
+        entry.n += 1;
+        counts.set(key, entry);
+      }
+    }
+    const keys = [...counts.keys()].sort((a, b) => (a === EMPTY_FILTER_KEY ? 1 : b === EMPTY_FILTER_KEY ? -1 : String(counts.get(a).label).localeCompare(String(counts.get(b).label), "es", { numeric: true })));
+    // Sin filtro aplicado, todo está marcado: es el estado inicial de Excel y el que
+    // hace que desmarcar dos valores se lea como «quita estos dos».
+    const picked = new Set(current ? [...current] : keys);
+    const r = anchorEl.getBoundingClientRect();
+
+    showPopoverAt(r.left, r.bottom + 4, (pop) => {
+      pop.style.minWidth = "248px";
+      el("div", "pop-title", `Filtrar: ${col.label || col.id}`, pop);
+
+      const searchWrap = el("div", "", null, pop);
+      searchWrap.style.cssText = "padding:2px 6px 6px;";
+      const inp = el("input", "", null, searchWrap);
+      inp.type = "search";
+      inp.placeholder = "Buscar valor…";
+      inp.style.cssText = "width:100%;box-sizing:border-box;padding:4px 6px;font-size:12px;border:1px solid var(--border);border-radius:6px;";
+
+      const addRow = el("label", "", null, pop);
+      addRow.style.cssText = "display:flex;align-items:center;gap:6px;padding:0 6px 6px;font-size:11px;cursor:pointer;";
+      const addChk = el("input", "", null, addRow);
+      addChk.type = "checkbox";
+      el("span", "", "Añadir al filtro actual", addRow);
+
+      const list = el("div", "", null, pop);
+      list.style.cssText = "max-height:206px;overflow-y:auto;padding:0 4px;";
+
+      const foot = el("div", "", null, pop);
+      foot.style.cssText = "display:flex;gap:6px;padding:6px;";
+
+      const shown = () => {
+        const term = CAT.foldText(inp.value.trim());
+        return term ? keys.filter((k) => String(counts.get(k).label).toLowerCase().includes(term)) : keys;
+      };
+
+      const paint = () => {
+        list.textContent = "";
+        const visible = shown();
+        for (const key of visible) {
+          const row = el("label", "", null, list);
+          row.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 4px;font-size:12px;cursor:pointer;";
+          const cb = el("input", "", null, row);
+          cb.type = "checkbox";
+          cb.checked = picked.has(key);
+          cb.onchange = () => { if (cb.checked) picked.add(key); else picked.delete(key); };
+          const txt = el("span", "", counts.get(key).label, row);
+          txt.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+          const n = el("span", "", String(counts.get(key).n), row);
+          n.style.cssText = "color:#94A3B8;font-size:10px;";
+        }
+        allChk.checked = visible.length > 0 && visible.every((k) => picked.has(k));
+        allChk.indeterminate = !allChk.checked && visible.some((k) => picked.has(k));
+      };
+
+      const allRow = el("label", "", null, pop);
+      allRow.style.cssText = "display:flex;align-items:center;gap:6px;padding:2px 10px 4px;font-size:11px;font-weight:600;cursor:pointer;";
+      const allChk = el("input", "", null, allRow);
+      allChk.type = "checkbox";
+      el("span", "", "Seleccionar todo", allRow);
+      allChk.onchange = () => {
+        const visible = shown();
+        if (allChk.checked) visible.forEach((k) => picked.add(k));
+        else visible.forEach((k) => picked.delete(k));
+        paint();
+      };
+
+      // El buscador manda la selección; el check decide si suma o reemplaza.
+      inp.oninput = () => {
+        const term = CAT.foldText(inp.value.trim());
+        if (term) {
+          const hits = keys.filter((k) => String(counts.get(k).label).toLowerCase().includes(term));
+          if (!addChk.checked) picked.clear();
+          hits.forEach((k) => picked.add(k));
+        }
+        paint();
+      };
+
+      const bApply = el("button", "btn-primary", "Aplicar", foot);
+      bApply.style.cssText = "flex:1;justify-content:center;padding:4px 8px;font-size:11px;";
+      bApply.onclick = () => {
+        // Marcar todo es equivalente a no filtrar: se guarda null para que el chip
+        // desaparezca y el estado no mienta diciendo que hay un filtro activo.
+        if (picked.size === keys.length) state.columnFilters.delete(col.id);
+        else state.columnFilters.set(col.id, new Set(picked));
+        closePopover();
+        refreshAll();
+      };
+      const bClear = el("button", "btn-outline", "Limpiar", foot);
+      bClear.style.cssText = "padding:4px 8px;font-size:11px;";
+      bClear.onclick = () => { state.columnFilters.delete(col.id); closePopover(); refreshAll(); };
+
+      paint();
+      inp.focus();
+    });
+  }
+
   function renderFilterChips() {
     filterChips.replaceChildren();
     const makeChip = (label, isOn, onClick, dotColor = null, title = "") => {
@@ -2307,15 +2472,28 @@
       else state.filterTypes.add(t);
       refreshAll();
     };
-    const hasAnyFilter = state.filterTypes.size > 0 || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || state.filterSups.size > 0;
+    const hasAnyFilter = state.filterTypes.size > 0 || state.hiddenZones.size > 0 || state.hiddenStatuses.size > 0 || state.filterSups.size > 0 || state.columnFilters.size > 0;
     makeChip("Todos", !hasAnyFilter, () => {
       state.filterTypes.clear();
       state.hiddenZones.clear();
       state.hiddenZoneAreas.clear();
       state.hiddenStatuses.clear();
       state.filterSups.clear();
+      state.columnFilters.clear();
       refreshAll();
     });
+
+    // S22: los chips son el resumen del filtro por columna, no un mecanismo paralelo.
+    // Quitar el chip borra el filtro de esa columna en el acto, sin paso de Aplicar.
+    for (const [colId, filter] of state.columnFilters) {
+      const col = TABLE_COLUMNS.find(c => c.id === colId);
+      if (!col) continue;
+      const label = `${col.label || colId} (${filter ? filter.size : 0}) ✕`;
+      makeChip(label, true, () => {
+        state.columnFilters.delete(colId);
+        refreshAll();
+      }, null, `Quitar el filtro de la columna ${col.label || colId}`);
+    }
 
     makeChip("Postes", state.filterTypes.has("PUNTO"), () => toggleTypeChip("PUNTO"));
     makeChip("Aperturas ✕", state.filterTypes.has("APERTURA"), () => toggleTypeChip("APERTURA"), OPENING_COLOR);
@@ -2480,6 +2658,13 @@
         else { state.sortBy = col.sortKey; state.sortDir = "asc"; }
         renderTable();
       };
+      // S22: el autofiltro de columna se abre desde una flecha chica del encabezado o
+      // con clic derecho. La flecha de orden sigue igual; ésta sólo abre el filtro.
+      const bFilter = el("button", "col-filter" + (state.columnFilters.has(col.id) ? " on" : ""), "▾", th);
+      bFilter.type = "button";
+      bFilter.title = "Filtrar por esta columna (clic derecho también)";
+      bFilter.onclick = (ev) => { ev.stopPropagation(); openColumnFilterPopover(bFilter, col); };
+      th.oncontextmenu = (ev) => { ev.preventDefault(); openColumnFilterPopover(th, col); };
     }
     if (checkAll) {
       checkAll.type = "checkbox";
@@ -2604,7 +2789,7 @@
 
       const tdN = doc.createElement("td");
       tdN.className = "num-cell";
-      tdN.textContent = String(f.get("rolPT") || f.get("numero"));
+      tdN.textContent = columnValues(f, "numero")[0];
 
       const tdCode = doc.createElement("td");
       const isAp = f.get("tipo") === "APERTURA";
@@ -2633,7 +2818,7 @@
 
       const codeSpan = doc.createElement("span");
       codeSpan.className = "code-mono";
-      codeSpan.textContent = (isAp ? "✕ " : "") + getPointCode(f);
+      codeSpan.textContent = (isAp ? "✕ " : "") + columnValues(f, "codigo")[0];
       if (isAp) codeSpan.style.color = OPENING_COLOR;
       codeSpan.style.fontWeight = "600";
       // El chip de características conserva su tamaño y lo que se recorta es el código:
@@ -2708,7 +2893,7 @@
       tdCode.title = `${getPointCode(f)} ${f.get("accionPT") ? "· " + f.get("accionPT") : ""}`;
 
       const tdZ = doc.createElement("td");
-      const zids = getPointZoneIds(f);
+      const zids = columnValues(f, "zona");
       if (zids.length) {
         // Todas las zonas, sin tope. Van en un contenedor que envuelve: en una celda
         // angosta el chip se comprimía hasta quedar en su borde y se veía como dos
@@ -2741,7 +2926,7 @@
         b.className = "sup-badge";
         b.style.background = sup.color;
         b.style.color = contrastText(sup.color);
-        b.textContent = sup.initials;
+        b.textContent = columnValues(f, "sup")[0];
         tdS.appendChild(b);
       }
 
