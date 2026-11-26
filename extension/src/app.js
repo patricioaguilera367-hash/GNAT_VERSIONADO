@@ -186,14 +186,14 @@
     lastCheckedPos: -1,
     undoStack: [],
     // Opciones de visualización en mapa
-    colorBy: "zone",        // "zone" | "supervisor"
+    colorBy: "zone",        // S21: "zone" | "supervisor" | "estado" | "propio"
     hidePoles: false,       // Ocultar pines de postes para editar polígonos cómodamente
     showHulls: true,        // Polígonos D / T / F
     showSpans: true,        // Vectores de tramos MT (A->B)
     showRoute: false,       // Línea secuencial 1->2->3
     showLinks: false,       // Rayos punteados desactivados por defecto (usar tramos MT reales)
     labelMode: "cerca",     // "cerca" | "siempre" | "ninguna"
-    labelContent: "numero", // "numero" | "completo"
+    labelContent: "numero", // S21: "numero" | "codigo" | "ssee" | "numeroCodigo"
     mtbtDetail: 0,          // 0 | 1 | 2 | 3
     highlightNetwork: false,
     backupDirHandle: null,
@@ -305,11 +305,20 @@
 
   const getPointColor = (f) => {
     const custom = f.get("colorPersonalizado");
-    if (isHex(custom)) return custom;
+    // S21: el color propio es la decisión manual y le gana a cualquier modo, salvo en
+    // «Propio», donde es la única fuente: ese modo sirve para ver sólo lo que uno marcó.
+    if (state.colorBy !== "propio" && isHex(custom)) return custom;
+    if (state.colorBy === "propio") return isHex(custom) ? custom : UNASSIGNED_ZONE_COLOR;
+    // Una apertura es un equipo, no un punto de zona: su color lo dice el tipo, y su
+    // forma ya la distingue en el mapa.
     if (f.get("tipo") === "APERTURA") return OPENING_COLOR;
-    if (state.colorBy === "supervisor" && isMultiSupActive()) {
+    if (state.colorBy === "estado") {
+      const st = state.statuses.get(f.get("estadoEjec") || "pendiente");
+      return st && isHex(st.color) ? st.color : UNASSIGNED_ZONE_COLOR;
+    }
+    if (state.colorBy === "supervisor") {
       const sup = state.supervisors.get(getSupId(f));
-      return sup ? sup.color : UNASSIGNED_ZONE_COLOR;
+      return sup && isHex(sup.color) ? sup.color : UNASSIGNED_ZONE_COLOR;
     }
     const zids = getPointZoneIds(f);
     // Prioridad visual: F (Faena) > T (Trabajo) > D (Desconectada) > otras zonas
@@ -1345,11 +1354,20 @@
     }
     if (cache.has(key)) return cache.get(key);
 
-    let labelStr = isRemate
+    // S21: el texto del mapa sale de un modo explícito, no de un fallback encadenado.
+    // «N°» usa el número y, si falta, el código: nunca una etiqueta vacía. El rol queda
+    // fuera a propósito: se solapaba con la numeración y ensuciaba el rótulo.
+    const labelStr = isRemate
       ? `▲ ${getPointCode(f)}`
-      : state.labelContent === "completo"
-        ? `${rolPT || f.get("numero")} · ${getPointCode(f)}`
-        : String(rolPT || f.get("numero"));
+      : (() => {
+          const num = String(f.get("numero") || "").trim();
+          const code = getPointCode(f);
+          const ssee = String(f.get("sseeCode") || "").trim();
+          if (state.labelContent === "codigo") return code;
+          if (state.labelContent === "ssee") return ssee || code;
+          if (state.labelContent === "numeroCodigo") return `${num || code} · ${code}`;
+          return num || code;
+        })();
 
     const openRad = isFocused ? 14 : (isSelected || isLinkedPeer) ? 12 : 10;
     const openW = isFocused || isLinkedPeer ? 5 : 4;
@@ -3708,75 +3726,136 @@
     });
   };
 
-  btnVista.onclick = () => {
-    const r = btnVista.getBoundingClientRect();
-    showPopoverAt(r.left, r.bottom + 6, (pop) => {
-      // S15: el panel se ordena por tipo de cosa y en el orden real de apilado —arriba lo
-      // que se pinta encima, la base al final—, así se lee como se ve el mapa. Los grupos
-      // que se tocan poco arrancan plegados para que el panel no crezca sin control.
-      const group = (title, { collapsible = false, open = false } = {}) => {
-        const body = doc.createElement("div");
-        if (!collapsible) {
-          el("div", "pop-sep", null, pop);
-          el("div", "pop-title", title, pop);
-          pop.appendChild(body);
-          return body;
-        }
-        // El encabezado plegable es un <button class="pop-item">, el mismo elemento que
-        // ya responde en este popover. Con un <div class="pop-title"> el clic no llegaba y
-        // el grupo parecía no plegarse; el estado va por style.display y no depende de
-        // una clase que otra regla pueda ganar.
-        el("div", "pop-sep", null, pop);
-        const head = el("button", "pop-item", "", pop);
-        let visible = open;
-        const paint = () => {
-          head.innerHTML = `<span>${visible ? "\u25BE" : "\u25B8"} ${title}</span>`;
-          head.title = visible ? "Plegar este grupo" : "Desplegar este grupo";
-          body.style.display = visible ? "" : "none";
-        };
-        head.onclick = () => {
-          visible = !visible;
-          paint();
-        };
-        pop.appendChild(body);
-        paint();
-        return body;
+  // S21: menú en cascada. Un solo componente para toda la barra: cada fila es casilla
+  // (varios), radio (uno solo) o submenú. La marca visual es la que impide pedir «varios
+  // colores a la vez»: una dimensión excluyente se dibuja con radios y punto.
+  // El submenú abre al pasar el mouse con retardo —sin retardo, cruzar en diagonal hacia
+  // otra fila lo abre de paso— y vive DENTRO del popover, así el click-afuera sigue
+  // reconociéndolo y no cierra el menú padre antes de que el clic llegue al botón.
+  const cascadeMark = (it) => {
+    if (it.kind === "radio") return it.active ? "\u25CF" : "\u25CB";
+    if (it.kind === "check") return it.active ? "\u2611" : "\u2610";
+    return "";
+  };
+
+  function openCascade(anchorEl, spec) {
+    const r = anchorEl.getBoundingClientRect();
+    return showPopoverAt(r.left, r.bottom + 6, (pop) => {
+      pop.style.minWidth = "236px";
+      let fly = null;
+      let flyRow = null;
+      let timer = 0;
+      const closeFly = () => {
+        if (timer) { clearTimeout(timer); timer = 0; }
+        if (fly) { fly.remove(); fly = null; }
+        if (flyRow) { flyRow.classList.remove("active-pill"); flyRow = null; }
       };
-
-      const gPoints = group("Puntos");
-      addMenuBtn(gPoints, !state.hidePoles ? "check" : "", "Pines de postes (tecla H)", () => { toggleHidePoles(); closePopover(); });
-
-      const gLabels = group("Etiquetas", { collapsible: true });
-      for (const [val, lbl] of [["cerca", "Al acercar zoom"], ["siempre", "Siempre visibles"], ["ninguna", "Ocultar etiquetas"]]) {
-        addMenuBtn(gLabels, state.labelMode === val ? "check" : "", lbl, () => { state.labelMode = val; styleCache = new WeakMap(); rebuildOverlayLayers(); closePopover(); });
+      const openFly = (row, items) => {
+        if (flyRow === row) return;
+        closeFly();
+        flyRow = row;
+        row.classList.add("active-pill");
+        fly = el("div", "popover");
+        fly.style.cssText = "position:absolute;min-width:216px;padding:4px;";
+        const pr = pop.getBoundingClientRect();
+        if (pr.right + 220 > w.innerWidth - 8) fly.style.right = "calc(100% - 2px)";
+        else fly.style.left = "calc(100% - 2px)";
+        fly.style.top = Math.max(0, row.offsetTop - 6) + "px";
+        pop.appendChild(fly);
+        for (const it of items) {
+          if (it.kind === "sep") { el("div", "pop-sep", null, fly); continue; }
+          const b = el("button", "pop-item", "", fly);
+          b.innerHTML = `<span style="min-width:15px;display:inline-block">${cascadeMark(it)}</span><span>${it.label}</span>`;
+          b.onclick = () => { closeFly(); it.pick(); };
+        }
+        fly.onmouseenter = () => { if (timer) { clearTimeout(timer); timer = 0; } };
+        fly.onmouseleave = () => { timer = w.setTimeout(closeFly, 180); };
+      };
+      for (const it of spec) {
+        if (it.kind === "sep") { el("div", "pop-sep", null, pop); continue; }
+        if (it.kind === "title") { el("div", "pop-title", it.label, pop); continue; }
+        const row = el("button", "pop-item", "", pop);
+        if (it.items) {
+          row.innerHTML = `<span style="flex:1;text-align:left">${it.label}</span><span style="color:#94A3B8">\u25B8</span>`;
+          row.onmouseenter = () => { timer = w.setTimeout(() => openFly(row, it.items), 220); };
+          row.onmouseleave = () => { if (timer) { clearTimeout(timer); timer = 0; } };
+          // El click también abre: el mouse no es la única mano, y el teclado necesita foco.
+          row.onclick = () => openFly(row, it.items);
+        } else {
+          row.innerHTML = `<span style="min-width:15px;display:inline-block">${cascadeMark(it)}</span><span>${it.label}</span>`;
+          row.onclick = () => { closeFly(); it.pick(); };
+        }
       }
-      addMenuBtn(gLabels, "sliders", state.labelContent === "numero" ? "Texto: Rol/N° (cambiar a completo)" : "Texto: Rol/N° + Código", () => {
-        state.labelContent = state.labelContent === "numero" ? "completo" : "numero";
-        styleCache = new WeakMap(); rebuildOverlayLayers(); closePopover();
-      });
-
-      const gNet = group("Red");
-      addMenuBtn(gNet, state.showSpans ? "check" : "", "Vectores de tramos MT (A→B)", () => { state.showSpans = !state.showSpans; rebuildOverlayLayers(); closePopover(); });
-      addMenuBtn(gNet, state.showRoute ? "check" : "", "Línea secuencial de ruta (1→2→3)", () => { state.showRoute = !state.showRoute; rebuildOverlayLayers(); closePopover(); });
-      addMenuBtn(gNet, state.showLinks ? "check" : "", "Rayos a aperturas vinculadas", () => { state.showLinks = !state.showLinks; rebuildOverlayLayers(); closePopover(); });
-
-      const gZones = group("Zonas");
-      addMenuBtn(gZones, state.showHulls ? "check" : "", "Polígonos de zonas (D / T / F)", () => { state.showHulls = !state.showHulls; rebuildOverlayLayers(); closePopover(); });
-      // El detalle por zona (área y puntos) ya vive en el chip «Zonas»: no se duplica acá.
-      const zoneHint = el("div", "", "Área y puntos de cada zona: chip «Zonas»", gZones);
-      zoneHint.style.cssText = "padding:0 8px 4px;font-size:10px;color:#64748B;";
-
-      const gBase = group("Base", { collapsible: true });
-      const mtRow = el("div", "", null, gBase);
-      mtRow.style.cssText = "display:flex;gap:4px;padding:4px;";
-      for (const lvl of [0, 1, 2, 3]) {
-        const b = el("button", state.mtbtDetail === lvl ? "active-pill" : "btn-outline", lvl === 0 ? "Original" : `+${lvl}`, mtRow);
-        b.style.flex = "1"; b.style.justifyContent = "center";
-        b.title = lvl === 0 ? "Detalle WMTS original" : `Detalle WMTS +${lvl}`;
-        b.onclick = () => { setMtBtDetail(lvl); closePopover(); };
-      }
-      addMenuBtn(gBase, state.highlightNetwork ? "check" : "", "Resaltar red MT/BT (alto contraste)", () => { setNetworkHighlight(!state.highlightNetwork); closePopover(); });
     });
+  }
+
+  // S21: cambiar el modo de color es una decisión de vista, no de dato: repinta y listo.
+  function setColorBy(mode) {
+    state.colorBy = mode;
+    styleCache = new WeakMap();
+    markDirty();
+    refreshAll();
+    closePopover();
+  }
+
+  function setLabelContent(mode) {
+    state.labelContent = mode;
+    styleCache = new WeakMap();
+    markDirty();
+    refreshAll();
+    closePopover();
+  }
+
+  function setLabelMode(mode) {
+    state.labelMode = mode;
+    styleCache = new WeakMap();
+    markDirty();
+    refreshAll();
+    closePopover();
+  }
+
+  btnVista.onclick = () => {
+    openCascade(btnVista, [
+      { kind: "check", label: "Pines de postes (H)", active: !state.hidePoles, pick: () => { toggleHidePoles(); closePopover(); } },
+      { kind: "sep" },
+      { kind: "title", label: "Aspecto del punto" },
+      { label: "Color por", items: [
+        { kind: "radio", label: "Zona", active: state.colorBy === "zone", pick: () => setColorBy("zone") },
+        { kind: "radio", label: "Supervisor", active: state.colorBy === "supervisor", pick: () => setColorBy("supervisor") },
+        { kind: "radio", label: "Estado", active: state.colorBy === "estado", pick: () => setColorBy("estado") },
+        { kind: "radio", label: "Color propio", active: state.colorBy === "propio", pick: () => setColorBy("propio") }
+      ] },
+      { label: "Texto en el mapa", items: [
+        { kind: "radio", label: "N°", active: state.labelContent === "numero", pick: () => setLabelContent("numero") },
+        { kind: "radio", label: "Código de poste", active: state.labelContent === "codigo", pick: () => setLabelContent("codigo") },
+        { kind: "radio", label: "Código SSEE", active: state.labelContent === "ssee", pick: () => setLabelContent("ssee") },
+        { kind: "radio", label: "N° + Código", active: state.labelContent === "numeroCodigo", pick: () => setLabelContent("numeroCodigo") }
+      ] },
+      { label: "Visibilidad de etiquetas", items: [
+        { kind: "radio", label: "Al acercar zoom", active: state.labelMode === "cerca", pick: () => setLabelMode("cerca") },
+        { kind: "radio", label: "Siempre visibles", active: state.labelMode === "siempre", pick: () => setLabelMode("siempre") },
+        { kind: "radio", label: "Ocultar etiquetas", active: state.labelMode === "ninguna", pick: () => setLabelMode("ninguna") }
+      ] },
+      { kind: "sep" },
+      { label: "Red", items: [
+        { kind: "check", label: "Vectores de tramos MT (A→B)", active: state.showSpans, pick: () => { state.showSpans = !state.showSpans; rebuildOverlayLayers(); closePopover(); } },
+        { kind: "check", label: "Línea secuencial de ruta (1→2→3)", active: state.showRoute, pick: () => { state.showRoute = !state.showRoute; rebuildOverlayLayers(); closePopover(); } },
+        { kind: "check", label: "Rayos a aperturas vinculadas", active: state.showLinks, pick: () => { state.showLinks = !state.showLinks; rebuildOverlayLayers(); closePopover(); } }
+      ] },
+      { label: "Zonas", items: [
+        { kind: "check", label: "Polígonos de zonas (D / T / F)", active: state.showHulls, pick: () => { state.showHulls = !state.showHulls; rebuildOverlayLayers(); closePopover(); } },
+        { kind: "sep" },
+        { label: "Colores y área por zona…", pick: () => { closePopover(); btnZonas.click(); } }
+      ] },
+      { label: "Base", items: [
+        { kind: "radio", label: "Detalle WMTS original", active: state.mtbtDetail === 0, pick: () => { setMtBtDetail(0); closePopover(); } },
+        { kind: "radio", label: "Detalle WMTS +1", active: state.mtbtDetail === 1, pick: () => { setMtBtDetail(1); closePopover(); } },
+        { kind: "radio", label: "Detalle WMTS +2", active: state.mtbtDetail === 2, pick: () => { setMtBtDetail(2); closePopover(); } },
+        { kind: "radio", label: "Detalle WMTS +3", active: state.mtbtDetail === 3, pick: () => { setMtBtDetail(3); closePopover(); } },
+        { kind: "sep" },
+        { kind: "check", label: "Resaltar red MT/BT (alto contraste)", active: state.highlightNetwork, pick: () => { setNetworkHighlight(!state.highlightNetwork); closePopover(); } }
+      ] }
+    ]);
   };
 
   btnRedMt.onclick = () => {
