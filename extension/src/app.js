@@ -3681,33 +3681,66 @@
   btnVista.onclick = () => {
     const r = btnVista.getBoundingClientRect();
     showPopoverAt(r.left, r.bottom + 6, (pop) => {
-      el("div", "pop-title", "Capas del mapa", pop);
-      addMenuBtn(pop, !state.hidePoles ? "check" : "", "Mostrar pines de postes (tecla H)", () => { toggleHidePoles(); closePopover(); });
-      addMenuBtn(pop, state.showHulls ? "check" : "", "Polígonos de zonas (D / T / F)", () => { state.showHulls = !state.showHulls; rebuildOverlayLayers(); closePopover(); });
-      addMenuBtn(pop, state.showSpans ? "check" : "", "Vectores de tramos MT (A→B)", () => { state.showSpans = !state.showSpans; rebuildOverlayLayers(); closePopover(); });
-      addMenuBtn(pop, state.showRoute ? "check" : "", "Línea secuencial de ruta (1→2→3)", () => { state.showRoute = !state.showRoute; rebuildOverlayLayers(); closePopover(); });
-      addMenuBtn(pop, state.showLinks ? "check" : "", "Rayos a aperturas vinculadas", () => { state.showLinks = !state.showLinks; rebuildOverlayLayers(); closePopover(); });
+      // S15: el panel se ordena por tipo de cosa y en el orden real de apilado —arriba lo
+      // que se pinta encima, la base al final—, así se lee como se ve el mapa. Los grupos
+      // que se tocan poco arrancan plegados para que el panel no crezca sin control.
+      const group = (title, { collapsible = false, open = false } = {}) => {
+        el("div", "pop-sep", null, pop);
+        const head = el("div", "pop-title", null, pop);
+        const body = el("div", "", null, pop);
+        if (!collapsible) {
+          head.textContent = title;
+          return body;
+        }
+        const paintHead = () => {
+          const visible = !body.classList.contains("hidden");
+          head.textContent = `${title} ${visible ? "▾" : "▸"}`;
+          head.title = visible ? "Plegar este grupo" : "Desplegar este grupo";
+        };
+        body.classList.toggle("hidden", !open);
+        head.style.cursor = "pointer";
+        head.style.userSelect = "none";
+        head.onclick = () => {
+          body.classList.toggle("hidden");
+          paintHead();
+        };
+        paintHead();
+        return body;
+      };
 
-      el("div", "pop-sep", null, pop);
-      el("div", "pop-title", "Etiquetas", pop);
+      const gPoints = group("Puntos");
+      addMenuBtn(gPoints, !state.hidePoles ? "check" : "", "Pines de postes (tecla H)", () => { toggleHidePoles(); closePopover(); });
+
+      const gLabels = group("Etiquetas", { collapsible: true });
       for (const [val, lbl] of [["cerca", "Al acercar zoom"], ["siempre", "Siempre visibles"], ["ninguna", "Ocultar etiquetas"]]) {
-        addMenuBtn(pop, state.labelMode === val ? "check" : "", lbl, () => { state.labelMode = val; styleCache = new WeakMap(); rebuildOverlayLayers(); closePopover(); });
+        addMenuBtn(gLabels, state.labelMode === val ? "check" : "", lbl, () => { state.labelMode = val; styleCache = new WeakMap(); rebuildOverlayLayers(); closePopover(); });
       }
-      addMenuBtn(pop, "sliders", state.labelContent === "numero" ? "Texto: Rol/N° (cambiar a completo)" : "Texto: Rol/N° + Código", () => {
+      addMenuBtn(gLabels, "sliders", state.labelContent === "numero" ? "Texto: Rol/N° (cambiar a completo)" : "Texto: Rol/N° + Código", () => {
         state.labelContent = state.labelContent === "numero" ? "completo" : "numero";
         styleCache = new WeakMap(); rebuildOverlayLayers(); closePopover();
       });
 
-      el("div", "pop-sep", null, pop);
-      el("div", "pop-title", "Detalle red MT/BT (WMTS)", pop);
-      const mtRow = el("div", "", null, pop);
+      const gNet = group("Red");
+      addMenuBtn(gNet, state.showSpans ? "check" : "", "Vectores de tramos MT (A→B)", () => { state.showSpans = !state.showSpans; rebuildOverlayLayers(); closePopover(); });
+      addMenuBtn(gNet, state.showRoute ? "check" : "", "Línea secuencial de ruta (1→2→3)", () => { state.showRoute = !state.showRoute; rebuildOverlayLayers(); closePopover(); });
+      addMenuBtn(gNet, state.showLinks ? "check" : "", "Rayos a aperturas vinculadas", () => { state.showLinks = !state.showLinks; rebuildOverlayLayers(); closePopover(); });
+
+      const gZones = group("Zonas");
+      addMenuBtn(gZones, state.showHulls ? "check" : "", "Polígonos de zonas (D / T / F)", () => { state.showHulls = !state.showHulls; rebuildOverlayLayers(); closePopover(); });
+      // El detalle por zona (área y puntos) ya vive en el chip «Zonas»: no se duplica acá.
+      const zoneHint = el("div", "", "Área y puntos de cada zona: chip «Zonas»", gZones);
+      zoneHint.style.cssText = "padding:0 8px 4px;font-size:10px;color:#64748B;";
+
+      const gBase = group("Base", { collapsible: true });
+      const mtRow = el("div", "", null, gBase);
       mtRow.style.cssText = "display:flex;gap:4px;padding:4px;";
       for (const lvl of [0, 1, 2, 3]) {
         const b = el("button", state.mtbtDetail === lvl ? "active-pill" : "btn-outline", lvl === 0 ? "Original" : `+${lvl}`, mtRow);
         b.style.flex = "1"; b.style.justifyContent = "center";
+        b.title = lvl === 0 ? "Detalle WMTS original" : `Detalle WMTS +${lvl}`;
         b.onclick = () => { setMtBtDetail(lvl); closePopover(); };
       }
-      addMenuBtn(pop, state.highlightNetwork ? "check" : "", "Resaltar red MT/BT (alto contraste)", () => { setNetworkHighlight(!state.highlightNetwork); closePopover(); });
+      addMenuBtn(gBase, state.highlightNetwork ? "check" : "", "Resaltar red MT/BT (alto contraste)", () => { setNetworkHighlight(!state.highlightNetwork); closePopover(); });
     });
   };
 
