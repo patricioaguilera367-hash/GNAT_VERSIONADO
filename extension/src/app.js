@@ -164,6 +164,10 @@
     filterTypes: new Set(), // combinable: "PUNTO", "APERTURA", "REMATE" (vacío = todos)
     filterZones: new Set(), // legacy
     hiddenZones: new Set(), // visibilidad por exclusión (vacío = todas visibles; "__NONE__" = sin zona)
+    // S14: conjunto aparte para el relleno. Antes el polígono leía `hiddenZones`, así que
+    // ocultar una zona se llevaba puestos los puntos y no había forma de ver los puntos
+    // sin el área pintada.
+    hiddenZoneAreas: new Set(),
     hiddenStatuses: new Set(),
     statuses: new Map([
       ["pendiente", { id: "pendiente", name: "Pendiente", color: "#64748B" }],
@@ -1471,6 +1475,13 @@
     return true;
   }
 
+  // S14: pintar el área y filtrar los puntos son dos decisiones distintas. `hiddenZones`
+  // decide qué puntos pasan; `hiddenZoneAreas` decide qué relleno se pinta. Puro a
+  // propósito: recibe sólo lo que necesita, y no puede ver el filtro de puntos.
+  function isZoneAreaPainted(showHulls, hiddenAreas, zoneId) {
+    return Boolean(showHulls) && !hiddenAreas.has(zoneId);
+  }
+
   function rebuildOverlayLayers() {
     const visible = getFilteredPoints();
     pointStyleFn._visibleSet = new Set(visible);
@@ -1502,6 +1513,8 @@
       for (const z of state.zones.values()) {
         if (state.filterZones.size > 0 && !state.filterZones.has(z.id)) continue;
         if (state.hiddenZones.has(z.id)) continue;
+        // El área apagada sólo apaga el relleno: los puntos de la zona siguen ahí.
+        if (!isZoneAreaPainted(state.showHulls, state.hiddenZoneAreas, z.id)) continue;
         if (zonesWithPoints.has(z.id) && !zonesVisible.has(z.id)) continue;
         const ringLonLat = getZoneRingLonLat(z.id);
         if (!ringLonLat || ringLonLat.length < 3) continue;
@@ -3210,6 +3223,27 @@
         sp.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
         const bSolo = el("button", "btn-outline", "Solo", row);
         bSolo.style.cssText = "padding:1px 6px;font-size:10px;";
+        // Segundo eje, en la misma fila: el ojo apaga o prende el relleno de esta zona
+        // sin tocar qué puntos pasan. No agrega chip ni entrada de menú.
+        const bArea = el("button", "btn-outline", "", row);
+        setBtn(bArea, "eye", "", 12);
+        const paintAreaState = () => {
+          const on = isZoneAreaPainted(state.showHulls, state.hiddenZoneAreas, id);
+          bArea.style.cssText = `padding:1px 5px;font-size:10px;opacity:${on ? "1" : "0.35"};`;
+          bArea.title = on
+            ? `Dejar de pintar el área de ${label} (los puntos siguen visibles)`
+            : `Volver a pintar el área de ${label}`;
+        };
+        paintAreaState();
+        bArea.onclick = (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (state.hiddenZoneAreas.has(id)) state.hiddenZoneAreas.delete(id);
+          else state.hiddenZoneAreas.add(id);
+          paintAreaState();
+          markDirty();
+          rebuildOverlayLayers();
+        };
         bSolo.onclick = () => {
           state.hiddenZones.clear();
           for (const oz of state.zones.keys()) if (oz !== id) state.hiddenZones.add(oz);
