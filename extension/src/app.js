@@ -120,6 +120,11 @@
   // S18: el orden de las columnas es dato del proyecto, no del código. Una columna que
   // la lista guardada no conoce (recién agregada) entra al final en vez de desaparecer.
   const orderedTableColumns = () => {
+    // S25: en vista compacta sólo quedan las dos columnas que identifican un punto.
+    // Va acá y no en renderTable porque el orden es la única fuente de columnas.
+    if (state.compactTable) {
+      return TABLE_COLUMNS.filter(c => c.id === "check" || c.id === "numero" || c.id === "codigo");
+    }
     const byId = new Map(TABLE_COLUMNS.map(c => [c.id, c]));
     const seen = new Set();
     const out = [];
@@ -186,6 +191,9 @@
     columnFilters: new Map(), // Map<colId, Set<string>|null>
     // S24: ancla del rango con Shift. Sin esto, Shift+clic no tiene desde dónde extender.
     lastTouchedIdx: -1,
+    // S25: vista compacta de la tabla (sólo N° y Código). El resto de la información
+    // sigue disponible en la nube del renglón, para no perderla al despejar la pantalla.
+    compactTable: false,
     lastSearchMissing: [],  // códigos pegados en el buscador que no están en la tabla
     recentColors: ["#00C853", "#FF6D00", "#DC2626", "#2979FF"],
     syncQueue: { running: false, paused: false, cancelled: false, total: 0, done: 0, items: [] },
@@ -1135,6 +1143,22 @@
   const syncQueueBar = el("div", "sync-queue-bar hidden", null, drawer);
   const tableWrap = el("div", "table-wrap", null, drawer);
   tableWrap.tabIndex = 0;
+  // S25: la tabla se estira con la pestaña de la esquina, como cualquier ventana. El
+  // tirador es un elemento propio y no el `resize` nativo porque además hay que
+  // distinguir un doble clic (vista compacta) de un arrastre (redimensionar).
+  // S25: la pestaña de la esquina es la nativa del navegador (`resize`), que no interfiere
+  // con el contenido. El doble clic se detecta por coordenadas dentro del contenedor y no
+  // con un elemento propio: la manija nativa no recibe eventos, así que un div encima
+  // sólo agregaría una segunda manija encima de la real.
+  tableWrap.addEventListener("dblclick", (ev) => {
+    const r = tableWrap.getBoundingClientRect();
+    if (ev.clientX <= r.right - 18 || ev.clientY <= r.bottom - 18) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    state.compactTable = !state.compactTable;
+    refreshAll();
+    showToast(state.compactTable ? "Vista compacta: N° y Código" : "Vista completa");
+  });
   const table = el("table", "", null, tableWrap);
   const colgroup = el("colgroup", "", null, table);
   const thead = el("thead", "", null, table);
@@ -2760,6 +2784,19 @@
       const isLinked = linkedPeerSet.has(f);
       const tr = doc.createElement("tr");
       tr.dataset.idx = String(idx);
+      // S25: en vista compacta la información que salió de las columnas no se pierde:
+      // queda en la nube del renglón, con el mismo dato que antes estaba a la vista.
+      if (state.compactTable) {
+        const zs = getPointZoneIds(f);
+        const supObj = state.supervisors.get(getSupId(f)) || {};
+        const stObj = state.statuses.get(f.get("estadoEjec") || "pendiente");
+        tr.title = [
+          `SSEE ${f.get("sseeCode") || "—"}`,
+          `Zona ${zs.length ? zs.join(" · ") : "—"}`,
+          `Sup. ${supObj.initials || "—"}`,
+          `Estado ${stObj ? stObj.name : "—"}`
+        ].join("   ·   ");
+      }
       if (isSel) tr.classList.add("selected");
       if (isFoc) tr.classList.add("focused");
       else if (isLinked) tr.classList.add("linked-highlight");
