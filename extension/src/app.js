@@ -194,6 +194,9 @@
     // S25: vista compacta de la tabla (sólo N° y Código). El resto de la información
     // sigue disponible en la nube del renglón, para no perderla al despejar la pantalla.
     compactTable: false,
+    // S25: ancho preferido del panel, elegido con el tirador. Se guarda aparte del ancho
+    // aplicado para poder clamparlo al achicar la ventana sin perder la preferencia.
+    drawerWidth: null,
     lastSearchMissing: [],  // códigos pegados en el buscador que no están en la tabla
     recentColors: ["#00C853", "#FF6D00", "#DC2626", "#2979FF"],
     syncQueue: { running: false, paused: false, cancelled: false, total: 0, done: 0, items: [] },
@@ -319,6 +322,20 @@
       if (used.size > 1) return true;
     }
     return false;
+  };
+
+  // S25: el resumen del punto en una línea. Lo usan la nube del renglón y la columna de
+  // código en vista compacta: es el mismo texto, definido una sola vez.
+  const compactSummary = (f) => {
+    const zs = getPointZoneIds(f);
+    const supObj = state.supervisors.get(getSupId(f)) || {};
+    const stObj = state.statuses.get(f.get("estadoEjec") || "pendiente");
+    return [
+      f.get("sseeCode") ? `SSEE ${f.get("sseeCode")}` : "",
+      zs.length ? zs.join(" · ") : "",
+      supObj.initials || "",
+      stObj ? stObj.name : ""
+    ].filter(Boolean).join("  ·  ");
   };
 
   const getPointColor = (f) => {
@@ -1165,10 +1182,23 @@
     const up = () => {
       doc.removeEventListener("pointermove", move);
       doc.removeEventListener("pointerup", up);
+      // Se guarda el ancho efectivamente elegido, no el clampeado: si la ventana está
+      // chica el panel se achica en pantalla pero la preferencia queda intacta.
+      state.drawerWidth = drawer.getBoundingClientRect().width;
+      markDirty();
     };
     doc.addEventListener("pointermove", move);
     doc.addEventListener("pointerup", up);
   };
+  // S25: al achicar la ventana el panel se clampa al viewport, pero el ancho preferido no
+  // se pierde: al volver a agrandar recupera el tamaño que el humano eligió.
+  const applyDrawerWidth = () => {
+    if (!state.drawerWidth) return;
+    drawer.style.width = Math.min(state.drawerWidth, Math.max(260, w.innerWidth - 40)) + "px";
+  };
+  applyDrawerWidth();
+  w.addEventListener("resize", applyDrawerWidth);
+
   tableGrip.ondblclick = (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
@@ -2671,6 +2701,9 @@
     // filtro las nueve columnas sumaban más ancho que la tabla y la única elástica
     // (Código) colapsaba a 0 px, que se veía como "borraste el código del poste".
     const columns = orderedTableColumns().filter(c => (!c.requiresMultiSup || multiSup) && !state.hiddenColumns.has(c.id));
+    // S25: en compacto la tabla ocupa todo el ancho para que Código absorba lo que antes
+    // era un hueco a la derecha.
+    table.style.width = state.compactTable ? "100%" : "";
     // El piso de ancho se calcula con las columnas visibles: sumar una columna ensancha
     // la tabla y aparece el desplazamiento horizontal, en vez de aplastar el código.
     table.style.minWidth = `${tableMinWidth(columns)}px`;
@@ -2801,19 +2834,7 @@
       const isLinked = linkedPeerSet.has(f);
       const tr = doc.createElement("tr");
       tr.dataset.idx = String(idx);
-      // S25: en vista compacta la información que salió de las columnas no se pierde:
-      // queda en la nube del renglón, con el mismo dato que antes estaba a la vista.
-      if (state.compactTable) {
-        const zs = getPointZoneIds(f);
-        const supObj = state.supervisors.get(getSupId(f)) || {};
-        const stObj = state.statuses.get(f.get("estadoEjec") || "pendiente");
-        tr.title = [
-          `SSEE ${f.get("sseeCode") || "—"}`,
-          `Zona ${zs.length ? zs.join(" · ") : "—"}`,
-          `Sup. ${supObj.initials || "—"}`,
-          `Estado ${stObj ? stObj.name : "—"}`
-        ].join("   ·   ");
-      }
+      if (state.compactTable) tr.title = compactSummary(f);
       if (isSel) tr.classList.add("selected");
       if (isFoc) tr.classList.add("focused");
       else if (isLinked) tr.classList.add("linked-highlight");
@@ -2957,6 +2978,15 @@
         tdCode.appendChild(sub);
       }
       tdCode.title = `${getPointCode(f)} ${f.get("accionPT") ? "· " + f.get("accionPT") : ""}`;
+
+      // S25: en compacto el ancho sobrante no queda vacío: el resumen ocupa la celda de
+      // código y la columna absorbe el espacio, así ensanchar el panel informa más.
+      if (state.compactTable) {
+        const sum = doc.createElement("span");
+        sum.className = "compact-summary";
+        sum.textContent = compactSummary(f);
+        tdCode.appendChild(sum);
+      }
 
       const tdZ = doc.createElement("td");
       const zids = columnValues(f, "zona");
