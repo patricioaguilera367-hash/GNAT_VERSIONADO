@@ -767,7 +767,7 @@
       if (!candidates.length) continue;
 
       const openingCands = candidates.filter(c => OPENING_DEVICE_REGEX.test(c.display || "") && !POLE_CLASS_REGEX.test(c.display || ""));
-      // Si es APERTURA (o se pidió desambiguar) y existen varios equipos con el mismo código (ej. FAL5870: DBC + RC + DF),
+      // Si es APERTURA (o se pidió desambiguar) y existen varios equipos con el mismo código (ej. FAL4310: DBC + RC + DF),
       // consultar sus geometrías en 1 solo lote para elegir por tipo declarado o por cercanía al clic/coordenada.
       if ((preferOpening || opts?.returnAllDevices) && openingCands.length > 1) {
         const idPairs = openingCands.map(c => ({ cand: c, id: Number(c.surrogate_in_map_id || c.object_id) })).filter(x => Number.isFinite(x.id) && x.id > 0);
@@ -966,7 +966,7 @@
           const pm = CODE_AT_START.exec(disp);
           if (pm) {
             const candCode = pm[1].toUpperCase();
-            // Priorizar siempre códigos alfanuméricos de poste (ej. FAB6532, F723319) sobre IDs numéricos puros
+            // Priorizar siempre códigos alfanuméricos de poste (ej. FAB7640, F688926) sobre IDs numéricos puros
             const candHasAlpha = /^[A-Z]/.test(candCode);
             const curHasAlpha = /^[A-Z]/.test(detectedPoleCode);
             if (!detectedPoleCode || (candHasAlpha && !curHasAlpha)) {
@@ -2079,7 +2079,7 @@
         // Incluir tanto equipos en serie (Reconectador, Seccionador, Pole Top, DDCC) como Desconectadores Fusibles de arranque MT (ya filtrados sin fusibles de SSEE)
         const lineDevicesHere = neighborhood.devices;
         const rawDevCode = (lineDevicesHere[0]?.code || "").toUpperCase();
-        // Priorizar código real del poste (alfanumérico) o del equipo de apertura (ej. FF4840, FA4434) antes que IDs numéricos del tramo
+        // Priorizar código real del poste (alfanumérico) o del equipo de apertura (ej. FF8171, FA4181) antes que IDs numéricos del tramo
         const pickCode = () => {
           const cands = [neighborhood.detectedPoleCode, rawDevCode, cur.hintCode].map(x => String(x || "").trim().toUpperCase()).filter(Boolean);
           const alpha = cands.find(x => /^[A-Z]/.test(x) && !x.startsWith("N_"));
@@ -4408,7 +4408,7 @@
     }
     const inpCode = el("input", "", null, form);
     inpCode.type = "text";
-    inpCode.placeholder = forceOpening ? "Código apertura (ej. FF4840)" : "Detectando poste GNAT...";
+    inpCode.placeholder = forceOpening ? "Código apertura (ej. FF8171)" : "Detectando poste GNAT...";
 
     const gnatHint = el("div", "", "Consultando poste en GNAT...", form);
     gnatHint.style.cssText = "font-size:11px;color:#475569;min-height:14px;";
@@ -4460,11 +4460,11 @@
           }
         } else {
           gnatHint.textContent = "Sin poste detectado en ese punto (ingresa el código manual).";
-          inpCode.placeholder = "Código poste (ej. FAG1672)";
+          inpCode.placeholder = "Código poste (ej. FAG8781)";
         }
       } catch (_) {
         gnatHint.textContent = "";
-        inpCode.placeholder = "Código poste (ej. FAG1672)";
+        inpCode.placeholder = "Código poste (ej. FAG8781)";
       }
     })();
 
@@ -5344,7 +5344,7 @@
 
     const fSsee = mkField("Cód. Subestación (S/E)");
     inpSsee = el("input", "code-mono", null, fSsee);
-    inpSsee.placeholder = "Ej. F59430 (asume DF XS)";
+    inpSsee.placeholder = "Ej. F12810 (asume DF XS)";
     inpSsee.value = String(f.get("sseeCode") || "").replace(/^SSEE\s+/i, "");
 
     const fTer = mkField("Código en terreno");
@@ -5611,7 +5611,7 @@
       if (foundSsee && !f.get("sseeCode")) f.set("sseeCode", `SSEE ${foundSsee}`);
 
       // Reconciliación automática S/E <-> Poste: si el usuario cargó el código de la S/E como código principal,
-      // moverlo a Cód. S/E y promover el código real del poste (ej. F59430 -> Poste F628190 + SSEE F59430 + DF XS)
+      // moverlo a Cód. S/E y promover el código real del poste (ej. F12810 -> Poste F731295 + SSEE F12810 + DF XS)
       const realPole = (nb.detectedPoleCode || "").toUpperCase();
       if (foundSsee && code === foundSsee) {
         // El código cargado es el de la S/E, no el de un poste: va al campo de S/E.
@@ -5758,7 +5758,7 @@
     el("div", "", "Pega una lista de códigos o copia/pega filas directo desde Excel (con o sin coordenadas):", body).style.fontSize = "12px";
     const ta = el("textarea", "", null, body);
     ta.style.cssText = "width:100%;height:110px;border:1px solid var(--border);border-radius:8px;padding:8px;font:12px monospace;";
-    ta.placeholder = "N°\tCOD POSTE\tLatitud\tLongitud\n55\tFBP0407\t-37,9159\t-72,9496";
+    ta.placeholder = "N°\tCOD POSTE\tLatitud\tLongitud\n55\tFBP9122\t-37,9159\t-72,9496";
 
     const optRow = el("div", "inline-input-row", null, body);
     optRow.style.justifyContent = "space-between";
