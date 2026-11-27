@@ -340,9 +340,11 @@
 
   const getPointColor = (f) => {
     const custom = f.get("colorPersonalizado");
-    // S21: el color propio es la decisión manual y le gana a cualquier modo, salvo en
-    // «Propio», donde es la única fuente: ese modo sirve para ver sólo lo que uno marcó.
-    if (state.colorBy !== "propio" && isHex(custom)) return custom;
+    // S31: el modo elegido es EL canal de color y manda sobre todo, incluido el color
+    // personalizado. «Propio» existe para ver esa marca manual; fuera de ese modo,
+    // elegir «Supervisor» tiene que dar supervisor. Antes el color propio se
+    // superponía a los cuatro modos: un punto pintado a mano alguna vez nunca volvía
+    // a su canal, y Alt+1..4 no lo alcanzaba.
     if (state.colorBy === "propio") return isHex(custom) ? custom : UNASSIGNED_ZONE_COLOR;
     // Una apertura es un equipo, no un punto de zona: su color lo dice el tipo, y su
     // forma ya la distingue en el mapa.
@@ -1469,7 +1471,14 @@
     const isFocused = state.focused === idx;
     const isSelected = state.selected.has(idx);
     const isLinkedPeer = pointStyleFn._linkedSet?.has(f) || false;
-    const color = isRemate ? "#7C3AED" : isIntermedio ? "#64748B" : getPointColor(f);
+    // S31: el color lo decide el modo activo, no la forma del punto. En «Zona» el remate
+    // y el intermedio conservan su tono propio (violeta / gris) porque no representan
+    // una zona; en cualquier otro modo manda el canal elegido: si se pinta por
+    // supervisor, un remate o un intermedio de CC salen naranjas como el resto de CC.
+    // Antes los dos atajos se aplicaban siempre y secuestraban el color en Alt+1..4.
+    const color = state.colorBy === "zone"
+      ? (isRemate ? "#7C3AED" : isIntermedio ? "#64748B" : getPointColor(f))
+      : getPointColor(f);
     const rolPT = String(f.get("rolPT") || "").trim();
     const showText = isIntermedio
       ? (isFocused || isSelected)
