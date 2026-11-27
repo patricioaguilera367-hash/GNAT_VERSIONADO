@@ -1,0 +1,21 @@
+{
+  "//": "Localiza el host del shadow root por id en el documento y en el frame del mapa.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 9000)); return { ready: true };"
+    },
+    {
+      "eval": "const h = document.getElementById('centrality-v10-host'); const out = { top: Boolean(h) }; if (h) { const sh = h.shadowRoot; out.shadowHijos = sh ? sh.childNodes.length : null; out.topbar = Boolean(sh && sh.querySelector('.topbar')); out.botones = sh ? sh.querySelectorAll('button').length : null; out.chips = sh ? sh.querySelectorAll('button.chip').length : null; } return out;"
+    },
+    {
+      "frame": "wmc",
+      "inFrame": "const h = document.getElementById('centrality-v10-host'); const out = { wmc: Boolean(h) }; if (h) { const sh = h.shadowRoot; out.shadowHijos = sh ? sh.childNodes.length : null; out.topbar = Boolean(sh && sh.querySelector('.topbar')); out.botones = sh ? sh.querySelectorAll('button').length : null; } return out;"
+    }
+  ]
+}

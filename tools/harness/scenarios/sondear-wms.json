@@ -1,0 +1,22 @@
+{
+  "//": "Abre el mapa capturando la consulta REAL al servicio, y sondea si es WMS.",
+  "//ojo": "Sólo se reportan marcadores y cantidades; ningún valor de dato.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "captureNetwork": {
+    "filter": "/webmap/|/svc_",
+    "inspectBodies": 0
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (!apps) return { error: 'no Aplicaciones' }; let container = apps; for (let i = 0; i < 6 && container; i += 1) { if (container.querySelector && container.querySelector('.x-tree-expander')) break; container = container.parentElement; } const expander = container ? container.querySelector('.x-tree-expander') : null; if (expander) expander.click(); else apps.click(); await new Promise((r) => setTimeout(r, 2500)); const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 12000)); return { clicked: true };"
+    },
+    {
+      "eval": "const probe = async (label, url) => { try { const r = await fetch(url, { credentials: 'include' }); const t = await r.text(); return { label, status: r.status, len: t.length, wms: /<WMS_Capabilities|<WMT_MS_Capabilities|wms_capabilities/i.test(t), wmts: /Capabilities[^>]*wmts|wmts:/i.test(t), layers: (t.match(/<Layer[ >]/gi) || []).length, serviceException: /ServiceException|ExceptionReport/i.test(t), head: t.slice(0, 60).replace(/[A-Za-z0-9]/g, '.') }; } catch (error) { return { label, error: String(error.message) }; } }; const base = '/webmap/saesa/service'; return { caps: await probe('GetCapabilities', base + '?SERVICE=WMS&REQUEST=GetCapabilities'), caps13: await probe('GetCapabilities130', base + '?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetCapabilities') };"
+    }
+  ]
+}

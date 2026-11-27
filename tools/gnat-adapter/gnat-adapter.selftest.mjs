@@ -1,0 +1,507 @@
+import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const zone = require("./gnat-adapter.js");
+
+const P1 = { lon: -52.094406189, lat: -28.739195167 };
+const P2 = { lon: -52.096025017, lat: -28.738362926 };
+const DEVICE_ID = 9000006;
+
+const SPANS_AT_P1 = [
+  { id: 9000001, display: "PT0009 - PT0010", type: "Alambre Cu Duro Des 6 AWG 2-fas MT" },
+  { id: 9000004, display: "PT0010 - PT0011", type: "Alambre Cu Duro Des 6 AWG 2-fas MT" },
+];
+
+const SPANS_AT_P2 = [
+  { id: 9000003, display: "PT0011 - PT0012", type: "Alambre Cu Duro Des 6 AWG 2-fas MT" },
+  { id: 9000002, display: "PT0013 - PT0012", type: "Alambre Cu Duro Des 6 AWG 1-fas BT" },
+  { id: 9000005, display: "PT0012", type: "Alambre Cu Duro Des 6 AWG 2-fas MT" },
+];
+
+/** Section 23 as GNAT actually renders it, measured live. */
+const SECTION_CLOSED = `<div class='section'><div class='h'>Datos</div>
+<div class='row'><span>Estado operativo:</span><b>normalmente cerrado (NC)</b></div>
+<div class='row'><span>Tensión del circuito:</span><b>13.2 kV</b></div>
+<div class='row'><span>Fases:</span><b>Real</b> desde 08/04/2026 18:30:00 -04</div></div>`;
+
+const SECTION_BLANK = `<div class='section'><div class='row'><span>Tensión del circuito:</span><b>13.2 kV</b></div></div>`;
+
+function makeClient(config = {}) {
+  const calls = [];
+  const client = {
+    calls,
+    async search(term) {
+      calls.push({ op: "search", term });
+      if (term === "PT0010") return [{ object_id: 9000007, surrogate_in_map_id: 9000007, display: "PT0010 (Postes c.a. 10 m)" }];
+      if (term === "PT0012") {
+        return [
+          { object_id: 9000008, surrogate_in_map_id: 9000008, display: "PT0012 (Postes c.a. 11.5 m)" },
+          { object_id: DEVICE_ID, surrogate_in_map_id: DEVICE_ID, display: "PT0012 (Desconectador Fusible Empresa)" },
+        ];
+      }
+      return [];
+    },
+    async geojson(ids) {
+      calls.push({ op: "geojson", ids });
+      const id = ids[0];
+      const point = id === 9000007 ? P1 : id === 9000008 || id === DEVICE_ID ? P2 : null;
+      if (!point) return { type: "Feature", geometry: null, id };
+      return {
+        type: "FeatureCollection",
+        features: [{ type: "Feature", geometry: { type: "Point", coordinates: [point.lon, point.lat] }, id }],
+      };
+    },
+    async pointObjects(lon, lat) {
+      calls.push({ op: "point", lon, lat });
+      // The two poles are ~180 m apart while a ring reaches 12 m, so classify by
+      // nearest centre: a fixed tolerance would fold both poles into one.
+      const toP1 = Math.abs(lon - P1.lon) + Math.abs(lat - P1.lat);
+      const toP2 = Math.abs(lon - P2.lon) + Math.abs(lat - P2.lat);
+      if (toP1 < toP2) return config.poleOneObjects || SPANS_AT_P1;
+      return config.poleTwoObjects || [...SPANS_AT_P2, { id: DEVICE_ID, display: "PT0012", type: "" }];
+    },
+    async objectTitle(id) {
+      calls.push({ op: "title", id });
+      if (id === DEVICE_ID) return "Desconectador Fusible Empresa";
+      return `Detalle de Cable ${id}`;
+    },
+    async sectionHtml(id, sectionId) {
+      calls.push({ op: "section", id, sectionId });
+      return config.sectionHtml === undefined ? SECTION_CLOSED : config.sectionHtml;
+    },
+  };
+  return client;
+}
+
+// --- one pole: the zone is defined, but nothing isolates it yet --------------
+{
+  const client = makeClient();
+  const result = await zone.findWorkZone({ poleCodes: ["PT0010"], client });
+
+  assert.equal(result.status, "parcial");
+  assert.equal(result.reason, "sin aparato de maniobra adyacente: la zona no queda delimitada por maniobra");
+  assert.equal(result.zone.edges.length, 2);
+  assert.deepEqual(
+    result.zone.edges.map((edge) => `${edge.from}-${edge.to}`),
+    ["PT0009-PT0010", "PT0010-PT0011"]
+  );
+  assert.deepEqual(result.zone.voltages, ["mt"]);
+  assert.equal(result.boundary.length, 0);
+  assert.equal(result.budget.requests, 3, "one search, one geometry, one calibrated point query");
+}
+
+// --- two poles: the switch at PT0012 closes the zone ------------------------
+{
+  const client = makeClient();
+  const result = await zone.findWorkZone({ poleCodes: ["PT0010", "PT0012"], client });
+
+  assert.equal(result.status, "delimitada");
+  assert.equal(result.zone.edges.length, 4, "the single-code pseudo span is not an edge");
+  assert.deepEqual(result.zone.voltages.sort(), ["bt", "mt"], "MT and BT never merge");
+  assert.equal(result.boundary.length, 1);
+  assert.equal(result.boundary[0].estado, "cerrado", "S7: a read switch reports its state");
+  assert.equal(result.boundary[0].estadoTexto, "normalmente cerrado (NC)");
+  assert.equal(result.boundary[0].realDesde, "08/04/2026 18:30:00 -04");
+  assert.equal(result.boundary[0].hasRealBlock, true);
+  assert.equal(result.boundary[0].title, "Desconectador Fusible Empresa");
+}
+
+// --- S7: an unread switch is not a closed switch -----------------------------
+{
+  const client = makeClient({ sectionHtml: SECTION_BLANK });
+  const result = await zone.findWorkZone({ poleCodes: ["PT0012"], client });
+
+  assert.equal(result.boundary.length, 1, "the device is still reported");
+  assert.equal(result.boundary[0].estado, "desconocido");
+  assert.equal(result.boundary[0].estadoTexto, null);
+  assert.equal(result.status, "parcial");
+  assert.equal(result.reason, "aparatos hallados sin estado legible");
+}
+
+// --- S1: the budget wins over completeness ----------------------------------
+{
+  const client = makeClient();
+  const result = await zone.findWorkZone({ poleCodes: ["PT0010", "PT0012"], client, settings: { maxRequests: 3 } });
+
+  assert.ok(result.budget.requests <= 3, "never spend past the budget");
+  assert.equal(result.status, "no concluyente", "a run that measured nothing is not a partial answer");
+  assert.match(result.reason, /presupuesto agotado/);
+}
+
+// --- a truncated run that did measure stays partial -------------------------
+{
+  const client = makeClient();
+  // One pole costs three requests now, so the cut lands on the second pole.
+  const result = await zone.findWorkZone({ poleCodes: ["PT0010", "PT0012"], client, settings: { maxRequests: 5 } });
+
+  assert.ok(result.budget.requests <= 5);
+  assert.ok(result.zone.edges.length > 0, "some spans were measured before the cut");
+  assert.equal(result.status, "parcial");
+  assert.match(result.reason, /presupuesto agotado/);
+}
+
+// --- a code nobody owns is reported, never guessed --------------------------
+{
+  const client = makeClient();
+  const result = await zone.findWorkZone({ poleCodes: ["F483579"], client });
+
+  assert.deepEqual(result.resolved, []);
+  assert.deepEqual(result.unresolved, ["F483579"]);
+  assert.equal(result.status, "no concluyente");
+  assert.equal(result.reason, "ningún código resolvió a un punto");
+}
+
+// --- verify: the operator chooses the openings, the engine checks them ------
+const CHAIN = ["PA1001", "PA1002", "PA1003", "PA1004", "PA1005"];
+const chainPoint = (index) => ({ lon: -62.1 + index * 0.01, lat: -33.7 });
+const SOURCE_OBJECT_ID = 5001;
+
+function makeChainClient(config = {}) {
+  return {
+    async search(term) {
+      if (!CHAIN.includes(term)) return [];
+      return [{ object_id: 9000 + CHAIN.indexOf(term), surrogate_in_map_id: 9000 + CHAIN.indexOf(term), display: `${term} (Postes c.a. 11.5 m)` }];
+    },
+    async geojson(ids) {
+      const index = Number(ids[0]) - 9000;
+      const point = chainPoint(index);
+      return { type: "Feature", geometry: { type: "Point", coordinates: [point.lon, point.lat] }, id: ids[0] };
+    },
+    async pointObjects(lon, lat) {
+      let best = 0;
+      for (let i = 1; i < CHAIN.length; i += 1) {
+        if (Math.abs(lon - chainPoint(i).lon) < Math.abs(lon - chainPoint(best).lon)) best = i;
+      }
+      const rows = [];
+      if (best > 0) rows.push({ id: 7000 + best, display: `${CHAIN[best - 1]} - ${CHAIN[best]}`, type: "Alambre Cu Duro Des 6 AWG 2-fas MT" });
+      if (best < CHAIN.length - 1) rows.push({ id: 7100 + best, display: `${CHAIN[best]} - ${CHAIN[best + 1]}`, type: "Alambre Cu Duro Des 6 AWG 2-fas MT" });
+      if (best === 0 && config.withSource) rows.push({ id: SOURCE_OBJECT_ID, display: CHAIN[0], type: "" });
+      return rows;
+    },
+    async objectTitle(id) {
+      return id === SOURCE_OBJECT_ID ? "Subestación MT/BT 15 kVA" : `Detalle de Cable ${id}`;
+    },
+    async sectionHtml() {
+      return SECTION_CLOSED;
+    },
+  };
+}
+
+// The chosen openings close the island: nothing else feeds it.
+{
+  const result = await zone.verifyAperturas({
+    workCodes: ["PA1002", "PA1003"],
+    openCodes: ["PA1001", "PA1004"],
+    client: makeChainClient(),
+  });
+  assert.equal(result.valid, true, result.reason);
+  assert.deepEqual(result.island.sort(), ["PA1002", "PA1003"]);
+  assert.deepEqual(result.boundary.sort(), ["PA1001", "PA1004"]);
+  assert.equal(result.sources.length, 0);
+  assert.equal(result.voltage, "mt");
+}
+
+// One opening missing: the island still reaches a source, so it is not dead.
+{
+  const result = await zone.verifyAperturas({
+    workCodes: ["PA1002", "PA1003"],
+    openCodes: ["PA1004"],
+    client: makeChainClient({ withSource: true }),
+    settings: { maxRequests: 200, readSources: true },
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.reason, /sigue conectada a Subestación/);
+  assert.equal(result.sources.length, 1);
+  assert.equal(result.sources[0].code, "PA1001");
+}
+
+// Opening nothing: the island never meets the switches it claims to rely on.
+{
+  const result = await zone.verifyAperturas({
+    workCodes: ["PA1002"],
+    openCodes: [],
+    client: makeChainClient(),
+    settings: { maxRequests: 200 },
+  });
+  assert.equal(result.valid, false);
+  assert.equal(result.boundary.length, 0);
+  assert.match(result.reason, /no se alcanzó ninguna de las aperturas/);
+  assert.equal(result.island.length, 5, "the walk covered the whole chain");
+}
+
+// S1: an unfinished walk is never a valid opening.
+{
+  const result = await zone.verifyAperturas({
+    workCodes: ["PA1002", "PA1003"],
+    openCodes: ["PA1001", "PA1004"],
+    client: makeChainClient(),
+    settings: { maxRequests: 3 },
+  });
+  assert.equal(result.valid, false, "incomplete evidence never approves an opening");
+  assert.match(result.reason, /presupuesto agotado/);
+  assert.ok(result.unresolved.length > 0);
+}
+
+// --- a switch cuts a side, not the pole -------------------------------------
+// Opening both sides isolates the pole; opening one leaves it fed from the other.
+{
+  const both = await zone.verifyAperturas({
+    workCodes: ["PA1002"],
+    openCodes: [{ code: "PA1001", side: "both" }, { code: "PA1003", side: "both" }],
+    client: makeChainClient(),
+  });
+  assert.equal(both.valid, true, both.reason);
+  assert.deepEqual(both.opened, ["PA1001", "PA1003"]);
+  assert.equal(both.poleStates.find((entry) => entry.code === "PA1001").live, "no");
+  assert.match(both.poleStates.find((entry) => entry.code === "PA1001").reason, /aislado/);
+}
+
+{
+  const oneSide = await zone.verifyAperturas({
+    workCodes: ["PA1002"],
+    openCodes: [{ code: "PA1001", side: "a" }, { code: "PA1003", side: "b" }],
+    client: makeChainClient(),
+    settings: { maxRequests: 400 },
+  });
+  const state = oneSide.poleStates.find((entry) => entry.code === "PA1001");
+  // No source anywhere in this chain, so no side can reach one.
+  assert.equal(state.live, "no");
+  assert.match(state.reason, /ningún lado alcanza una fuente/);
+  assert.equal(state.role, "apertura");
+}
+
+// --- radial line: the opened side decides the pole's fate -------------------
+// fuente — PA1001 — PA1002 — PA1003 (remate)
+{
+  const result = await zone.verifyAperturas({
+    workCodes: ["PA1003"],
+    openCodes: [{ code: "PA1002", side: "a" }],
+    client: makeChainClient({ withSource: true }),
+    settings: { maxRequests: 400, readSources: true },
+  });
+  const state = result.poleStates.find((entry) => entry.code === "PA1002");
+  assert.equal(state.live, "no", "opening the feeding side kills the pole");
+  assert.match(state.reason, /se abre el lado que alimenta/);
+  assert.equal(result.valid, true, result.reason);
+}
+
+{
+  const result = await zone.verifyAperturas({
+    workCodes: ["PA1003"],
+    openCodes: [{ code: "PA1002", side: "b" }],
+    client: makeChainClient({ withSource: true }),
+    settings: { maxRequests: 400, readSources: true },
+  });
+  const state = result.poleStates.find((entry) => entry.code === "PA1002");
+  assert.equal(state.live, "si", "opening the far side leaves a live dead-end");
+  assert.match(state.reason, /remate energizado/);
+  assert.equal(result.valid, true, "the work zone itself is dead");
+  assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0], /PA1002 queda con tensión/);
+}
+
+// A pole that is both work and an opening cannot be declared dead.
+{
+  const result = await zone.verifyAperturas({
+    workCodes: ["PA1002"],
+    openCodes: ["PA1002"],
+    client: makeChainClient(),
+    settings: { maxRequests: 400 },
+  });
+  const state = result.poleStates.find((entry) => entry.code === "PA1002");
+  assert.equal(state.role, "ambos");
+  assert.equal(result.valid, false);
+}
+
+// --- audit: rebuild the permit and compare it with the network --------------
+{
+  const permit = {
+    objectCode: "PA1004",
+    workCodes: ["PA1003", "PA1004"],
+    openCodes: [{ code: "PA1002", side: "a" }],
+    groundCodes: ["PA1004"],
+    siteCodes: ["PA1005"],
+  };
+  const audit = await zone.auditPermit({
+    permit,
+    client: makeChainClient({ withSource: true }),
+    settings: { maxRequests: 800, readSources: true },
+  });
+
+  assert.equal(audit.declared.length, 4, "four distinct codes across the five roles");
+  assert.deepEqual(audit.missing, []);
+  assert.equal(audit.points.length, 4);
+  assert.ok(audit.points.every((entry) => entry.lonlat && entry.lonlat.lon < 0));
+  assert.equal(audit.outline.length, 2, "a straight radial line has no area: its hull is a segment");
+  assert.ok(audit.network.spans.length >= 3);
+  assert.deepEqual(audit.voltages, ["mt"]);
+  assert.equal(audit.verification.valid, true, audit.verification.reason);
+  assert.equal(audit.status, "consistente");
+  assert.equal(audit.findings.filter((finding) => finding.level === "bloqueante").length, 0);
+  // The audit and its verification share one clock instead of restarting it.
+  assert.equal(audit.budget.requests, audit.verification.budget.requests);
+
+  const ground = await zone.auditPermit({
+    permit: { workCodes: ["PA1003"], openCodes: [{ code: "PA1002", side: "a" }], groundCodes: ["PA1002"] },
+    client: makeChainClient({ withSource: true }),
+    settings: { maxRequests: 800, readSources: true },
+  });
+  assert.ok(
+    ground.findings.some((finding) => /PA1002 se declara puesta a tierra/.test(finding.text)),
+    "a ground outside the dead island is reported"
+  );
+}
+
+// A code the network does not own makes the permit inconsistent.
+{
+  const audit = await zone.auditPermit({
+    permit: { workCodes: ["PA1003"], openCodes: [{ code: "PA1002", side: "a" }], groundCodes: ["ZZ9999"] },
+    client: makeChainClient({ withSource: true }),
+    settings: { maxRequests: 800, readSources: true },
+  });
+
+  assert.equal(audit.status, "inconsistente");
+  assert.equal(audit.missing.length, 1);
+  assert.equal(audit.missing[0].code, "ZZ9999");
+  assert.equal(audit.missing[0].role, "puesta a tierra");
+  assert.ok(audit.findings.some((finding) => finding.level === "bloqueante" && /ZZ9999/.test(finding.text)));
+}
+
+// A distribution transformer (SSEE) is fed from MT; it never feeds the zone.
+{
+  const client = makeChainClient({ withSource: true });
+  const original = client.objectTitle;
+  let probe = null;
+  client.objectTitle = async (id) => {
+    if (id === 6001) return "Detalle de Subestación PT4309";
+    return original(id);
+  };
+  client.pointObjects = async (lon, lat) => {
+    let best = 0;
+    for (let i = 1; i < CHAIN.length; i += 1) {
+      if (Math.abs(lon - chainPoint(i).lon) < Math.abs(lon - chainPoint(best).lon)) best = i;
+    }
+    const rows = [];
+    if (best > 0) rows.push({ id: 7000 + best, display: `${CHAIN[best - 1]} - ${CHAIN[best]}`, type: "Alambre Cu Duro Des 6 AWG 2-fas MT" });
+    if (best < CHAIN.length - 1) rows.push({ id: 7100 + best, display: `${CHAIN[best]} - ${CHAIN[best + 1]}`, type: "Alambre Cu Duro Des 6 AWG 2-fas MT" });
+    if (best === 2) rows.push({ id: 6001, display: "PT4309", type: "" });
+    return rows;
+  };
+  probe = await zone.verifyAperturas({
+    workCodes: ["PA1004"],
+    openCodes: [{ code: "PA1002" }],
+    client,
+    settings: { maxRequests: 400, readSources: true },
+  });
+  assert.equal(probe.sources.length, 0, "an SSEE is a load, not a source");
+  assert.equal(probe.valid, true, probe.reason);
+}
+
+// A permit preset becomes the project V10 already loads.
+{
+  const project = await zone.buildProjectFromPreset({
+    preset: {
+      preset: "T-PRUEBA",
+      nombre: "Prueba de preset",
+      roles: [
+        { rol: "D1", codigo: "PA1001", bloque: "D", tipo: "apertura", equipo: "Reconectador" },
+        { rol: "T1", codigo: "PA1002", bloque: "T", tipo: "trabajo" },
+        { rol: "T9", codigo: "NOEXISTE", bloque: "T", tipo: "trabajo" },
+      ],
+    },
+    client: makeChainClient({}),
+    settings: { maxRequests: 100 },
+  });
+  assert.equal(project.formato, "CentralityLocal");
+  assert.equal(project.version, 5);
+  assert.equal(project.registros.length, 2, "solo los códigos que resuelven se vuelven puntos");
+  assert.deepEqual(project.unresolved.map((item) => item.codigo), ["NOEXISTE"]);
+  const trabajo = project.registros.find((row) => row.codigo === "PA1002");
+  assert.equal(trabajo.bloqueId, "T");
+  assert.equal(trabajo.tipo, "PUNTO");
+  assert.ok(Number.isFinite(trabajo.longitud) && Number.isFinite(trabajo.latitud), "el punto trae coordenadas de GNAT");
+  const apertura = project.registros.find((row) => row.codigo === "PA1001");
+  assert.equal(apertura.tipo, "APERTURA");
+  assert.equal(apertura.tipoEquipo, "Reconectador");
+  assert.deepEqual(project.bloques.map((block) => block.id), ["D", "T", "F"]);
+}
+
+// Discovery from metadata: a structure sheet names its cables, so no radius probe.
+{
+  let pointQueries = 0;
+  const client = {
+    async search(term) {
+      const index = CHAIN.indexOf(term);
+      if (index === -1) return [];
+      return [{ object_id: 9000 + index, surrogate_in_map_id: 9000 + index, display: term }];
+    },
+    async geojson(ids) {
+      const index = Number(ids[0]) - 9000;
+      const point = chainPoint(index);
+      return { type: "Feature", geometry: { type: "Point", coordinates: [point.lon, point.lat] }, id: ids[0] };
+    },
+    async pointObjects() {
+      pointQueries += 1;
+      return [];
+    },
+    async objectTitle() {
+      return "";
+    },
+    async sectionHtml(id) {
+      const index = Number(id) - 9000;
+      const left = CHAIN[index - 1];
+      const right = CHAIN[index + 1];
+      const rows = [left, right]
+        .filter(Boolean)
+        .map((other) => `<td>${other} - ${CHAIN[index]}</td>`)
+        .join("");
+      return `<table><tr><td>Vecinos</td></tr>${rows}` +
+        `<tr><td>Tensión del circuito:</td><td>13.2 kV</td></tr>` +
+        `<tr><td>Estado operativo:</td><td>normalmente cerrado (NC)</td></tr></table>`;
+    },
+  };
+  const result = await zone.verifyAperturas({
+    workCodes: ["PA1004"],
+    openCodes: [{ code: "PA1002" }],
+    client,
+    settings: { maxRequests: 200, metadata: true },
+  });
+  // The walk itself never probes: the remaining point queries belong to the
+  // opening's side analysis, which still reads spans geometrically.
+  assert.equal(result.diagnostics.every((entry) => entry.fuente === "metadata"), true);
+  assert.deepEqual(result.island.sort(), ["PA1003", "PA1004", "PA1005"]);
+  assert.deepEqual(result.boundary, ["PA1002"]);
+  assert.equal(result.valid, true, result.reason);
+  assert.equal(result.diagnostics[0].fuente, "metadata");
+}
+
+// The outline is a hull, not the input order.
+{
+  const square = [
+    { lon: 0, lat: 0 },
+    { lon: 2, lat: 0 },
+    { lon: 2, lat: 2 },
+    { lon: 0, lat: 2 },
+    { lon: 1, lat: 1 },
+  ];
+  const hull = zone.convexHull(square);
+  assert.equal(hull.length, 4, "the interior point is dropped");
+  assert.ok(!hull.some(([lon, lat]) => lon === 1 && lat === 1));
+}
+
+// --- shared parsers ---------------------------------------------------------
+{
+  assert.equal(zone.codeOf("PT0012 (Postes c.a. 11.5 m)"), "PT0012");
+  assert.equal(zone.codeOf("Trintre"), null);
+  assert.deepEqual(zone.codePairOf("PT2540 - PT2541"), ["PT2540", "PT2541"]);
+  assert.equal(zone.codePairOf("Trintre - Colonia Miraflores"), null);
+  assert.equal(zone.parseOperatingState(SECTION_CLOSED).estado, "cerrado");
+  assert.equal(
+    zone.parseOperatingState("<b>Estado operativo:</b> normalmente abierto (NA) <span>Tensión del circuito:</span>").estado,
+    "abierto"
+  );
+  assert.equal(zone.parseOperatingState("").estado, "desconocido");
+}
+
+console.log("gnat-adapter.selftest: OK — work zone engine verified against recorded GNAT shapes");

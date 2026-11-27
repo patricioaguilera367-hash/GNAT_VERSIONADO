@@ -1,0 +1,21 @@
+{
+  "//": "Cadena mínima verificada: sesión persistida -> menú ExtJS -> iframe wmc.php -> OpenLayers.",
+  "//espera": "El iframe del mapa tarda varios segundos; los waits están medidos sobre el sitio real.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "//": "ExtJS: 'Navegación' es el título del panel, no un nodo. Hay que expandir el nodo Aplicaciones por su expander.",
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (!apps) return { error: 'no Aplicaciones' }; let container = apps; for (let i = 0; i < 6 && container; i += 1) { if (container.querySelector && container.querySelector('.x-tree-expander')) break; container = container.parentElement; } const expander = container ? container.querySelector('.x-tree-expander') : null; if (expander) expander.click(); else apps.click(); await new Promise((r) => setTimeout(r, 2500)); const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 9000)); return { clicked: true, iframeSrc: (document.querySelector('iframe#content') || {}).src || null };"
+    },
+    {
+      "//": "El mapa vive en el iframe wmc.php, en un mundo aislado: sólo se lee el DOM, no los globales de la página.",
+      "frame": "wmc\\.php",
+      "inFrame": "await new Promise((r) => setTimeout(r, 3000)); return { openlayers: document.querySelectorAll('.ol-viewport').length > 0, canvases: document.querySelectorAll('canvas').length, hasMapContainer: Boolean(document.querySelector('[id$=\"map-container\"]')), hasToolbar: Boolean(document.querySelector('.map-top-toolbar')) };"
+    }
+  ]
+}

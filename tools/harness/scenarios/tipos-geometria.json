@@ -1,0 +1,17 @@
+{
+  "//": "¿Las aperturas se distinguen por tipo de geometria? Solo tipos y claves.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 10000)); return { ready: true };"
+    },
+    {
+      "eval": "const w = document.querySelector('#content').contentWindow; const req = (url, params, ms) => new Promise((resolve) => { let done = false; const finish = (v) => { if (!done) { done = true; resolve(v); } }; const timer = setTimeout(() => finish({ ok: false, e: 'timeout' }), ms || 10000); try { w.Acs.request({ url, params, success: (r) => { clearTimeout(timer); finish({ ok: true, r }); }, failure: (e) => { clearTimeout(timer); finish({ ok: false, e: String((e && e.message) || e) }); } }); } catch (err) { clearTimeout(timer); finish({ ok: false, e: String(err.message) }); } }); const viewport = w.webMap_.getViewportParams ? w.webMap_.getViewportParams() : {}; const out = {}; for (const code of ['F913184', 'F913122', 'F913124', 'F914012']) { const s = await req('svc_wmc.php', Object.assign({ action: 'textual_search', query: code, page: 1, start: 0, limit: 25 }, viewport)); if (!s.ok) { out[code] = { error: s.e }; continue; } const rows = Array.isArray(s.r) ? s.r : (s.r.rows || s.r.data || []); const ids = rows.map((x) => x.object_id).filter(Boolean); if (!ids.length) { out[code] = { rows: rows.length, note: 'sin ids' }; continue; } const gj = await req('svc_wmc.php', Object.assign({ action: 'get_objects_geojson', object_ids: w.Ext.encode(ids) }, viewport)); if (!gj.ok) { out[code] = { rows: rows.length, error: gj.e }; continue; } const feats = gj.r.features || []; const geomTypes = [...new Set(feats.map((f) => (f.geometry && f.geometry.type) || 'sin-geometria'))]; const propKeys = [...new Set(feats.flatMap((f) => (f.properties ? Object.keys(f.properties) : [])))]; out[code] = { rows: rows.length, features: feats.length, geomTypes, propKeys: propKeys.slice(0, 20), topLevelKeys: Object.keys(gj.r).slice(0, 10) }; } return out;"
+    }
+  ]
+}

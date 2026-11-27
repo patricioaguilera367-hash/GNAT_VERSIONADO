@@ -1,0 +1,18 @@
+{
+  "//": "Normaliza Feature vs FeatureCollection y verifica: la apertura comparte codigo con su poste.",
+  "//ojo": "Solo tipo de geometria, forma de coordenadas y si el codigo coincide. Ningun valor.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 10000)); return { ready: true };"
+    },
+    {
+      "eval": "const w = document.querySelector('#content').contentWindow; const req = (url, params, ms) => new Promise((resolve) => { let done = false; const finish = (v) => { if (!done) { done = true; resolve(v); } }; const timer = setTimeout(() => finish({ ok: false, e: 'timeout' }), ms || 10000); const fail = (e) => { clearTimeout(timer); finish({ ok: false, e: String((e && e.message) || e) }); }; try { w.Acs.request({ url, params, success: (r) => { clearTimeout(timer); finish({ ok: true, r }); }, failure: fail }); } catch (err) { fail(err); } }); const viewport = w.webMap_.getViewportParams ? w.webMap_.getViewportParams() : {}; const norm = (r) => { if (!r) return []; if (r.type === 'FeatureCollection') return r.features || []; if (r.type === 'Feature') return [r]; if (Array.isArray(r)) return r; return []; }; const coordShape = (g) => { if (!g || !g.coordinates) return 'sin-coords'; const c = g.coordinates; if (typeof c[0] === 'number') return 'par-numerico'; if (Array.isArray(c[0]) && typeof c[0][0] === 'number') return 'lista-de-pares(' + c.length + ')'; if (Array.isArray(c[0]) && Array.isArray(c[0][0])) return 'anidado(' + c.length + ')'; return 'otro'; }; const out = {}; for (const code of ['F913184', 'F913122', 'F913124', 'F914012']) { const s = await req('svc_wmc.php', Object.assign({ action: 'textual_search', query: code, page: 1, start: 0, limit: 25 }, viewport)); if (!s.ok) { out[code] = { error: s.e }; continue; } const rows = Array.isArray(s.r) ? s.r : (s.r.rows || s.r.data || []); const ids = rows.map((x) => x.object_id).filter(Boolean); const gj = await req('svc_wmc.php', Object.assign({ action: 'get_objects_geojson', object_ids: w.Ext.encode(ids) }, viewport)); if (!gj.ok) { out[code] = { rows: rows.length, error: gj.e }; continue; } const feats = norm(gj.r); out[code] = { rows: rows.length, shape: (gj.r && gj.r.type) || 'array', features: feats.length, items: feats.map((f) => { const g = f.geometry || {}; return { geom: g.type || 'sin-geometria', coordShape: coordShape(g), sameCode: Boolean(f.properties && typeof f.properties.display_name === 'string' && f.properties.display_name.indexOf(code) === 0), propKeys: f.properties ? Object.keys(f.properties) : [] }; }) }; } return out;"
+    }
+  ]
+}

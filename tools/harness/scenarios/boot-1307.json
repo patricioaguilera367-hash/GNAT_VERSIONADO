@@ -1,0 +1,14 @@
+{
+  "//": "Confirma que app.js arranca en v13.0.7: la barra la construye el propio codigo.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const texts = [...document.querySelectorAll('button')].map((b) => (b.textContent || '').trim()); const has = (needle) => texts.some((t) => t.toLowerCase().includes(needle)); return { botones: texts.length, Zonas: has('zonas'), Vista: has('vista'), Tabla: has('tabla'), Poligono: has('polígono') || has('poligono'), errorOverlay: Boolean(document.querySelector('[class*=error-overlay], .app-crash')) };"
+    }
+  ]
+}

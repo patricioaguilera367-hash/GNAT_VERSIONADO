@@ -1,0 +1,20 @@
+{
+  "source": "SUB1",
+  "points": [
+    { "code": "SUB1", "lonlat": [-73.0500, -36.8200], "numero": 1, "tipo": "PUNTO" },
+    { "code": "P1", "lonlat": [-73.0495, -36.8201], "numero": 2, "tipo": "PUNTO" },
+    { "code": "P2", "lonlat": [-73.0490, -36.8202], "numero": 3, "tipo": "PUNTO" },
+    { "code": "P3", "lonlat": [-73.0485, -36.8203], "numero": 4, "tipo": "PUNTO" },
+    { "code": "P4", "lonlat": [-73.0480, -36.8204], "numero": 5, "tipo": "PUNTO" },
+    { "code": "P5", "lonlat": [-73.0475, -36.8205], "numero": 6, "tipo": "PUNTO" }
+  ],
+  "spans": [
+    { "from": "SUB1", "to": "P1", "lengthM": 58.2 },
+    { "from": "P1", "to": "P2", "lengthM": 41.0 },
+    { "from": "P2", "to": "P3", "lengthM": 44.7 },
+    { "from": "P3", "to": "P4", "lengthM": 39.9 }
+  ],
+  "openings": [
+    { "code": "A1", "at": "P2", "state": "open", "kind": "DC POLE TOP" }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "//": "Verifica F913184 por la API real: textual_search + get_objects_geojson en bloque.",
+  "//ojo": "Devuelve SOLO formas: claves, largos de arreglo y si hay campos de adyacencia.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 10000)); const w = document.querySelector('#content') && document.querySelector('#content').contentWindow; return { hasFrame: Boolean(w), hasWebMap: Boolean(w && w.webMap_), hasAcs: Boolean(w && w.Acs && typeof w.Acs.request === 'function'), hasExt: Boolean(w && w.Ext) };"
+    },
+    {
+      "eval": "const w = document.querySelector('#content').contentWindow; const req = (url, params) => new Promise((resolve) => { try { w.Acs.request({ url, params, success: (r) => resolve({ ok: true, r }), failure: (e) => resolve({ ok: false, e: String((e && e.message) || e) }) }); } catch (err) { resolve({ ok: false, e: String(err.message) }); } }); const shape = (v) => { if (Array.isArray(v)) { const h = v[0]; return { arrayLength: v.length, itemKeys: h && typeof h === 'object' ? Object.keys(h).slice(0, 20) : null }; } if (v && typeof v === 'object') { const keys = Object.keys(v); return { keys: keys.slice(0, 20), arrays: keys.filter((k) => Array.isArray(v[k])).map((k) => ({ key: k, ...shape(v[k]) })).slice(0, 8) }; } return { scalar: typeof v }; }; const viewport = w.webMap_.getViewportParams ? w.webMap_.getViewportParams() : {}; const search = await req('svc_wmc.php', Object.assign({ action: 'textual_search', query: 'F913184', page: 1, start: 0, limit: 25 }, viewport)); const out = { searchOk: search.ok, searchShape: search.ok ? shape(search.r) : search.e }; let ids = []; if (search.ok) { const walk = (v, depth) => { if (depth > 3 || ids.length > 0) return; if (Array.isArray(v)) { const h = v.find((x) => x && typeof x === 'object' && (x.id || x.object_id)); if (h) { ids = v.map((x) => x.id || x.object_id).filter(Boolean).slice(0, 12); return; } for (const item of v.slice(0, 5)) walk(item, depth + 1); } else if (v && typeof v === 'object') { for (const key of Object.keys(v).slice(0, 10)) walk(v[key], depth + 1); } }; walk(search.r, 0); } out.idsFound = ids.length; if (ids.length > 0) { const gj = await req('svc_wmc.php', Object.assign({ action: 'get_objects_geojson', object_ids: w.Ext.encode(ids) }, viewport)); out.geojsonOk = gj.ok; out.geojsonShape = gj.ok ? shape(gj.r) : gj.e; if (gj.ok) { const r = gj.r; const firstArray = Array.isArray(r) ? r : Object.values(r).find((v) => Array.isArray(v)); const item = Array.isArray(firstArray) ? firstArray[0] : null; if (item && typeof item === 'object') { const keys = Object.keys(item); out.geojsonItemKeys = keys.slice(0, 25); out.adjacencyKeys = keys.filter((k) => /from|to|source|target|span|tramo|conect|node|nodo|parent|child|apertura|switch/i.test(k)); } } } return out;"
+    }
+  ]
+}

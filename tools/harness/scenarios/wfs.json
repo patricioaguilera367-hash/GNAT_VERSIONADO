@@ -1,0 +1,15 @@
+{
+  "//": "¿Hay WFS? Es la puerta vectorial: features con atributos en bloque.",
+  "//ojo": "Solo nombres de FeatureType, conteos y claves. Ningun valor.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const get = async (url, ms) => { const c = new AbortController(); const t = setTimeout(() => c.abort(), ms || 15000); try { const r = await fetch(url, { credentials: 'same-origin', signal: c.signal }); const text = await r.text(); return { status: r.status, ct: (r.headers.get('content-type') || '').slice(0, 40), text }; } catch (e) { return { status: 0, error: String(e.message).slice(0, 80) } } finally { clearTimeout(t); } }; const out = { intentos: [] }; const urls = ['/webmap/saesa/service?SERVICE=WFS&REQUEST=GetCapabilities&VERSION=1.1.0', '/webmap/saesa/wfs?SERVICE=WFS&REQUEST=GetCapabilities&VERSION=1.1.0', '/webmap/saesa/service?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetCapabilities']; for (const u of urls) { const r = await get(u, 15000); const row = { url: u.replace(/[?&](SERVICE|REQUEST|VERSION)=[^&]*/g, ''), status: r.status, ct: r.ct, bytes: r.text ? r.text.length : 0 }; if (r.text) { const doc = new DOMParser().parseFromString(r.text, 'text/xml'); const ft = [...doc.getElementsByTagName('FeatureType')]; row.featureTypes = ft.length; row.se = ((doc.getElementsByTagName('ServiceException')[0] || {}).textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 200) || null; row.error = ((doc.getElementsByTagName('ExceptionText')[0] || {}).textContent || '').slice(0, 200) || null; if (ft.length) { row.nombres = ft.map((f) => { const n = f.getElementsByTagName('Name')[0]; return n ? n.textContent.trim() : ''; }).filter((n) => /poste|estructura|structure|conductor|cable|mt|device|nodo|tramo|electrical|distribution|network/i.test(n)).slice(0, 30); row.todos = ft.length; } } out.intentos.push(row); } const leg = await get('/webmap/saesa/service?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetLegendGraphic&LAYER=saesa.webmap.fase_cables_mt&FORMAT=image/png', 15000); out.leyenda = { status: leg.status, ct: leg.ct, bytes: leg.text ? leg.text.length : 0 }; return out;"
+    }
+  ]
+}

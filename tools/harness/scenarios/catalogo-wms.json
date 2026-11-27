@@ -1,0 +1,15 @@
+{
+  "//": "Catalogo WMS: que capas existen, cuales son queryable y por que falla GetFeatureInfo.",
+  "//ojo": "Solo nombres de capa, flags y el texto del ServiceException. Ningun dato.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const get = async (url, ms) => { const c = new AbortController(); const t = setTimeout(() => c.abort(), ms || 15000); try { const r = await fetch(url, { credentials: 'same-origin', signal: c.signal }); const text = await r.text(); return { status: r.status, ct: (r.headers.get('content-type') || '').slice(0, 40), text }; } catch (e) { return { status: 0, error: String(e.message).slice(0, 80) }; } finally { clearTimeout(t); } }; const out = {}; const caps = await get('/webmap/saesa/service?SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.1.1', 20000); out.caps = { status: caps.status, ct: caps.ct, bytes: caps.text ? caps.text.length : 0 }; if (caps.text) { const doc = new DOMParser().parseFromString(caps.text, 'text/xml'); const all = [...doc.getElementsByTagName('Layer')]; out.caps.layerNodes = all.length; out.caps.error = (doc.getElementsByTagName('ServiceException')[0] || {}).textContent || null; const interesting = []; let queryableTrue = 0; for (const l of all) { const n = l.getElementsByTagName('Name')[0]; if (!n) continue; const name = n.textContent.trim(); const q = (l.getAttribute('queryable') || (l.parentNode && l.parentNode.getAttribute && l.parentNode.getAttribute('queryable')) || '').toLowerCase(); if (q === '1') queryableTrue++; if (/poste|estructura|structure|conductor|cable|distribu|apertura|desconect|electrical|network|red_|nodo|tramo/i.test(name)) interesting.push(name.slice(0, 80) + (q === '1' ? ' [Q]' : '')); } out.caps.nombrados = all.filter((l) => l.getElementsByTagName('Name')[0]).length; out.caps.queryableTotal = queryableTrue; out.caps.interesantes = interesting.slice(0, 40); } const probe = await get('/webmap/saesa/service?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetFeatureInfo&LAYERS=webmap.electrical.operable_status&QUERY_LAYERS=webmap.electrical.operable_status&STYLES=&SRS=EPSG:3857&BBOX=-8000000,-4000000,-7000000,-3000000&WIDTH=400&HEIGHT=400&X=200&Y=200&INFO_FORMAT=application/json&FEATURE_COUNT=50', 15000); out.gfi = { status: probe.status, ct: probe.ct, bytes: probe.text ? probe.text.length : 0, mensaje: probe.text ? probe.text.replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 400) : null }; return out;"
+    }
+  ]
+}

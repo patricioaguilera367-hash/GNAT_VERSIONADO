@@ -1,0 +1,12 @@
+{
+  "//": "Copy this file to config.json and fill the four site values. config.json is not committed.",
+  "browserPath": null,
+  "profileDir": null,
+  "extensionDir": null,
+  "startUrl": null,
+  "headless": true,
+  "selectors": {
+    "loggedIn": null,
+    "login": null
+  }
+}

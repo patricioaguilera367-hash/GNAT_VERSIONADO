@@ -1,0 +1,18 @@
+{
+  "//": "¿El mapa tiene capas vectoriales con los postes? Introspeccion de OpenLayers.",
+  "//ojo": "Solo nombres de clase, conteos y claves de propiedades. Ningun valor.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 10000)); return { ready: true };"
+    },
+    {
+      "eval": "const w = document.querySelector('#content').contentWindow; const out = { olVersion: (w.ol && (w.ol.VERSION || w.ol.OL_VERSION)) || null }; const wm = w.webMap_; out.wmType = wm ? (wm.constructor && wm.constructor.name) : null; out.wmKeys = wm ? Object.keys(wm).slice(0, 40) : null; const isMap = (o) => o && typeof o.getLayers === 'function' && typeof o.getView === 'function'; let map = null; let mapPath = ''; const seen = new Set(); const scan = (obj, path, depth) => { if (map || !obj || depth > 2 || typeof obj !== 'object') return; if (seen.has(obj)) return; seen.add(obj); if (isMap(obj)) { map = obj; mapPath = path; return; } let keys = []; try { keys = Object.keys(obj); } catch (e) { return; } for (const k of keys.slice(0, 80)) { let v; try { v = obj[k]; } catch (e) { continue; } if (v && typeof v === 'object') scan(v, path + '.' + k, depth + 1); } }; scan(wm, 'webMap_', 0); if (!map) { for (const k of Object.keys(w)) { if (!/map|view|ol/i.test(k)) continue; let v; try { v = w[k]; } catch (e) { continue; } scan(v, 'window.' + k, 1); if (map) break; } } out.mapFound = Boolean(map); out.mapPath = mapPath; if (map) { try { const view = map.getView(); out.view = { zoom: view.getZoom ? view.getZoom() : null, projection: view.getProjection ? String(view.getProjection().getCode ? view.getProjection().getCode() : view.getProjection()) : null }; } catch (e) { out.view = { error: String(e.message) }; } let layers = []; try { layers = map.getLayers().getArray(); } catch (e) { out.layersError = String(e.message); } out.layerCount = layers.length; out.layers = layers.slice(0, 30).map((l) => { let src = null; try { src = l.getSource ? l.getSource() : null; } catch (e) {} let featCount = null; let propKeys = []; const geomTypes = {}; try { if (src && typeof src.getFeatures === 'function') { const feats = src.getFeatures(); featCount = feats.length; propKeys = [...new Set(feats.slice(0, 20).flatMap((f) => Object.keys(f.getProperties ? f.getProperties() : {})))]; for (const f of feats.slice(0, 80)) { const g = f.getGeometry ? f.getGeometry() : null; const t = g && g.getType ? g.getType() : 'sin'; geomTypes[t] = (geomTypes[t] || 0) + 1; } } } catch (e) {} return { cls: l.constructor ? l.constructor.name : '?', title: l.get ? l.get('title') || null : null, visible: l.getVisible ? l.getVisible() : null, srcCls: src && src.constructor ? src.constructor.name : null, features: featCount, geomTypes, propKeys: propKeys.slice(0, 24) }; }); } return out;"
+    }
+  ]
+}

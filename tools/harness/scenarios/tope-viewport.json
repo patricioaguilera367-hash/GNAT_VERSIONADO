@@ -1,0 +1,18 @@
+{
+  "//": "Pregunta decisiva: el tope de 40 es global o por viewport?",
+  "//ojo": "Solo conteos, tipos de parametro y solapamiento de ids.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 10000)); return { ready: true };"
+    },
+    {
+      "eval": "const w = document.querySelector('#content').contentWindow; const req = (params, ms) => new Promise((resolve) => { let done = false; const finish = (v) => { if (!done) { done = true; resolve(v); } }; const timer = setTimeout(() => finish({ ok: false, e: 'timeout' }), ms || 12000); const fail = (e) => { clearTimeout(timer); finish({ ok: false, e: String((e && e.message) || e) }); }; try { w.Acs.request({ url: 'svc_wmc.php', params, success: (r) => { clearTimeout(timer); finish({ ok: true, r }); }, failure: fail }); } catch (err) { fail(err); } }); const vp = w.webMap_.getViewportParams ? w.webMap_.getViewportParams() : {}; const rowsOf = (r) => Array.isArray(r) ? r : (r && (r.rows || r.data)) || []; const idsOf = (rows) => rows.map((x) => x.object_id).filter(Boolean); const search = async (q, params) => { const s = await req(Object.assign({ action: 'textual_search', query: q, page: 1, start: 0, limit: 100 }, params), 12000); return s.ok ? rowsOf(s.r) : null; }; const out = {}; const vpInfo = {}; for (const k of Object.keys(vp)) { const v = vp[k]; vpInfo[k] = Array.isArray(v) ? 'array(' + v.length + ')[' + typeof v[0] + ']' : typeof v; } out.viewportKeys = vpInfo; const A = await search('F73', vp); out.base = A ? idsOf(A).length : null; const vpFar = JSON.parse(JSON.stringify(vp)); let touched = []; for (const k of Object.keys(vpFar)) { const v = vpFar[k]; if (Array.isArray(v) && v.length === 4 && v.every((n) => typeof n === 'number')) { const bw = v[2] - v[0]; const bh = v[3] - v[1]; vpFar[k] = [v[0] - 100 * bw, v[1] - 100 * bh, v[0] - 99 * bw, v[1] - 99 * bh]; touched.push(k); } else if (typeof v === 'number' && /scale|resolution|zoom/i.test(k)) { vpFar[k] = v * 40; touched.push(k); } } out.perturbados = touched; const B = await search('F73', vpFar); if (A && B) { const sa = new Set(idsOf(A)); const sb = new Set(idsOf(B)); const solape = [...sa].filter((x) => sb.has(x)).length; out.viewportLejano = { filas: idsOf(B).length, solape, cambia: solape < sa.size }; } else out.viewportLejano = { error: 'sin respuesta' }; const prefijos = ['F69096', 'F69097', 'F69098', 'F69099', 'F69100', 'F69101']; const acum = new Set(); const detalle = []; for (const p of prefijos) { const rows = await search(p, vp); const n = rows ? idsOf(rows).length : -1; if (rows) for (const id of idsOf(rows)) acum.add(id); detalle.push(p.slice(-2) + ':' + n); } out.abanico = { prefijos: detalle, idsUnicos: acum.size, suma: detalle.length }; return out;"
+    }
+  ]
+}

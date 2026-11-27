@@ -1,0 +1,18 @@
+{
+  "//": "Toggle del popover, evaluado dentro del iframe del mapa donde vive el shadow root.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 9000)); return { ready: true };"
+    },
+    {
+      "frame": "wmc",
+      "inFrame": "const host = [...document.querySelectorAll('*')].find((e) => e.shadowRoot && e.shadowRoot.querySelector('.topbar')); if (!host) return { error: 'sin shadow host', iframe: location.pathname }; const sh = host.shadowRoot; const wait = (ms) => new Promise((r) => setTimeout(r, ms)); const zona = [...sh.querySelectorAll('button')].find((b) => /zonas/i.test(b.textContent || '')); if (!zona) return { error: 'sin boton Zonas', botones: [...sh.querySelectorAll('button')].slice(0, 14).map((b) => (b.textContent || '').trim().slice(0, 16)) }; const pops = () => sh.querySelectorAll('.popover').length; const chips = [...sh.querySelectorAll('button.chip')].map((c) => (c.textContent || '').trim()); const out = { chips: chips.length, chipsMuestra: chips.slice(0, 9).map((c) => c.replace(/[A-Za-zÁÉÍÓÚÑáéíóúñ]/g, 'a')) }; out.antes = pops(); zona.click(); await wait(400); out.tras1 = pops(); zona.click(); await wait(400); out.tras2 = pops(); zona.click(); await wait(400); out.tras3 = pops(); return out;"
+    }
+  ]
+}

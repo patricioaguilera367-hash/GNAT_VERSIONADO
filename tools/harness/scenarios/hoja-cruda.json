@@ -1,0 +1,18 @@
+{
+  "//": "Trae la hoja cruda de section 23 para validar el parser contra HTML real.",
+  "//ojo": "El HTML crudo queda solo en artifacts fuera del repo; no se imprime.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 9000)); return { ready: true };"
+    },
+    {
+      "eval": "const w = document.querySelector('#content').contentWindow; const code = 'F914012'; const req = (params, ms) => new Promise((resolve) => { let done = false; const finish = (v) => { if (!done) { done = true; resolve(v); } }; const timer = setTimeout(() => finish({ ok: false, e: 'timeout' }), ms || 12000); const fail = (e) => { clearTimeout(timer); finish({ ok: false, e: String((e && e.message) || e) }); }; try { w.Acs.request({ url: 'svc_wmc.php', params, success: (r) => { clearTimeout(timer); finish({ ok: true, r }); }, failure: fail }); } catch (err) { fail(err); } }); const vp = w.webMap_.getViewportParams ? w.webMap_.getViewportParams() : {}; const s = await req(Object.assign({ action: 'textual_search', query: code, page: 1, start: 0, limit: 25 }, vp)); const rows = (s.ok && (Array.isArray(s.r) ? s.r : (s.r.rows || s.r.data))) || []; const ids = rows.map((x) => x.object_id).filter(Boolean); const sheets = []; for (const id of ids) { const c = new AbortController(); const t = setTimeout(() => c.abort(), 9000); try { const r = await w.fetch('elec_addons_cm_object_data_section.php?object_id=' + encodeURIComponent(id) + '&section_id=23', { credentials: 'same-origin', signal: c.signal }); sheets.push({ id, bytes: 0, html: r.ok ? await r.text() : '' }); sheets[sheets.length - 1].bytes = sheets[sheets.length - 1].html.length; } catch (e) { sheets.push({ id, bytes: 0, html: '' }); } finally { clearTimeout(t); } } sheets.sort((a, b) => b.bytes - a.bytes); return { code, objects: ids.length, best: sheets[0] || null };"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "//": "Descubre por dónde se piden datos vectoriales: controles de la extensión y buscador.",
+  "//ojo": "Sólo inventario de DOM: tags, ids, clases y textos. Ningún dato de red.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "captureNetwork": {
+    "filter": "/svc_|/backend/.*\\.php",
+    "inspectBodies": 0
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const pick = (el) => ({ tag: el.tagName.toLowerCase(), id: el.id || null, cls: String(el.className || '').slice(0, 60), text: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40) }); const header = document.querySelector('#app-header'); const tools = header ? [...header.querySelectorAll('a, button, div[class*=btn], span[class*=icon], i[class*=fa]')].slice(0, 30).map(pick) : []; const inputs = [...document.querySelectorAll('input')].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }).slice(0, 15).map((el) => ({ ...pick(el), type: el.type, name: el.name || null, placeholder: el.placeholder || null })); const extensionNodes = [...document.querySelectorAll('[id*=gnat], [class*=gnat], [data-gnat]')].slice(0, 15).map(pick); return { headerTools: tools, visibleInputs: inputs, extensionNodes };"
+    },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const busc = findNode(/^buscadores?$/i); if (!busc) return { error: 'no Buscadores', nodes: [...document.querySelectorAll('.x-tree-node-text')].map((el) => el.textContent.trim()).slice(0, 30) }; busc.click(); await new Promise((r) => setTimeout(r, 4000)); const pick = (el) => ({ tag: el.tagName.toLowerCase(), id: el.id || null, cls: String(el.className || '').slice(0, 50), placeholder: el.placeholder || null, type: el.type || null }); return { inputs: [...document.querySelectorAll('input')].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }).slice(0, 15).map(pick), buttons: [...document.querySelectorAll('a[class*=btn], button')].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }).slice(0, 15).map((el) => ({ id: el.id || null, text: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 30) })), titles: [...document.querySelectorAll('.x-title-text')].map((el) => el.textContent.trim()).filter(Boolean).slice(0, 15) };"
+    }
+  ]
+}

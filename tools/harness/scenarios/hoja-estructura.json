@@ -1,0 +1,18 @@
+{
+  "//": "Hoja de estructura (section 23) por raw GET, como hace el puente. Solo conteos.",
+  "//ojo": "Acs.request destroza el HTML: hay que usar fetch. Solo bytes, conteos y booleanos.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 10000)); return { ready: true };"
+    },
+    {
+      "eval": "const w = document.querySelector('#content').contentWindow; const req = (params, ms) => new Promise((resolve) => { let done = false; const finish = (v) => { if (!done) { done = true; resolve(v); } }; const timer = setTimeout(() => finish({ ok: false, e: 'timeout' }), ms || 10000); const fail = (e) => { clearTimeout(timer); finish({ ok: false, e: String((e && e.message) || e) }); }; try { w.Acs.request({ url: 'svc_wmc.php', params, success: (r) => { clearTimeout(timer); finish({ ok: true, r }); }, failure: fail }); } catch (err) { fail(err); } }); const viewport = w.webMap_.getViewportParams ? w.webMap_.getViewportParams() : {}; const section = async (objectId, sectionId) => { const c = new AbortController(); const t = setTimeout(() => c.abort(), 9000); try { const r = await w.fetch('elec_addons_cm_object_data_section.php?object_id=' + encodeURIComponent(objectId) + '&section_id=' + encodeURIComponent(sectionId), { credentials: 'same-origin', signal: c.signal }); if (!r.ok) return { status: r.status, error: 'http' }; return { status: r.status, text: await r.text() }; } catch (e) { return { status: 0, error: String(e.message) }; } finally { clearTimeout(t); } }; const PAIR = /\\b([A-Z]{0,3}\\d{4,})\\s*[-\\u2013]\\s*([A-Z]{0,3}\\d{4,})\\b/g; const out = {}; for (const code of ['F913184', 'F913122', 'F913124', 'F914012']) { const s = await req(Object.assign({ action: 'textual_search', query: code, page: 1, start: 0, limit: 25 }, viewport)); if (!s.ok) { out[code] = { searchError: s.e }; continue; } const rows = Array.isArray(s.r) ? s.r : (s.r.rows || s.r.data || []); const ids = rows.map((x) => x.object_id).filter(Boolean); const per = []; for (const id of ids) { const res = await section(id, 23); if (res.error) { per.push({ status: res.status, error: res.error }); continue; } const text = res.text; const pairs = text.match(PAIR) || []; const plain = text.replace(/<[^>]*>/g, ' ').replace(/&[a-z]+;/gi, ' ').replace(/\\s+/g, ' '); per.push({ status: res.status, bytes: text.length, pairs: pairs.length, uniquePairs: new Set(pairs.map((p) => p.replace(/\\s+/g, ''))).size, vecinos: /vecin/i.test(plain), tension: /tensi[oó]n del circuito/i.test(plain), estadoOp: /estado operativo/i.test(plain), deviceWord: /(desconectador|seccional|reconectador|cuchilla|interruptor|fusible)/i.test(plain), plainChars: plain.length }); } out[code] = { objects: ids.length, sheets: per }; } return out;"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "//": "Segundo nivel: claves de properties, tipo de geometria, y vecindad por punto.",
+  "//ojo": "Sólo claves y cantidades. Ningún valor, código ni coordenada.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 10000)); return { ready: true };"
+    },
+    {
+      "eval": "const w = document.querySelector('#content').contentWindow; const req = (url, params) => new Promise((resolve) => { try { w.Acs.request({ url, params, success: (r) => resolve({ ok: true, r }), failure: (e) => resolve({ ok: false, e: String((e && e.message) || e) }) }); } catch (err) { resolve({ ok: false, e: String(err.message) }); } }); const viewport = w.webMap_.getViewportParams ? w.webMap_.getViewportParams() : {}; const search = await req('svc_wmc.php', Object.assign({ action: 'textual_search', query: 'F913184', page: 1, start: 0, limit: 25 }, viewport)); if (!search.ok) return { error: search.e }; const rows = search.r; const out = { searchCount: Array.isArray(rows) ? rows.length : null, searchItemKeys: Array.isArray(rows) && rows[0] ? Object.keys(rows[0]) : null, displayKeys: Array.isArray(rows) && rows[0] && rows[0].display ? Object.keys(rows[0].display) : null }; const ids = (Array.isArray(rows) ? rows : []).map((x) => x.object_id).filter(Boolean).slice(0, 12); const gj = await req('svc_wmc.php', Object.assign({ action: 'get_objects_geojson', object_ids: w.Ext.encode(ids) }, viewport)); if (gj.ok) { const feats = (gj.r.features || []).slice(0, 6); out.features = feats.map((f) => ({ geometryType: f.geometry && f.geometry.type, propKeys: f.properties ? Object.keys(f.properties).slice(0, 25) : null, hasBbox: Array.isArray(f.bbox) })); out.propKeysUnion = [...new Set(feats.flatMap((f) => (f.properties ? Object.keys(f.properties) : [])))].slice(0, 40); } const first = Array.isArray(rows) && rows[0] ? rows[0].pin_location : null; if (first && Array.isArray(first) && first.length >= 2) { const params = Object.assign({ action: 'get_objects_info_for_point', lonlat: w.Ext.encode({ lon: first[0], lat: first[1] }), units_per_pixel: 3 }, viewport); const pt = await req('svc_wmc.php', params); out.pointOk = pt.ok; if (pt.ok) { const r = pt.r; const arr = Array.isArray(r) ? r : Object.values(r).find((v) => Array.isArray(v)); out.pointArrayLength = Array.isArray(arr) ? arr.length : null; out.pointItemKeys = Array.isArray(arr) && arr[0] ? Object.keys(arr[0]).slice(0, 30) : null; out.pointTopKeys = Array.isArray(r) ? null : Object.keys(r).slice(0, 15); } else { out.pointError = pt.e; } } else { out.pinLocationShape = first ? Object.keys(first) : null; } return out;"
+    }
+  ]
+}

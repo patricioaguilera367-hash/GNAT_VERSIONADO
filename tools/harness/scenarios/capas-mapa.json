@@ -1,0 +1,18 @@
+{
+  "//": "Identifica cada capa con instanceof real de OpenLayers y su patron de URL.",
+  "//ojo": "Solo tipos, conteos y patrones de URL de capa. Ningun dato de red.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 10000)); return { ready: true };"
+    },
+    {
+      "eval": "const w = document.querySelector('#content').contentWindow; const map = w.webMap_.scaleLineControl.map_; const out = {}; const namesOf = (ns, obj) => { const hits = []; if (!ns) return hits; for (const k of Object.keys(ns)) { const C = ns[k]; if (typeof C !== 'function') continue; try { if (obj instanceof C) hits.push(k); } catch (e) {} } return hits; }; const layers = map.getLayers().getArray(); out.count = layers.length; out.viz = { currentVizId: w.webMap_.currentVizId, currentSpaceId: w.webMap_.currentSpaceId, appVisualizations: Array.isArray(w.webMap_.appVisualizations) ? w.webMap_.appVisualizations.length : typeof w.webMap_.appVisualizations }; out.layers = layers.map((l, i) => { const row = { i, visible: l.getVisible ? l.getVisible() : null, layerTypes: namesOf(w.ol && w.ol.layer, l) }; let src = null; try { src = l.getSource ? l.getSource() : null; } catch (e) {} if (!src) return row; row.srcTypes = namesOf(w.ol && w.ol.source, src); try { if (src.getFeatures) row.features = src.getFeatures().length; } catch (e) {} try { const f = src.getFormat && src.getFormat(); if (f) row.format = f.constructor ? f.constructor.name : String(f); } catch (e) {} try { const u = src.getUrls && src.getUrls(); if (u && u.length) row.urls = u.length; } catch (e) {} try { const fn = src.getTileUrlFunction && src.getTileUrlFunction(); if (typeof fn === 'function') { const t = fn.call(src, [3, 1, 1]); row.tileUrlSample = typeof t === 'string' ? t.replace(/[0-9]+/g, '9').slice(0, 160) : String(t); } } catch (e) { row.tileUrlErr = String(e.message).slice(0, 80); } try { const uf = src.getUrl && src.getUrl(); if (typeof uf === 'function') row.urlFn = true; else if (typeof uf === 'string') row.url = uf.slice(0, 160); } catch (e) {} try { const pk = l.getProperties ? Object.keys(l.getProperties()) : []; row.propKeys = pk.slice(0, 14); } catch (e) {} return row; }); return out;"
+    }
+  ]
+}

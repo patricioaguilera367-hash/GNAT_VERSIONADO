@@ -1,0 +1,19 @@
+{
+  "//": "¿El endpoint /webmap es ArcGIS REST? Si lo es, soporta consultas masivas.",
+  "//ojo": "Devuelve sólo forma y escalares: versión, maxRecordCount, cantidad de capas.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "captureNetwork": {
+    "filter": "/webmap/",
+    "inspectBodies": 3
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const probe = async (url) => { try { const r = await fetch(url, { credentials: 'include' }); const t = await r.text(); let j = null; try { j = JSON.parse(t); } catch {} if (!j) return { url, status: r.status, len: t.length, notJson: true }; return { url, status: r.status, len: t.length, keys: Object.keys(j).slice(0, 22), currentVersion: j.currentVersion ?? null, maxRecordCount: j.maxRecordCount ?? null, layerCount: Array.isArray(j.layers) ? j.layers.length : null, supportedQueryFormats: j.supportedQueryFormats ?? null, geometryType: j.geometryType ?? null }; } catch (error) { return { url, error: String(error.message) }; } }; return { info: await probe('/webmap/saesa/service?f=json'), root: await probe('/webmap/saesa?f=json'), webmapRoot: await probe('/webmap?f=json') };"
+    }
+  ]
+}

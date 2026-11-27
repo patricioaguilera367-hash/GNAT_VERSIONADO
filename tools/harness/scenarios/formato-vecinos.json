@@ -1,0 +1,18 @@
+{
+  "//": "Formato del bloque Vecinos y del Estado operativo. Texto enmascarado.",
+  "//ojo": "Codigos -> a9999, corridas de digitos -> 9. Solo ventanas alrededor de las etiquetas.",
+  "selectors": {
+    "loggedIn": "#app-header",
+    "login": "#loginForm",
+    "loading": "#loading-mask"
+  },
+  "steps": [
+    { "waitFor": "return document.querySelector('#app-header') !== null" },
+    {
+      "eval": "const findNode = (rx) => [...document.querySelectorAll('.x-tree-node-text')].find((el) => rx.test(el.textContent.trim())); const apps = findNode(/^aplicaciones$/i); if (apps) { let c = apps; for (let i = 0; i < 6 && c; i += 1) { if (c.querySelector && c.querySelector('.x-tree-expander')) break; c = c.parentElement; } const ex = c ? c.querySelector('.x-tree-expander') : null; (ex || apps).click(); await new Promise((r) => setTimeout(r, 2000)); } const mapa = findNode(/^mapas?$/i); if (!mapa) return { error: 'no Mapas' }; mapa.click(); await new Promise((r) => setTimeout(r, 10000)); return { ready: true };"
+    },
+    {
+      "eval": "const w = document.querySelector('#content').contentWindow; const req = (params, ms) => new Promise((resolve) => { let done = false; const finish = (v) => { if (!done) { done = true; resolve(v); } }; const timer = setTimeout(() => finish({ ok: false, e: 'timeout' }), ms || 10000); const fail = (e) => { clearTimeout(timer); finish({ ok: false, e: String((e && e.message) || e) }); }; try { w.Acs.request({ url: 'svc_wmc.php', params, success: (r) => { clearTimeout(timer); finish({ ok: true, r }); }, failure: fail }); } catch (err) { fail(err); } }); const viewport = w.webMap_.getViewportParams ? w.webMap_.getViewportParams() : {}; const section = async (objectId) => { const c = new AbortController(); const t = setTimeout(() => c.abort(), 9000); try { const r = await w.fetch('elec_addons_cm_object_data_section.php?object_id=' + encodeURIComponent(objectId) + '&section_id=23', { credentials: 'same-origin', signal: c.signal }); if (!r.ok) return null; return await r.text(); } catch (e) { return null; } finally { clearTimeout(t); } }; const mask = (s) => s.replace(/\\b[A-Z]{0,3}\\d{4,}\\b/gi, 'a9999').replace(/\\d{3,}/g, '9').replace(/\\s+/g, ' ').trim(); const window_ = (t, label, before, after) => { const i = t.toLowerCase().indexOf(label); if (i < 0) return null; return t.slice(Math.max(0, i - before), i + after); }; const s = await req(Object.assign({ action: 'textual_search', query: 'F914012', page: 1, start: 0, limit: 25 }, viewport)); const rows = (s.ok && (Array.isArray(s.r) ? s.r : (s.r.rows || s.r.data || []))) || []; const ids = rows.map((x) => x.object_id).filter(Boolean); const out = { objects: ids.length, sheets: [] }; for (const id of ids) { const html = await section(id); if (!html) { out.sheets.push({ error: 'fetch' }); continue; } const plain = html.replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&[a-z]+;/gi, ' ').replace(/\\s+/g, ' '); out.sheets.push({ bytes: html.length, maskedLen: plain.length, vecinos: window_(plain, 'vecin', 20, 520) ? mask(window_(plain, 'vecin', 20, 520)) : null, estadoOp: window_(plain, 'estado operativo', 10, 220) ? mask(window_(plain, 'estado operativo', 10, 220)) : null }); } return out;"
+    }
+  ]
+}
