@@ -149,13 +149,13 @@ function geoJsonFor(ids) {
       geometry: {
         type: "LineString",
         coordinates: [
-          [-72.8128, -37.912],
-          [-72.813, -37.9125],
+          [-62.8128, -32.912],
+          [-62.813, -32.9125],
         ],
       },
       id,
       properties: { display_name: "F378334 - F378336" },
-      bbox: [-72.813, -37.9125, -72.8128, -37.912],
+      bbox: [-62.813, -32.9125, -62.8128, -32.912],
     };
   });
   return features.length === 1 ? features[0] : { type: "FeatureCollection", features };

@@ -111,7 +111,7 @@ Centre the map on the line and sample that coordinate instead:
 
 ```js
 __gnatProbe.probeCenter()                                  // current map centre
-await __gnatProbe.probeAt({ lon: -72.09, lat: -38.73 })     // explicit coordinate
+await __gnatProbe.probeAt({ lon: -50.09, lat: -20.73 })     // explicit coordinate
 ```
 
 Each call appends a case to the report, so `copySummary()` picks it up. This is

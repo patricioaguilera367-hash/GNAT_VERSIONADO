@@ -33,10 +33,14 @@ test("el mismo código da el mismo reemplazo en dos archivos distintos", () => {
 });
 
 test("una coordenada se desplaza y conserva los decimales", () => {
-  const { text, coords } = anonymizeText("lon: -72.094406189, lat: -38.739195167");
+  // Semilla sintética. La longitud tiene que quedar por debajo de -60 porque el desplazamiento
+  // se elige por magnitud, no por nombre: `-100` es longitud y `-20` es latitud. Los decimales
+  // se conservan y el offset es +10 de longitud y +5 de latitud. Un punto de la red real no
+  // tiene nada que hacer acá, ni siquiera como entrada.
+  const { text, coords } = anonymizeText("lon: -100.123456789, lat: -20.987654321");
   assert.equal(coords, 2);
-  assert.ok(text.includes("-62.094406189"), "longitud desplazada");
-  assert.ok(text.includes("-33.739195167"), "latitud desplazada");
+  assert.ok(text.includes("-90.123456789"), "longitud desplazada");
+  assert.ok(text.includes("-15.987654321"), "latitud desplazada");
 });
 
 test("un sintético conserva la forma, así que la herramienta se corre una sola vez", () => {
@@ -52,7 +56,7 @@ test("un sintético conserva la forma, así que la herramienta se corre una sola
 test("las coordenadas no son idempotentes por diseño, y eso está documentado", () => {
   // Sin estado no se distingue una coordenada ya desplazada; el test fija el límite en vez
   // de prometer algo que la función no puede cumplir.
-  const once = anonymizeText("-72.094406189").text;
+  const once = anonymizeText("-100.123456789").text;
   const twice = anonymizeText(once).text;
   assert.notEqual(twice, once);
 });
