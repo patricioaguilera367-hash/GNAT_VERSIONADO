@@ -28,7 +28,11 @@ const SUITES = [
   { name: "data-guard", cmd: ["--test", "tools/data-guard.test.mjs"] },
   { name: "harness core", cmd: ["--test", "tools/harness/enumerate-core.test.mjs"] },
   { name: "topology", cmd: ["--test", "tools/topology/topology.test.mjs"] },
-  { name: "neighbours", cmd: ["--test", "tools/topology/neighbours.test.mjs"] }
+  { name: "neighbours", cmd: ["--test", "tools/topology/neighbours.test.mjs"] },
+  { name: "autosave", cmd: ["tools/harness/autosave-check.mjs"] },
+  { name: "backup filename", cmd: ["tools/harness/backup-filename-check.mjs"] },
+  { name: "drain owner", cmd: ["tools/harness/drain-owner-check.mjs"] },
+  { name: "null geometry", cmd: ["tools/harness/null-geometry-check.mjs"] }
 ];
 
 const run = (label, argv) => {

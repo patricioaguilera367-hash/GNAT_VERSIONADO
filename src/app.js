@@ -593,14 +593,21 @@
     }, 450);
   }
 
+  function backupFileName(project) {
+    const safe = String((project && project.id) || "").replace(/[^a-zA-Z0-9._-]+/g, "_") || "proyecto";
+    return safe + ".json";
+  }
+
   async function writeToBackupFolder(payload) {
     if (!state.backupDirHandle) return false;
     try {
       const perm = await state.backupDirHandle.queryPermission({ mode: "readwrite" });
       state.backupDirPerm = perm;
       if (perm !== "granted") return false;
-      const safeName = state.projectName.replace(/[^a-zA-Z0-9._-]+/g, "_") || "proyecto";
-      const fh = await state.backupDirHandle.getFileHandle(safeName + ".json", { create: true });
+      const fh = await state.backupDirHandle.getFileHandle(
+        backupFileName({ id: state.projectId, name: state.projectName }),
+        { create: true }
+      );
       const writable = await fh.createWritable();
       await writable.write(JSON.stringify(payload, null, 2));
       await writable.close();
@@ -610,6 +617,14 @@
     }
   }
 
+  function handleAutosaveResult(result) {
+    if (!result || result.ok === false) {
+      updateSaveIndicator(`Error al guardar: ${result?.error || "error desconocido"}`);
+      return;
+    }
+    updateSaveIndicator(result.label || "Guardado");
+  }
+
   async function autosaveNow() {
     const hasAnyData = state.points.length > 0 || [...state.zones.values()].some(z => Array.isArray(z.customRing) && z.customRing.length >= 3);
     if (!hasAnyData) {
@@ -617,18 +632,25 @@
       updateSaveIndicator("Sin datos");
       return;
     }
-    const payload = serializeProjectPayload();
-    await dbPutProject({
-      id: state.projectId,
-      name: state.projectName,
-      updatedAt: payload.updatedAt,
-      pointCount: payload.registros.length,
-      zoneCount: payload.bloques.length,
-      payload
-    });
-    const backedUp = await writeToBackupFolder(payload);
-    state.dirty = false;
-    updateSaveIndicator(backedUp ? `Guardado en ${state.backupDirHandle.name}` : "Guardado · solo navegador");
+    try {
+      const payload = serializeProjectPayload();
+      await dbPutProject({
+        id: state.projectId,
+        name: state.projectName,
+        updatedAt: payload.updatedAt,
+        pointCount: payload.registros.length,
+        zoneCount: payload.bloques.length,
+        payload
+      });
+      const backedUp = await writeToBackupFolder(payload);
+      state.dirty = false;
+      handleAutosaveResult({
+        ok: true,
+        label: backedUp ? `Guardado en ${state.backupDirHandle.name}` : "Guardado · solo navegador"
+      });
+    } catch (err) {
+      handleAutosaveResult({ ok: false, error: err?.message || err });
+    }
   }
 
   // =========================================================================
@@ -1603,7 +1625,7 @@
     }
     const proj = map.getView().getProjection();
     const zPts = state.points
-      .filter(f => getPointZoneIds(f).includes(zoneId))
+      .filter(f => f.getGeometry() && getPointZoneIds(f).includes(zoneId))
       .map(f => ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj));
     if (zPts.length < 3) return null;
     return convexHullLonLat(zPts);
@@ -1614,7 +1636,7 @@
     if (!z) return false;
     const proj = map.getView().getProjection();
     const zPts = state.points
-      .filter(f => getPointZoneIds(f).includes(zoneId))
+      .filter(f => f.getGeometry() && getPointZoneIds(f).includes(zoneId))
       .map(f => ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj));
     if (zoneId === "D" && Array.isArray(state.graphNodes)) {
       for (const gn of state.graphNodes) {
@@ -4914,7 +4936,7 @@
     for (const z of state.zones.values()) {
       let ring = Array.isArray(z.customRing) && z.customRing.length >= 3 ? z.customRing : null;
       if (!ring) {
-        const zPts = state.points.filter(f => getPointZoneIds(f).includes(z.id)).map(f => ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj));
+        const zPts = state.points.filter(f => f.getGeometry() && getPointZoneIds(f).includes(z.id)).map(f => ol.proj.toLonLat(f.getGeometry().getCoordinates(), proj));
         if (z.id === "D" && Array.isArray(state.graphNodes)) {
           for (const gn of state.graphNodes) if (Array.isArray(gn.lonlat)) zPts.push(gn.lonlat);
         }
@@ -5468,14 +5490,16 @@
     bPause.onclick = () => {
       q.paused = !q.paused;
       renderSyncQueueBar();
-      if (!q.paused && !q.running) drainGnatSyncQueue();
+      if (canStartDrain(q)) drainGnatSyncQueue();
     };
     const bCancel = el("button", "", "×", btns);
     bCancel.title = "Cancelar sincronización";
     bCancel.onclick = () => {
+      // El botón de cancelar NO libera `running`: lo libera la corrida que lo tomó,
+      // al terminar. Si lo soltara acá, reencolar mientras la corrida anterior sigue
+      // esperando su await abriría un segundo drain (R6.3).
       q.cancelled = true;
       q.paused = false;
-      q.running = false;
       for (const f of q.items) {
         if (f.get("syncStatus") === "loading") f.set("syncStatus", "cancelled");
       }
@@ -5671,9 +5695,13 @@
     }
   }
 
+  function canStartDrain(q) {
+    return Boolean(q) && !q.running && !q.paused;
+  }
+
   async function drainGnatSyncQueue() {
     const q = state.syncQueue;
-    if (q.running || q.paused) return;
+    if (!canStartDrain(q)) return;
     q.running = true;
     q.cancelled = false;
     renderSyncQueueBar();
@@ -5718,6 +5746,10 @@
       q.paused = false;
       rebuildOverlayLayers();
       markDirty();
+    } else if (!q.paused) {
+      // Quedan items encolados (p. ej. reencolados tras cancelar): el único owner
+      // arranca la corrida siguiente, sin depender de quién encoló.
+      drainGnatSyncQueue();
     }
     renderSyncQueueBar();
   }
@@ -5734,7 +5766,7 @@
         q.total++;
       }
     }
-    if (!q.running && !q.paused) {
+    if (canStartDrain(q)) {
       q.done = 0;
       q.total = q.items.length;
       drainGnatSyncQueue();
@@ -5889,6 +5921,7 @@
       const defaultSt = selTargetSt.value || "pendiente";
       const toResolveBg = [];
       const placedIndices = [];
+      let rejectedNoCoords = 0;
 
       for (const row of dataRows) {
         let numero = null, codigo = "", sseeCode = "", codigoTerreno = "", lat = null, lon = null, obsText = "", stName = "", supName = "";
@@ -5934,6 +5967,11 @@
           else lonlat = [lon, lat];
         } else {
           lonlat = extractLatLonFromLine(row.join(" "));
+        }
+
+        if (!lonlat) {
+          rejectedNoCoords++;
+          continue;
         }
 
         let estadoEjec = defaultSt;
@@ -5989,9 +6027,12 @@
       markDirty();
       refreshAll();
       if (placedIndices.length) fitPoints(placedIndices);
-      if (toResolveBg.length) {
-        showToast(`${toResolveBg.length} fila(s) cargadas · sincronizando metadata GNAT en segundo plano...`);
-        enqueueGnatMetadataSync(toResolveBg, true);
+      if (toResolveBg.length) enqueueGnatMetadataSync(toResolveBg, true);
+      if (toResolveBg.length || rejectedNoCoords) {
+        const parts = [];
+        if (toResolveBg.length) parts.push(`${toResolveBg.length} fila(s) cargadas · sincronizando metadata GNAT en segundo plano...`);
+        if (rejectedNoCoords) parts.push(`${rejectedNoCoords} fila(s) sin coordenadas no se agregaron.`);
+        showToast(parts.join(" "), rejectedNoCoords > 0);
       }
     };
   }
